@@ -206,8 +206,20 @@ compute_roc_metrics <- function(
     )
 
   # Join TPR and FPR
+  # Note: FPR is grouped by strip_method for robustness analysis
+  # For primary ROC, aggregate FPR across strip_methods by taking mean
+  fpr_aggregated <- fpr_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::summarise(
+      n_null = sum(n_null, na.rm = TRUE),
+      n_false_positive = sum(n_false_positive, na.rm = TRUE),
+      FPR = ifelse(n_null > 0, n_false_positive / n_null, NA_real_),
+      mean_effect_null = mean(mean_effect_null, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
   roc_df <- tpr_df %>%
-    dplyr::left_join(fpr_df, by = group_vars, suffix = c("_present", "_null")) %>%
+    dplyr::left_join(fpr_aggregated, by = group_vars, suffix = c("_present", "_null")) %>%
     dplyr::mutate(
       # d-prime (sensitivity index)
       d_prime = qnorm(pmin(TPR, 0.999)) - qnorm(pmax(FPR, 0.001)),
@@ -261,7 +273,7 @@ compute_fpr_by_null_type <- function(
       .groups = "drop"
     )
 
-  logger::log_info("Computed FDR for {nrow(fdr_df)} null-condition groupings")
+  logger::log_info("Computed FPR for {nrow(fpr_df)} null-condition groupings")
 
   fpr_df
 }
@@ -332,7 +344,7 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
       false_positive_rate = FPR
     ) %>%
     dplyr::mutate(
-      pct_tpr = 100 * true_discovery_rate,
+      pct_tpr = 100 * true_positive_rate,
       pct_fpr = 100 * false_positive_rate
     )
 
@@ -420,11 +432,11 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::group_by(strip_method) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
-        power = if (unique(strip_method) == "none") {
-          mean(is_significant[is_true_effect], na.rm = TRUE)
-        } else {
+        power = ifelse(
+          strip_method[1] == "none",
+          mean(is_significant[is_true_effect], na.rm = TRUE),
           NA_real_
-        },
+        ),
         fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
         mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
         mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
@@ -445,7 +457,13 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
     spec_inconsistencies = detect_specification_inconsistencies(results_with_diag, alpha = alpha),
 
     # Sensitivity analysis
-    spec_sensitivity = analyze_specification_sensitivity(results_with_diag)
+    spec_sensitivity = analyze_specification_sensitivity(results_with_diag),
+    
+    # Summary table for reporting
+    summary_table = create_summary_table(results_with_diag),
+    
+    # Include diagnostics for plotting
+    results_with_diagnostics = results_with_diag
   )
 
   logger::log_info("Multiverse analysis complete:  {length(analyses)} tables generated")
@@ -568,4 +586,49 @@ analyze_specification_sensitivity <- function(results_df) {
       mean_rp = mean(main_p_value, na.rm = TRUE),
       .groups = "drop"
     )
+}
+
+# ==============================================================================
+# SUMMARY TABLE FOR REPORTING
+# ==============================================================================
+
+#' Generate summary statistics table
+#'
+#' @param results_df Results with diagnostics
+#'
+#' @return Summary tibble
+#'
+create_summary_table <- function(results_df) {
+  # Add model_type grouping for display
+  prepared <- results_df %>%
+    dplyr::mutate(
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    )
+
+  summary_tbl <- prepared %>%
+    dplyr::group_by(model_type, transformation, effect_condition) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_converged = sum(converged_both, na.rm = TRUE),
+      pct_significant = mean(is_significant, na.rm = TRUE) * 100,
+      mean_effect = mean(main_estimate, na.rm = TRUE),
+      sd_effect = sd(main_estimate, na.rm = TRUE),
+      median_p = median(main_p_value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      metric_type = dplyr::case_when(
+        effect_condition == "present" ~ "Power (TPR)",
+        TRUE ~ "FPR"
+      )
+    ) %>%
+    dplyr::arrange(model_type, transformation, effect_condition)
+
+  summary_tbl
 }

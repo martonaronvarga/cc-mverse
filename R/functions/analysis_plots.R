@@ -61,24 +61,28 @@ get_strip_palette <- function() {
 
 #' Prepare results with proper diagnostics
 #'
-#' Ensures all derived columns exist before analysis
+#' Ensures all derived columns exist before visualization
+#' NOTE: This is a lightweight transformation for visualization only.
+#' All analytical computations should be done in analysis.R
 #'
-prepare_results <- function(results_df) {
+prepare_results_for_plots <- function(results_df) {
   results_df %>%
     dplyr::filter(!error) %>%
     dplyr::mutate(
       # Convergence
       converged_both = full_converged & dplyr::coalesce(null_converged, TRUE),
 
-      # Effect classification
+      # Effect classification (must match analysis.R definitions)
       is_true_effect = (effect_condition == "present" & strip_method == "none"),
       is_null_effect = (
         (effect_condition == "null_interaction" & strip_method %in% c("shuffle", "qmap_5")) |
           (effect_condition == "null_both" & strip_method == "none")
-      ), # Significance (use t test as primary)
+      ), 
+      
+      # Significance (use t test as primary)
       is_significant = main_p_value < 0.05,
 
-      # Model type grouping
+      # Model type grouping for display
       model_type = dplyr::case_when(
         grepl("rmanova", model) ~ "rmANOVA",
         grepl("full_slope", model) ~ "LMM (full)",
@@ -87,7 +91,7 @@ prepare_results <- function(results_df) {
         TRUE ~ model
       ),
 
-      # Clean labels
+      # Clean labels for display
       sample_size_pct = paste0(sample_size * 100, "%"),
       transformation_label = dplyr::if_else(
         transformation == "log_rt", "log(RT)", "Raw RT"
@@ -103,91 +107,24 @@ prepare_results <- function(results_df) {
     dplyr::filter(!(effect_condition == "present" & strip_method != "none"))
 }
 
-#' Compute ROC metrics properly
-#'
-#' TPR from present condition, FPR from null conditions
-#' Grouped appropriately to avoid single-row groups
-#'
-compute_roc_metrics <- function(results_df,
-                                group_vars = c(
-                                  "model_type", "sample_size",
-                                  "transformation", "strip_method"
-                                )) {
-  prepared <- prepare_results(results_df)
-
-  # TPR:  proportion significant when effect is PRESENT
-  tpr_df <- prepared %>%
-    dplyr::filter(is_true_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
-    dplyr::summarise(
-      n_true = dplyr::n(),
-      n_detected = sum(is_significant, na.rm = TRUE),
-      TPR = ifelse(n_true > 0, n_detected / n_true, NA_real_),
-      .groups = "drop"
-    )
-
-  # FPR:  proportion significant when effect is NULL
-  fpr_df <- prepared %>%
-    dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
-    dplyr::summarise(
-      n_null = dplyr::n(),
-      n_false_positive = sum(is_significant, na.rm = TRUE),
-      FPR = ifelse(n_null > 0, n_false_positive / n_null, NA_real_),
-      .groups = "drop"
-    )
-
-  # Join TPR and FPR
-  roc_df <- tpr_df %>%
-    dplyr::left_join(fpr_df, by = group_vars) %>%
-    dplyr::mutate(
-      # d' (sensitivity index)
-      d_prime = qnorm(pmin(TPR, 0.999)) - qnorm(pmax(FPR, 0.001)),
-      # Youden's J
-      youden_j = TPR - FPR
-    )
-
-  roc_df
-}
-
-#' Compute FDR by null condition type
-#'
-#' Separates null_interaction vs null_both to check if stripping works
-#'
-compute_fdr_by_null_type <- function(results_df,
-                                     group_vars = c(
-                                       "model_type", "sample_size",
-                                       "transformation", "strip_method"
-                                     )) {
-  prepared <- prepare_results(results_df)
-
-  prepared %>%
-    dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
-    dplyr::summarise(
-      n = dplyr::n(),
-      n_significant = sum(is_significant, na.rm = TRUE),
-      FDR = ifelse(n > 0, n_significant / n, NA_real_),
-      mean_p = mean(main_p_value, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      .groups = "drop"
-    )
-}
-
 # ==============================================================================
 # INDIVIDUAL PLOTS
 # ==============================================================================
+# All plot functions now accept pre-computed analysis objects
+# No statistical computations should occur in plotting code
 
 #' Plot 1: ROC curves by model and sample size
 #'
-plot_roc_by_model <- function(results_df,
+#' @param roc_metrics Pre-computed ROC metrics from analysis.R::compute_roc_metrics()
+#' @param facet_by Faceting variable (default: "transformation")
+#' @param cb_palette Color palette
+#'
+plot_roc_by_model <- function(roc_metrics,
                               facet_by = "transformation",
                               cb_palette = get_cb_palette()) {
-  roc_df <- compute_roc_metrics(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  ) %>%
-    dplyr::filter(strip_method == "none") # Baseline without stripping
+  # Filter to baseline (no stripping) for primary ROC
+  roc_df <- roc_metrics %>%
+    dplyr::filter(strip_method == "none" | is.na(strip_method))
 
   p <- ggplot(roc_df, aes(x = FPR, y = TPR, color = model_type, group = model_type)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
@@ -234,25 +171,23 @@ plot_roc_by_model <- function(results_df,
 #'
 #' Key robustness check: does stripping inflate FDR?
 #'
-plot_fdr_by_stripping <- function(results_df, cb_palette = get_strip_palette()) {
-  fdr_df <- compute_fdr_by_null_type(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  )
-
+#' @param fpr_by_null Pre-computed FPR by null type from analysis.R::compute_fpr_by_null_type()
+#' @param cb_palette Color palette
+#'
+plot_fdr_by_stripping <- function(fpr_by_null, cb_palette = get_strip_palette()) {
   # Summarize across sample sizes for cleaner plot
-  fdr_summary <- fdr_df %>%
+  fdr_summary <- fpr_by_null %>%
     dplyr::group_by(model_type, transformation, strip_method, effect_condition) %>%
     dplyr::summarise(
-      mean_FDR = mean(FDR, na.rm = TRUE),
-      se_FDR = sd(FDR, na.rm = TRUE) / sqrt(dplyr::n()),
+      mean_FPR = mean(FPR, na.rm = TRUE),
+      se_FPR = sd(FPR, na.rm = TRUE) / sqrt(dplyr::n()),
       .groups = "drop"
     )
 
-  p <- ggplot(fdr_summary, aes(x = strip_method, y = mean_FDR, fill = strip_method)) +
+  p <- ggplot(fdr_summary, aes(x = strip_method, y = mean_FPR, fill = strip_method)) +
     geom_col(position = "dodge", alpha = 0.8) +
     geom_errorbar(
-      aes(ymin = mean_FDR - se_FDR, ymax = mean_FDR + se_FDR),
+      aes(ymin = mean_FPR - se_FPR, ymax = mean_FPR + se_FPR),
       width = 0.2,
       position = position_dodge(0.9)
     ) +
@@ -291,15 +226,15 @@ plot_fdr_by_stripping <- function(results_df, cb_palette = get_strip_palette()) 
 
 #' Plot 3: TPR (Power) by sample size
 #'
-plot_power_by_sample_size <- function(results_df, cb_palette = get_cb_palette()) {
-  roc_df <- compute_roc_metrics(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  ) %>%
-    dplyr::filter(strip_method == "none")
-
-  p <- ggplot(roc_df, aes(
-    x = factor(sample_size), y = TPR,
+#' @param power_metrics Pre-computed power metrics from analysis.R::compute_power()
+#' @param cb_palette Color palette
+#'
+plot_power_by_sample_size <- function(power_metrics, cb_palette = get_cb_palette()) {
+  # Filter to baseline only if not already filtered
+  power_df <- power_metrics
+  
+  p <- ggplot(power_df, aes(
+    x = factor(sample_size), y = power,
     color = model_type, group = model_type
   )) +
     geom_line(linewidth = 0.8) +
@@ -328,8 +263,11 @@ plot_power_by_sample_size <- function(results_df, cb_palette = get_cb_palette())
 
 #' Plot 4: Specification curve
 #'
+#' @param results_df Results with branch diagnostics (pre-computed from analysis.R)
+#' @param alpha Significance threshold (for display only)
+#'
 plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
-  prepared <- prepare_results(results_df) %>%
+  prepared <- results_df %>%
     dplyr::arrange(main_estimate) %>%
     dplyr::mutate(spec_rank = dplyr::row_number())
 
@@ -343,7 +281,7 @@ plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
     geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
     scale_color_manual(
       values = c("TRUE" = "#2E7D32", "FALSE" = "#9E9E9E"),
-      labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05"),
+      labels = c("TRUE" = paste0("p < ", alpha), "FALSE" = paste0("p >= ", alpha)),
       name = NULL
     ) +
     labs(y = "Effect Estimate", x = NULL) +
@@ -390,10 +328,11 @@ plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
 
 #' Plot 5: Effect size distributions by condition
 #'
+#' @param results_df Results with branch diagnostics (pre-computed)
+#' @param cb_palette Color palette
+#'
 plot_effect_distributions <- function(results_df, cb_palette = get_effect_palette()) {
-  prepared <- prepare_results(results_df)
-
-  p <- ggplot(prepared, aes(x = effect_size, fill = effect_condition)) +
+  p <- ggplot(results_df, aes(x = effect_size, fill = effect_condition)) +
     geom_density(alpha = 0.6, color = NA) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
     scale_fill_manual(
@@ -423,10 +362,11 @@ plot_effect_distributions <- function(results_df, cb_palette = get_effect_palett
 
 #' Plot 6: P-value distributions (diagnostic)
 #'
+#' @param results_df Results with branch diagnostics (pre-computed)
+#' @param cb_palette Color palette
+#'
 plot_pvalue_distributions <- function(results_df, cb_palette = get_effect_palette()) {
-  prepared <- prepare_results(results_df)
-
-  p <- ggplot(prepared, aes(x = main_p_value, fill = effect_condition)) +
+  p <- ggplot(results_df, aes(x = main_p_value, fill = effect_condition)) +
     geom_histogram(bins = 20, alpha = 0.7, position = "identity") +
     geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
     scale_fill_manual(values = cb_palette, name = "Condition") +
@@ -510,17 +450,14 @@ plot_stripping_robustness <- function(results_df) {
 
 #' Plot 8: Sensitivity heatmap
 #'
-plot_sensitivity_heatmap <- function(results_df) {
-  sensitivity <- results_df %>%
-    prepare_results() %>%
-    dplyr::filter(is_true_effect) %>% # Only look at power for true effects
-    dplyr::group_by(model_type, outlier, transformation, sample_size) %>%
-    dplyr::summarise(
-      power = mean(is_significant, na.rm = TRUE),
-      .groups = "drop"
-    )
+#' @param sensitivity_df Pre-computed sensitivity analysis from analysis.R::analyze_specification_sensitivity()
+#'
+plot_sensitivity_heatmap <- function(sensitivity_df) {
+  # Filter to true effects only for power display
+  sensitivity_power <- sensitivity_df %>%
+    dplyr::filter(!is.na(power), !is.infinite(power))
 
-  p <- ggplot(sensitivity, aes(x = outlier, y = model_type, fill = power)) +
+  p <- ggplot(sensitivity_power, aes(x = outlier, y = model_type, fill = power)) +
     geom_tile(color = "white", linewidth = 0.5) +
     geom_text(aes(label = scales::percent(power, accuracy = 1)), size = 2.5) +
     scale_fill_viridis_c(
@@ -551,29 +488,39 @@ plot_sensitivity_heatmap <- function(results_df) {
 
 #' Generate full multiverse analysis dashboard
 #'
-#' @param results_df Results tibble from pipeline
+#' Uses pre-computed analysis objects from analysis.R
+#' No statistical computations performed here
+#'
+#' @param analysis_list List of analysis objects from analyze_multiverse_results()
 #' @param output_dir Directory to save plots
 #' @param save_individual Save individual plots as well as combined
 #'
 #' @return List of ggplot objects
 #'
-generate_multiverse_dashboard <- function(results_df,
+generate_multiverse_dashboard <- function(analysis_list,
                                           output_dir = "outputs/figures",
                                           save_individual = TRUE) {
-  logger::log_info("Generating multiverse dashboard...")
+  logger::log_info("Generating multiverse dashboard from pre-computed analysis...")
 
   if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-  # Generate all plots
+  # Extract pre-computed analysis objects
+  roc_metrics <- analysis_list$roc_metrics
+  fpr_by_null <- analysis_list$fdr_by_null_type  # Note: This is actually FPR in analysis.R
+  power_metrics <- analysis_list$power_analysis
+  sensitivity_df <- analysis_list$spec_sensitivity
+  results_with_diag <- analysis_list$results_with_diagnostics  # Need to pass this
+  
+  # Generate all plots using pre-computed objects
   plots <- list(
-    roc_by_model = plot_roc_by_model(results_df),
-    fdr_by_stripping = plot_fdr_by_stripping(results_df),
-    power_by_sample = plot_power_by_sample_size(results_df),
-    spec_curve = plot_specification_curve_detailed(results_df),
-    effect_dist = plot_effect_distributions(results_df),
-    pvalue_dist = plot_pvalue_distributions(results_df),
-    strip_robust = plot_stripping_robustness(results_df),
-    sensitivity = plot_sensitivity_heatmap(results_df)
+    roc_by_model = plot_roc_by_model(roc_metrics),
+    fdr_by_stripping = plot_fdr_by_stripping(fpr_by_null),
+    power_by_sample = plot_power_by_sample_size(power_metrics),
+    spec_curve = plot_specification_curve_detailed(results_with_diag),
+    effect_dist = plot_effect_distributions(results_with_diag),
+    pvalue_dist = plot_pvalue_distributions(results_with_diag),
+    strip_robust = plot_stripping_robustness(fpr_by_null),
+    sensitivity = plot_sensitivity_heatmap(sensitivity_df)
   )
 
   # Save individual plots
@@ -595,7 +542,7 @@ generate_multiverse_dashboard <- function(results_df,
     (plots$fdr_by_stripping + plots$strip_robust) +
     plot_annotation(
       title = "Multiverse Analysis Summary",
-      subtitle = sprintf("N = %d specifications", nrow(results_df)),
+      subtitle = sprintf("Pre-computed from %d analysis groups", nrow(roc_metrics)),
       theme = theme(
         plot.title = element_text(size = 16, face = "bold"),
         plot.subtitle = element_text(size = 12)
@@ -626,33 +573,4 @@ generate_multiverse_dashboard <- function(results_df,
   invisible(plots)
 }
 
-# ==============================================================================
-# SUMMARY TABLE
-# ==============================================================================
 
-#' Generate summary statistics table
-#'
-create_summary_table <- function(results_df) {
-  prepared <- prepare_results(results_df)
-
-  summary_tbl <- prepared %>%
-    dplyr::group_by(model_type, transformation, effect_condition) %>%
-    dplyr::summarise(
-      n = dplyr::n(),
-      n_converged = sum(converged_both, na.rm = TRUE),
-      pct_significant = mean(is_significant, na.rm = TRUE) * 100,
-      mean_effect = mean(main_estimate, na.rm = TRUE),
-      sd_effect = sd(main_estimate, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(
-      metric_type = dplyr::case_when(
-        effect_condition == "present" ~ "Power (TPR)",
-        TRUE ~ "FDR"
-      )
-    ) %>%
-    dplyr::arrange(model_type, transformation, effect_condition)
-
-  summary_tbl
-}
