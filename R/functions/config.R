@@ -169,11 +169,23 @@ generate_all_branches <- function(config) {
   branches <- dplyr::bind_rows(branches_present, branches_other) |>
     dplyr::mutate(
       branch_id = paste(sample_size, transformation, outlier, model, effect_condition, strip_method, sep = "__"),
-      n_combinations = dplyr::n()
+      n_total_branches = dplyr::n()
     ) |>
     tibble::rowid_to_column("idx")
 
+  stopifnot(
+    "present with non-none strip_method" =
+      !any(branches$effect_condition == "present" & branches$strip_method != "none"),
+    "null_both with non-none strip_method" =
+      !any(branches$effect_condition == "null_both" & branches$strip_method != "none"),
+    "null_interaction with none strip_method" =
+      !any(branches$effect_condition == "null_interaction" & branches$strip_method == "none"),
+    "duplicate branch_id" = length(unique(branches$branch_id)) == nrow(branches),
+    "all required columns present" = all(c("sample_size", "transformation", "outlier", "model", "effect_condition", "strip_method") %in% names(branches))
+  )
+
   logger::log_info("Generated {nrow(branches)} branch combinations")
+  logger::log_info("Branch validation: all constraints satisfied")
 
   branches
 }

@@ -63,21 +63,9 @@ get_strip_palette <- function() {
 #'
 #' Ensures all derived columns exist before analysis
 #'
-prepare_results <- function(results_df) {
-  results_df %>%
-    dplyr::filter(!error) %>%
+rename_for_plots <- function(df) {
+  df %>%
     dplyr::mutate(
-      # Convergence
-      converged_both = full_converged & dplyr::coalesce(null_converged, TRUE),
-
-      # Effect classification
-      is_true_effect = (effect_condition == "present" & strip_method == "none"),
-      is_null_effect = (
-        (effect_condition == "null_interaction" & strip_method %in% c("shuffle", "qmap_5")) |
-          (effect_condition == "null_both" & strip_method == "none")
-      ), # Significance (use t test as primary)
-      is_significant = main_p_value < 0.05,
-
       # Model type grouping
       model_type = dplyr::case_when(
         grepl("rmanova", model) ~ "rmANOVA",
@@ -88,91 +76,20 @@ prepare_results <- function(results_df) {
       ),
 
       # Clean labels
-      sample_size_pct = paste0(sample_size * 100, "%"),
+      sample_size = paste0(sample_size * 100, "%"),
       transformation_label = dplyr::if_else(
         transformation == "log_rt", "log(RT)", "Raw RT"
       ),
       strip_label = dplyr::case_when(
         strip_method == "none" ~ "No stripping",
+        strip_method == "none" & effect_condition == "null_both" ~ "ERROR!",
         strip_method == "shuffle" ~ "Shuffle",
         strip_method == "qmap_5" ~ "QMap",
         TRUE ~ strip_method
       )
-    ) %>%
-    dplyr::filter(converged_both) %>%
-    dplyr::filter(!(effect_condition == "present" & strip_method != "none"))
-}
-
-#' Compute ROC metrics properly
-#'
-#' TPR from present condition, FPR from null conditions
-#' Grouped appropriately to avoid single-row groups
-#'
-compute_roc_metrics <- function(results_df,
-                                group_vars = c(
-                                  "model_type", "sample_size",
-                                  "transformation", "strip_method"
-                                )) {
-  prepared <- prepare_results(results_df)
-
-  # TPR:  proportion significant when effect is PRESENT
-  tpr_df <- prepared %>%
-    dplyr::filter(is_true_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
-    dplyr::summarise(
-      n_true = dplyr::n(),
-      n_detected = sum(is_significant, na.rm = TRUE),
-      TPR = ifelse(n_true > 0, n_detected / n_true, NA_real_),
-      .groups = "drop"
-    )
-
-  # FPR:  proportion significant when effect is NULL
-  fpr_df <- prepared %>%
-    dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
-    dplyr::summarise(
-      n_null = dplyr::n(),
-      n_false_positive = sum(is_significant, na.rm = TRUE),
-      FPR = ifelse(n_null > 0, n_false_positive / n_null, NA_real_),
-      .groups = "drop"
-    )
-
-  # Join TPR and FPR
-  roc_df <- tpr_df %>%
-    dplyr::left_join(fpr_df, by = group_vars) %>%
-    dplyr::mutate(
-      # d' (sensitivity index)
-      d_prime = qnorm(pmin(TPR, 0.999)) - qnorm(pmax(FPR, 0.001)),
-      # Youden's J
-      youden_j = TPR - FPR
-    )
-
-  roc_df
-}
-
-#' Compute FDR by null condition type
-#'
-#' Separates null_interaction vs null_both to check if stripping works
-#'
-compute_fdr_by_null_type <- function(results_df,
-                                     group_vars = c(
-                                       "model_type", "sample_size",
-                                       "transformation", "strip_method"
-                                     )) {
-  prepared <- prepare_results(results_df)
-
-  prepared %>%
-    dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
-    dplyr::summarise(
-      n = dplyr::n(),
-      n_significant = sum(is_significant, na.rm = TRUE),
-      FDR = ifelse(n > 0, n_significant / n, NA_real_),
-      mean_p = mean(main_p_value, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      .groups = "drop"
     )
 }
+
 
 # ==============================================================================
 # INDIVIDUAL PLOTS
@@ -180,16 +97,11 @@ compute_fdr_by_null_type <- function(results_df,
 
 #' Plot 1: ROC curves by model and sample size
 #'
-plot_roc_by_model <- function(results_df,
-                              facet_by = "transformation",
-                              cb_palette = get_cb_palette()) {
-  roc_df <- compute_roc_metrics(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  ) %>%
-    dplyr::filter(strip_method == "none") # Baseline without stripping
-
-  p <- ggplot(roc_df, aes(x = FPR, y = TPR, color = model_type, group = model_type)) +
+plot_roc_by_model <- function(
+    roc_metrics,
+    facet_by = "transformation",
+    cb_palette = get_cb_palette()) {
+  p <- ggplot(roc_metrics, aes(x = FPR, y = TPR, color = model_type, group = model_type)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
     geom_vline(xintercept = 0.05, linetype = "dashed", color = "red", alpha = 0.5) +
     geom_path(linewidth = 0.8) +
@@ -230,32 +142,57 @@ plot_roc_by_model <- function(results_df,
   p
 }
 
-#' Plot 2: FDR comparison across stripping methods
-#'
-#' Key robustness check: does stripping inflate FDR?
-#'
-plot_fdr_by_stripping <- function(results_df, cb_palette = get_strip_palette()) {
-  fdr_df <- compute_fdr_by_null_type(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  )
 
-  # Summarize across sample sizes for cleaner plot
-  fdr_summary <- fdr_df %>%
-    dplyr::group_by(model_type, transformation, strip_method, effect_condition) %>%
-    dplyr::summarise(
-      mean_FDR = mean(FDR, na.rm = TRUE),
-      se_FDR = sd(FDR, na.rm = TRUE) / sqrt(dplyr::n()),
-      .groups = "drop"
+plot_roc_by_outlier <- function(
+    roc_metrics,
+    facet_by = "transformation",
+    cb_palette = get_cb_palette()) {
+  p <- ggplot(roc_metrics, aes(x = FPR, y = TPR, color = outlier, group = outlier)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
+    geom_vline(xintercept = 0.05, linetype = "dashed", color = "red", alpha = 0.5) +
+    geom_path(linewidth = 0.8) +
+    geom_point(aes(shape = model_type), alpha = 0.8) +
+    ggrepel::geom_text_repel(
+      aes(label = scales::percent(model_type, accuracy = 1)),
+      size = 2.5,
+      max.overlaps = 10,
+      show.legend = FALSE,
+      segment.alpha = 0.3
+    ) +
+    scale_color_manual(values = cb_palette, name = "Filtering Method") +
+    scale_size_continuous(range = c(2, 5), guide = "none") +
+    scale_x_continuous(
+      limits = c(0, 0.25),
+      breaks = c(0, 0.05, 0.1, 0.15, 0.2, 0.25),
+      labels = scales::percent
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.2),
+      labels = scales::percent
+    ) +
+    facet_wrap(vars(!!sym(facet_by)), ncol = 2) +
+    labs(
+      title = "ROC Curves by Filtering Strategies",
+      subtitle = "Points shaped by model type; dashed line = nominal alpha = 0.05",
+      x = "False Positive Rate",
+      y = "True Positive Rate"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(face = "bold")
     )
 
-  p <- ggplot(fdr_summary, aes(x = strip_method, y = mean_FDR, fill = strip_method)) +
+  p
+}
+#' Plot 2: FPR comparison across stripping methods
+
+#'
+plot_fdr_by_stripping <- function(fpr_by_null, cb_palette = get_strip_palette()) {
+  p <- ggplot(fpr_by_null, aes(x = strip_method, y = FPR, fill = strip_method)) +
     geom_col(position = "dodge", alpha = 0.8) +
-    geom_errorbar(
-      aes(ymin = mean_FDR - se_FDR, ymax = mean_FDR + se_FDR),
-      width = 0.2,
-      position = position_dodge(0.9)
-    ) +
     geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
     scale_fill_manual(values = cb_palette, guide = "none") +
     scale_y_continuous(
@@ -264,20 +201,18 @@ plot_fdr_by_stripping <- function(results_df, cb_palette = get_strip_palette()) 
       expand = expansion(mult = c(0, 0.1))
     ) +
     facet_grid(
-      rows = vars(effect_condition),
       cols = vars(model_type),
       labeller = labeller(
         effect_condition = c(
           "null_interaction" = "Null: Interaction only",
-          "null_both" = "Null: Both effects"
         )
       )
     ) +
     labs(
-      title = "False Discovery Rate by Stripping Method",
+      title = "False Positive Rate by Stripping Method",
       subtitle = "Red dashed line = nominal alpha = 0.05",
       x = "Stripping Method",
-      y = "False Discovery Rate"
+      y = "False Positive Rate"
     ) +
     theme_minimal(base_size = 11) +
     theme(
@@ -291,15 +226,9 @@ plot_fdr_by_stripping <- function(results_df, cb_palette = get_strip_palette()) 
 
 #' Plot 3: TPR (Power) by sample size
 #'
-plot_power_by_sample_size <- function(results_df, cb_palette = get_cb_palette()) {
-  roc_df <- compute_roc_metrics(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  ) %>%
-    dplyr::filter(strip_method == "none")
-
-  p <- ggplot(roc_df, aes(
-    x = factor(sample_size), y = TPR,
+plot_power_by_sample_size <- function(power_metrics, cb_palette = get_cb_palette()) {
+  p <- ggplot(power_metrics, aes(
+    x = factor(sample_size), y = power,
     color = model_type, group = model_type
   )) +
     geom_line(linewidth = 0.8) +
@@ -329,7 +258,7 @@ plot_power_by_sample_size <- function(results_df, cb_palette = get_cb_palette())
 #' Plot 4: Specification curve
 #'
 plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
-  prepared <- prepare_results(results_df) %>%
+  prepared <- results_df %>%
     dplyr::arrange(main_estimate) %>%
     dplyr::mutate(spec_rank = dplyr::row_number())
 
@@ -357,10 +286,11 @@ plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
 
   # Bottom panel: specification indicators
   spec_indicators <- prepared %>%
+    dplyr::filter(effect_condition == "present" & strip_method == "none") %>%
     dplyr::mutate(sample_size = as.factor(sample_size)) %>%
     dplyr::select(
       spec_rank, model_type, transformation, sample_size,
-      outlier, strip_method, effect_condition
+      outlier
     ) %>%
     tidyr::pivot_longer(
       cols = -spec_rank,
@@ -369,8 +299,8 @@ plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
     ) %>%
     dplyr::mutate(
       dimension = factor(dimension, levels = c(
-        "effect_condition", "model_type", "transformation",
-        "sample_size", "outlier", "strip_method"
+        "model_type", "transformation",
+        "sample_size", "outlier"
       ))
     )
 
@@ -391,17 +321,14 @@ plot_specification_curve_detailed <- function(results_df, alpha = 0.05) {
 #' Plot 5: Effect size distributions by condition
 #'
 plot_effect_distributions <- function(results_df, cb_palette = get_effect_palette()) {
-  prepared <- prepare_results(results_df)
-
-  p <- ggplot(prepared, aes(x = effect_size, fill = effect_condition)) +
+  p <- ggplot(results_df, aes(x = main_estimate, fill = effect_condition)) +
     geom_density(alpha = 0.6, color = NA) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
     scale_fill_manual(
       values = cb_palette,
       labels = c(
         "present" = "Effect present",
-        "null_interaction" = "Null interaction",
-        "null_both" = "Null both"
+        "null_interaction" = "Null interaction"
       ),
       name = "Condition"
     ) +
@@ -424,9 +351,7 @@ plot_effect_distributions <- function(results_df, cb_palette = get_effect_palett
 #' Plot 6: P-value distributions (diagnostic)
 #'
 plot_pvalue_distributions <- function(results_df, cb_palette = get_effect_palette()) {
-  prepared <- prepare_results(results_df)
-
-  p <- ggplot(prepared, aes(x = main_p_value, fill = effect_condition)) +
+  p <- ggplot(results_df, aes(x = main_p_value, fill = effect_condition)) +
     geom_histogram(bins = 20, alpha = 0.7, position = "identity") +
     geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
     scale_fill_manual(values = cb_palette, name = "Condition") +
@@ -437,7 +362,7 @@ plot_pvalue_distributions <- function(results_df, cb_palette = get_effect_palett
     ) +
     labs(
       title = "P-value Distributions",
-      subtitle = "Null conditions should be uniform; present condition should be left-skewed",
+      subtitle = "Null condition should be uniform; present condition should be left-skewed",
       x = "P-value (Satterthwaite)",
       y = "Count"
     ) +
@@ -452,14 +377,9 @@ plot_pvalue_distributions <- function(results_df, cb_palette = get_effect_palett
 
 #' Plot 7: Stripping robustness - FDR should NOT depend on stripping
 #'
-plot_stripping_robustness <- function(results_df) {
-  fdr_df <- compute_fdr_by_null_type(
-    results_df,
-    group_vars = c("model_type", "sample_size", "transformation", "strip_method")
-  )
-
+plot_stripping_robustness <- function(fpr_df) {
   # Compare none vs shuffle vs qmap
-  fdr_wide <- fdr_df %>%
+  fpr_wide <- fpr_df %>%
     dplyr::select(
       model_type, sample_size, transformation, effect_condition,
       strip_method, FDR
@@ -470,8 +390,8 @@ plot_stripping_robustness <- function(results_df) {
       names_prefix = "FDR_"
     )
 
-  # Plot:  FDR with stripping vs without
-  p1 <- ggplot(fdr_wide, aes(x = FDR_none, y = FDR_shuffle)) +
+  # Plot: FDR with stripping vs without
+  p1 <- ggplot(fpr_wide, aes(x = FDR_qmap_5, y = FDR_shuffle)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
     geom_point(aes(color = model_type, shape = effect_condition), size = 3, alpha = 0.7) +
     geom_vline(xintercept = 0.05, linetype = "dotted", color = "red", alpha = 0.5) +
@@ -479,48 +399,24 @@ plot_stripping_robustness <- function(results_df) {
     scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
     scale_y_continuous(limits = c(0, 0.3), labels = scales::percent) +
     labs(
-      title = "Shuffle vs No Stripping",
-      x = "FDR (no stripping)",
+      title = "Shuffle vs Quantile Mapping",
+      x = "FDR (qmap_5)",
       y = "FDR (shuffle)"
-    ) +
-    theme_minimal(base_size = 10) +
-    theme(legend.position = "none")
-
-  p2 <- ggplot(fdr_wide, aes(x = FDR_none, y = FDR_qmap_5)) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
-    geom_point(aes(color = model_type, shape = effect_condition), size = 3, alpha = 0.7) +
-    geom_vline(xintercept = 0.05, linetype = "dotted", color = "red", alpha = 0.5) +
-    geom_hline(yintercept = 0.05, linetype = "dotted", color = "red", alpha = 0.5) +
-    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
-    scale_y_continuous(limits = c(0, 0.3), labels = scales::percent) +
-    labs(
-      title = "QMap vs No Stripping",
-      x = "FDR (no stripping)",
-      y = "FDR (QMap)"
     ) +
     theme_minimal(base_size = 10) +
     theme(legend.position = "right")
 
-  p1 + p2 +
+  p1 +
     plot_annotation(
       title = "Stripping Robustness Check",
-      subtitle = "Points on diagonal = stripping does not inflate FDR"
+      subtitle = "Points on diagonal = stripping method does not influence FPR"
     )
 }
 
 #' Plot 8: Sensitivity heatmap
 #'
-plot_sensitivity_heatmap <- function(results_df) {
-  sensitivity <- results_df %>%
-    prepare_results() %>%
-    dplyr::filter(is_true_effect) %>% # Only look at power for true effects
-    dplyr::group_by(model_type, outlier, transformation, sample_size) %>%
-    dplyr::summarise(
-      power = mean(is_significant, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  p <- ggplot(sensitivity, aes(x = outlier, y = model_type, fill = power)) +
+plot_sensitivity_heatmap <- function(sensitivity_df) {
+  p <- ggplot(sensitivity_df, aes(x = outlier, y = model_type, fill = power)) +
     geom_tile(color = "white", linewidth = 0.5) +
     geom_text(aes(label = scales::percent(power, accuracy = 1)), size = 2.5) +
     scale_fill_viridis_c(
@@ -557,23 +453,30 @@ plot_sensitivity_heatmap <- function(results_df) {
 #'
 #' @return List of ggplot objects
 #'
-generate_multiverse_dashboard <- function(results_df,
+generate_multiverse_dashboard <- function(analysis_list,
                                           output_dir = "outputs/figures",
                                           save_individual = TRUE) {
-  logger::log_info("Generating multiverse dashboard...")
+  logger::log_info("Generating multiverse dashboard from precomputed tables...")
 
   if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-  # Generate all plots
+
+  roc_metrics <- analysis_list$roc_metrics
+  fpr_by_null <- analysis_list$fpr_by_null
+  power_metrics <- analysis_list$power_analytics
+  sensitivity_df <- analysis_list$spec_sensitivity
+  results_with_diag <- analysis_list$results_with_diagnostics
+
   plots <- list(
-    roc_by_model = plot_roc_by_model(results_df),
-    fdr_by_stripping = plot_fdr_by_stripping(results_df),
-    power_by_sample = plot_power_by_sample_size(results_df),
-    spec_curve = plot_specification_curve_detailed(results_df),
-    effect_dist = plot_effect_distributions(results_df),
-    pvalue_dist = plot_pvalue_distributions(results_df),
-    strip_robust = plot_stripping_robustness(results_df),
-    sensitivity = plot_sensitivity_heatmap(results_df)
+    roc_by_outlier = plot_roc_by_outlier(roc_metrics),
+    roc_by_model = plot_roc_by_model(roc_metrics),
+    fdr_by_stripping = plot_fdr_by_stripping(fpr_by_null),
+    power_by_sample = plot_power_by_sample_size(power_metrics),
+    spec_curve = plot_specification_curve_detailed(results_with_diag),
+    effect_dist = plot_effect_distributions(results_with_diag),
+    pvalue_dist = plot_pvalue_distributions(results_with_diag),
+    strip_robust = plot_stripping_robustness(fpr_by_null),
+    sensitivity = plot_sensitivity_heatmap(sensitivity_df)
   )
 
   # Save individual plots
@@ -590,12 +493,13 @@ generate_multiverse_dashboard <- function(results_df,
     }
   }
 
-  # Create summary dashboard (2x2 of key plots)
-  dashboard <- (plots$roc_by_model + plots$power_by_sample) /
+  # Create summary dashboard (3x2 of key plots)
+  dashboard <- plots$roc_by_outlier /
+    (plots$roc_by_model + plots$power_by_sample) /
     (plots$fdr_by_stripping + plots$strip_robust) +
     plot_annotation(
       title = "Multiverse Analysis Summary",
-      subtitle = sprintf("N = %d specifications", nrow(results_df)),
+      subtitle = sprintf("Pre-computed from %d analysis groups", nrow(roc_metrics)),
       theme = theme(
         plot.title = element_text(size = 16, face = "bold"),
         plot.subtitle = element_text(size = 12)
@@ -624,35 +528,4 @@ generate_multiverse_dashboard <- function(results_df,
   logger::log_info("Dashboard generation complete:  {length(plots)} plots created")
 
   invisible(plots)
-}
-
-# ==============================================================================
-# SUMMARY TABLE
-# ==============================================================================
-
-#' Generate summary statistics table
-#'
-create_summary_table <- function(results_df) {
-  prepared <- prepare_results(results_df)
-
-  summary_tbl <- prepared %>%
-    dplyr::group_by(model_type, transformation, effect_condition) %>%
-    dplyr::summarise(
-      n = dplyr::n(),
-      n_converged = sum(converged_both, na.rm = TRUE),
-      pct_significant = mean(is_significant, na.rm = TRUE) * 100,
-      mean_effect = mean(main_estimate, na.rm = TRUE),
-      sd_effect = sd(main_estimate, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(
-      metric_type = dplyr::case_when(
-        effect_condition == "present" ~ "Power (TPR)",
-        TRUE ~ "FDR"
-      )
-    ) %>%
-    dplyr::arrange(model_type, transformation, effect_condition)
-
-  summary_tbl
 }

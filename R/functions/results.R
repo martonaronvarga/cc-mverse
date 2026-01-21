@@ -134,19 +134,26 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     )
   null_interaction_rows <- null_coefs %>%
     dplyr::filter(
-      dplyr::str_detect(term, ":")
+      stringr::str_detect(term, ":")
     )
 
-  main_est <- interaction_rows$estimate[1] %||% NA_real_
+
+  main_est <- interaction_rows$estimate[1] %||% {
+    logger::log_debug("No interaction term found for {branch_spec$branch_id}")
+    NA_real_
+  }
   main_se <- interaction_rows$std.error[1] %||% NA_real_
   main_tstat <- interaction_rows$statistic[1] %||% NA_real_
   main_p <- interaction_rows$p.value[1] %||% NA_real_
 
-  null_main_est <- null_interaction_rows$estimate[1] %||% NA_real_
-  null_main_se <- null_interaction_rows$std.error[1] %||% NA_real_
-  null_tstat <- null_interaction_rows$statistic[1] %||% NA_real_
-  null_main_p <- null_interaction_rows$p.value[1] %||% NA_real_ # Effect size (Cohen's d approximation from t-statistic)
-  null_effect_size <- ifelse(!is.na(null_main_tstat), null_main_tstat / sqrt(nobs(null_model)), NA_real_)
+  null_main_est <- null_interaction_rows$estimate[1] %||% {
+    logger::log_debug("No interaction term in null model for {branch_spec$branch_id}")
+    0
+  }
+  null_main_se <- null_interaction_rows$std.error[1] %||% 0
+  null_tstat <- null_interaction_rows$statistic[1] %||% 0
+  null_main_p <- null_interaction_rows$p.value[1] %||% 0
+  null_effect_size <- ifelse(null_main_tstat != 0, null_main_tstat / sqrt(nobs(null_model)), 0)
 
   # Confidence interval (already in tidy output if conf.int = TRUE)
   ci_lower <- interaction_rows$conf.low[1] %||% NA_real_
@@ -158,7 +165,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 
   # Extract random effects variance
   ranef_tib <- model_result$random_effects
-  null_ranef_tib <- model_result$null_random_efects
+  null_ranef_tib <- model_result$null_random_effects
   random_int_var <- NA_real_
   random_slope_var <- NA_real_
   null_random_int_var <- NA_real_
@@ -168,6 +175,13 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   null_vc <- lme4::VarCorr(null_model)
   random_int_var <- as.numeric(attr(vc$participant_id, "stddev")["(Intercept)"]^2)
   null_random_int_var <- as.numeric(attr(null_vc$participant_id, "stddev")["(Intercept)"]^2)
+
+  if (!is.null(vc$participant_id) && "cong" %in% colnames(vc$participant_id)) {
+    random_slope_var <- as.numeric(attr(vc$participant_id, "stddev")["cong:prev_cong"]^2)
+  }
+  if (!is.null(null_vc$participant_id) && "cong" %in% colnames(null_vc$participant_id)) {
+    null_random_slope_var <- as.numeric(attr(null_vc$participant_id, "stddev")["cong:prev_cong"]^2)
+  }
 
   # Model fit metrics from lme4::VarCorr
   resid_var <- attr(vc, "sc")^2 # Residual variance (sigma)
@@ -180,7 +194,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     NA_real_
   )
   null_effect_size <- ifelse(
-    !is.na(null_main_est) && !is.na(null_resid_var) && null_resid_var > 0,
+    (null_main_est != 0) && !is.na(null_resid_var) && null_resid_var > 0,
     null_main_est / sqrt(null_resid_var),
     NA_real_
   )
@@ -216,7 +230,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     full_converged = model_result$full_converged,
     null_converged = model_result$null_converged,
     AIC_diff = (performance$full_AIC - performance$null_AIC) %>% as.numeric(),
-    BIC_diff = (performance$full_BIC - performance$null_bic) %>% as.numeric(),
+    BIC_diff = (performance$full_BIC - performance$null_BIC) %>% as.numeric(),
     LR_stat = performance$LR_stat,
     LR_df = performance$LR_df,
     LR_p = performance$LR_p,
@@ -333,12 +347,12 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     LR_p = p_value,
 
     # Fixed effect (main effect)
-    main_estimate = f_stat,
-    null_main_estimate = f_stat,
+    main_estimate = eta_sq,
+    null_main_estimate = NA_real_,
     main_std_error = NA_real_,
     null_std_error = NA_real_,
     main_t_stat = f_stat, # F-stat as proxy
-    nul_t_stat = f_stat,
+    null_t_stat = f_stat,
     main_p_value = p_value,
     null_main_p_value = p_value,
 

@@ -174,7 +174,7 @@ compute_roc_metrics <- function(
     alpha = 0.05,
     group_vars = c(
       "model", "sample_size",
-      "transformation"
+      "transformation", "outlier"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both) %>%
@@ -183,7 +183,7 @@ compute_roc_metrics <- function(
 
   # TPR: proportion significant when effect is PRESENT
   tpr_df <- prepared %>%
-    dplyr::filter(is_true_effect, strip_method == "none") %>%
+    dplyr::filter(is_true_effect) %>%
     dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
     dplyr::summarise(
       n_true = dplyr::n(),
@@ -196,7 +196,7 @@ compute_roc_metrics <- function(
   # FPR: proportion significant when effect is NULL
   fpr_df <- prepared %>%
     dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "strip_method")))) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars)))) %>%
     dplyr::summarise(
       n_null = dplyr::n(),
       n_false_positive = sum(is_significant, na.rm = TRUE),
@@ -248,7 +248,6 @@ compute_fpr_by_null_type <- function(
     allowed_combinations_filter() %>%
     dplyr::mutate(is_significant = main_p_value < alpha)
 
-  # NOTE: i think in some null models the interaction doesn't exist so i have to grace that in results.R/models.R
   fpr_df <- prepared %>%
     dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
     dplyr::summarise(
@@ -261,7 +260,7 @@ compute_fpr_by_null_type <- function(
       .groups = "drop"
     )
 
-  logger::log_info("Computed FDR for {nrow(fdr_df)} null-condition groupings")
+  logger::log_info("Computed FPR for {nrow(fpr_df)} null-condition groupings")
 
   fpr_df
 }
@@ -304,9 +303,6 @@ compute_power <- function(
   power_df
 }
 
-# ==============================================================================
-# MULTIVERSE-LEVEL ANALYSIS
-# ==============================================================================
 
 #' Compute discovery rates
 #'
@@ -321,7 +317,7 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
   roc_metrics <- compute_roc_metrics(
     results_df,
     alpha = alpha,
-    group_vars = c("model", "strip_method", "sample_size", "transformation", "outlier")
+    group_vars = c("model", "sample_size", "transformation", "outlier")
   )
 
 
@@ -332,7 +328,7 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
       false_positive_rate = FPR
     ) %>%
     dplyr::mutate(
-      pct_tpr = 100 * true_discovery_rate,
+      pct_tpr = 100 * true_positive_rate,
       pct_fpr = 100 * false_positive_rate
     )
 
@@ -420,11 +416,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::group_by(strip_method) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
-        power = if (unique(strip_method) == "none") {
-          mean(is_significant[is_true_effect], na.rm = TRUE)
-        } else {
-          NA_real_
-        },
+        power = ifelse(strip_method[1] == "none", mean(is_significant[is_true_effect], na.rm = TRUE), NA_real_),
         fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
         mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
         mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
@@ -445,12 +437,55 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
     spec_inconsistencies = detect_specification_inconsistencies(results_with_diag, alpha = alpha),
 
     # Sensitivity analysis
-    spec_sensitivity = analyze_specification_sensitivity(results_with_diag)
+    spec_sensitivity = analyze_specification_sensitivity(results_with_diag),
+    summary_table = create_summary_table(results_with_diag),
+    results_with_diag = results_with_diag
   )
 
   logger::log_info("Multiverse analysis complete:  {length(analyses)} tables generated")
 
   analyses
+}
+
+#' Generate summary statistics table
+#'
+#' @param results_df Results with diagnostics
+#'
+#' @return Summary tibble
+#'
+create_summary_table <- function(results_df) {
+  # Add model_type grouping for display
+  prepared <- results_df %>%
+    dplyr::mutate(
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    )
+
+  summary_tbl <- prepared %>%
+    dplyr::group_by(model_type, transformation, effect_condition) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_converged = sum(converged_both, na.rm = TRUE),
+      pct_significant = mean(is_significant, na.rm = TRUE) * 100,
+      mean_effect = mean(main_estimate, na.rm = TRUE),
+      sd_effect = sd(main_estimate, na.rm = TRUE),
+      median_p = median(main_p_value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      metric_type = dplyr::case_when(
+        effect_condition == "present" ~ "Power (TPR)",
+        TRUE ~ "FPR"
+      )
+    ) %>%
+    dplyr::arrange(model_type, transformation, effect_condition)
+
+  summary_tbl
 }
 
 #' Analyze results and save to disk
@@ -557,12 +592,12 @@ analyze_specification_sensitivity <- function(results_df) {
     allowed_combinations_filter() %>%
     analysis_main_filter() %>%
     dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
-    dplyr::group_by(transformation, outlier, sample_size) %>%
+    dplyr::group_by(transformation, outlier, sample_size, model_type) %>%
     dplyr::summarise(
       n_results = dplyr::n(),
       # Separate by condition type
       power = mean(is_significant[is_true_effect], na.rm = TRUE),
-      fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
+      fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
       mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
       mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
       mean_rp = mean(main_p_value, na.rm = TRUE),
