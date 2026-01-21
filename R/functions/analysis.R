@@ -1,6 +1,28 @@
 # R/functions/analysis.R - Results Aggregation & Discovery Rate Analysis
 
 # ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+#' Derive canonical model_type label from raw model name
+#'
+#' Converts raw model names (e.g., "lmm_intercept") to display labels (e.g., "LMM (intercept)")
+#'
+#' @param model Character vector of model names
+#'
+#' @return Character vector of display labels
+#'
+derive_model_type <- function(model) {
+  dplyr::case_when(
+    grepl("rmanova", model) ~ "rmANOVA",
+    grepl("full_slope", model) ~ "LMM (full)",
+    grepl("cong_slope", model) ~ "LMM (cong slope)",
+    grepl("intercept", model) ~ "LMM (intercept)",
+    TRUE ~ model
+  )
+}
+
+# ==============================================================================
 # BRANCH-LEVEL ANALYSIS
 # ==============================================================================
 # Analysis of individual branch results (single models, convergence, fit)
@@ -181,13 +203,7 @@ compute_roc_metrics <- function(
     allowed_combinations_filter() %>%
     dplyr::mutate(
       is_significant = main_p_value < alpha,
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
+      model_type = derive_model_type(model)
     )
 
   # TPR: proportion significant when effect is PRESENT
@@ -242,7 +258,8 @@ compute_roc_metrics <- function(
 #'
 #' @param results_df Results tibble
 #' @param alpha Significance threshold
-#' @param group_vars Grouping variables
+#' @param group_vars Grouping variables (expanded from original to include model_type,
+#'   sample_size, transformation for downstream plot compatibility)
 #'
 #' @return Tibble with FPR by null type
 #'
@@ -257,13 +274,7 @@ compute_fpr_by_null_type <- function(
     allowed_combinations_filter() %>%
     dplyr::mutate(
       is_significant = main_p_value < alpha,
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
+      model_type = derive_model_type(model)
     )
 
   fpr_df <- prepared %>%
@@ -303,13 +314,7 @@ compute_power <- function(
     allowed_combinations_filter() %>%
     dplyr::mutate(
       is_significant = main_p_value < alpha,
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
+      model_type = derive_model_type(model)
     )
 
   power_df <- prepared %>%
@@ -483,15 +488,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
 create_summary_table <- function(results_df) {
   # Add model_type grouping for display
   prepared <- results_df %>%
-    dplyr::mutate(
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
-    )
+    dplyr::mutate(model_type = derive_model_type(model))
 
   summary_tbl <- prepared %>%
     dplyr::group_by(model_type, transformation, effect_condition) %>%
@@ -619,15 +616,7 @@ analyze_specification_sensitivity <- function(results_df) {
     allowed_combinations_filter() %>%
     analysis_main_filter() %>%
     dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
-    dplyr::mutate(
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
-    ) %>%
+    dplyr::mutate(model_type = derive_model_type(model)) %>%
     dplyr::group_by(transformation, outlier, sample_size, model_type) %>%
     dplyr::summarise(
       n_results = dplyr::n(),

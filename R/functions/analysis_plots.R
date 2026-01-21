@@ -62,18 +62,13 @@ get_strip_palette <- function() {
 #' Prepare results with proper diagnostics
 #'
 #' Ensures all derived columns exist before analysis
+#' Uses derive_model_type() helper from analysis.R
 #'
 rename_for_plots <- function(df) {
   df %>%
     dplyr::mutate(
-      # Model type grouping
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      ),
+      # Model type grouping - use shared helper
+      model_type = derive_model_type(model),
 
       # Clean labels
       sample_size = paste0(sample_size * 100, "%"),

@@ -45,13 +45,8 @@ prep_alt_results <- function(results_df) {
           (effect_condition == "null_both" & strip_method == "none")
       ),
       is_significant = main_p_value < 0.05,
-      model_type = case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      ),
+      # Use shared helper from analysis.R
+      model_type = derive_model_type(model),
       strip_label = case_when(
         strip_method == "none" ~ "No stripping",
         strip_method == "shuffle" ~ "Shuffle",
