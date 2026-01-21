@@ -4,26 +4,14 @@
 # BRANCH-LEVEL ANALYSIS
 # ==============================================================================
 # Analysis of individual branch results (single models, convergence, fit)
-#
 
 analysis_main_filter <- function(
     df,
-    max_abs_main_estimate = 1e3,
-    max_main_std_error = 1e2,
-    min_effect_precision = 0, # can be set, but defaults to keep all
     remove_singular = TRUE # remove singular fits via lme4 message or random effects var
     ) {
   out <- df
 
-  # Remove extreme main_estimate or main_std_error (irrealistic)
-  out <- out %>%
-    dplyr::filter(
-      is.na(main_estimate) | abs(main_estimate) <= max_abs_main_estimate,
-      is.na(main_std_error) | main_std_error <= max_main_std_error,
-      is.na(effect_precision) | effect_precision >= min_effect_precision
-    )
 
-  # Remove singular fits if indicated (for LMMs: variance of random slopes/intercepts exactly zero, or lme4 message; or global flag in model_result)
   if (remove_singular) {
     # Often found as "singular fit" message in error_message or model_result$message
     if ("error_message" %in% names(out)) {
@@ -90,6 +78,10 @@ compute_branch_diagnostics <- function(results_df) {
     )
 
   diagn <- analysis_main_filter(diagn)
+
+  stopifnot(
+    "Overlapping effect definitions" = !any(diagn$is_true_effect & diagn$is_null_effect, na.rm = TRUE)
+  )
   diagn
 }
 
@@ -108,18 +100,17 @@ branch_summary_by_model <- function(results_df) {
       n_branches = dplyr::n(),
       n_converged = sum(converged_both, na.rm = TRUE),
       convergence_rate = mean(converged_both, na.rm = TRUE),
-
       # Effect estimates (only converged)
       mean_main_estimate = mean(main_estimate[converged_both], na.rm = TRUE),
       median_main_estimate = median(main_estimate[converged_both], na.rm = TRUE),
       sd_main_estimate = sd(main_estimate[converged_both], na.rm = TRUE),
 
       # Model fit
-      mean_aic_diff = mean(AIC_diff, na.rm = TRUE),
-      mean_bic_diff = mean(BIC_diff, na.rm = TRUE),
+      mean_aic_diff = mean(AIC_diff[converged_both], na.rm = TRUE),
+      mean_bic_diff = mean(BIC_diff[converged_both], na.rm = TRUE),
 
       # Inference precision
-      mean_main_se = mean(main_std_error, na.rm = TRUE),
+      mean_main_se = mean(main_std_error[converged_both], na.rm = TRUE),
       .groups = "drop"
     ) %>%
     dplyr::arrange(mean_main_estimate)
@@ -156,9 +147,14 @@ identify_problematic_branches <- function(results_df) {
 }
 
 allowed_combinations_filter <- function(df) {
-  # Only allow present when strip_method == "none"
-  df %>% dplyr::filter(!(effect_condition == "present" & strip_method != "none"))
+  df %>%
+    dplyr::filter(
+      (effect_condition == "present" & strip_method == "none") |
+        (effect_condition == "null_both" & strip_method == "none") |
+        (effect_condition == "null_interaction" & strip_method != "none")
+    )
 }
+
 
 #' Compute ROC metrics (TPR and FPR) properly
 #'
@@ -173,15 +169,14 @@ allowed_combinations_filter <- function(df) {
 #'
 #' @return Tibble with TPR, FPR, and derived metrics
 #'
-compute_roc_metrics <- function(results_df,
-                                alpha = 0.05,
-                                group_vars = c(
-                                  "model", "sample_size",
-                                  "transformation", "strip_method"
-                                )) {
-  # Ensure diagnostics are computed
+compute_roc_metrics <- function(
+    results_df,
+    alpha = 0.05,
+    group_vars = c(
+      "model", "sample_size",
+      "transformation"
+    )) {
   prepared <- results_df %>%
-    compute_branch_diagnostics() %>%
     dplyr::filter(!error, converged_both) %>%
     allowed_combinations_filter() %>%
     dplyr::mutate(is_significant = main_p_value < alpha)
@@ -201,7 +196,7 @@ compute_roc_metrics <- function(results_df,
   # FPR: proportion significant when effect is NULL
   fpr_df <- prepared %>%
     dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "strip_method")))) %>%
     dplyr::summarise(
       n_null = dplyr::n(),
       n_false_positive = sum(is_significant, na.rm = TRUE),
@@ -219,7 +214,10 @@ compute_roc_metrics <- function(results_df,
       # Youden's J statistic
       youden_j = TPR - FPR,
       # Diagnostic odds ratio
-      DOR = (TPR / (1 - TPR + 1e-6)) / (FPR / (1 - FPR + 1e-6))
+      DOR = dplyr::case_when(
+        FPR == 0 | TPR == 1 ~ NA_real_,
+        TRUE ~ (TPR / (1 - TPR)) / (FPR / (1 - FPR))
+      )
     )
 
   logger::log_info("Computed ROC metrics for {nrow(roc_df)} groupings")
@@ -227,7 +225,7 @@ compute_roc_metrics <- function(results_df,
   roc_df
 }
 
-#' Compute FDR by null condition type
+#' Compute FPR by null condition type
 #'
 #' @details
 #' Separates null_interaction vs null_both to verify stripping method works
@@ -237,26 +235,26 @@ compute_roc_metrics <- function(results_df,
 #' @param alpha Significance threshold
 #' @param group_vars Grouping variables
 #'
-#' @return Tibble with FDR by null type
+#' @return Tibble with FPR by null type
 #'
-compute_fdr_by_null_type <- function(results_df,
-                                     alpha = 0.05,
-                                     group_vars = c(
-                                       "model", "sample_size",
-                                       "transformation", "strip_method"
-                                     )) {
+compute_fpr_by_null_type <- function(
+    results_df,
+    alpha = 0.05,
+    group_vars = c(
+      "strip_method"
+    )) {
   prepared <- results_df %>%
-    compute_branch_diagnostics() %>%
     dplyr::filter(!error, converged_both, is_null_effect) %>%
     allowed_combinations_filter() %>%
     dplyr::mutate(is_significant = main_p_value < alpha)
 
-  fdr_df <- prepared %>%
+  # NOTE: i think in some null models the interaction doesn't exist so i have to grace that in results.R/models.R
+  fpr_df <- prepared %>%
     dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
     dplyr::summarise(
       n = dplyr::n(),
       n_significant = sum(is_significant, na.rm = TRUE),
-      FDR = ifelse(n > 0, n_significant / n, NA_real_),
+      FPR = ifelse(n > 0, n_significant / n, NA_real_),
       mean_p = mean(main_p_value, na.rm = TRUE),
       median_p = median(main_p_value, na.rm = TRUE),
       mean_effect = mean(main_estimate, na.rm = TRUE),
@@ -265,10 +263,10 @@ compute_fdr_by_null_type <- function(results_df,
 
   logger::log_info("Computed FDR for {nrow(fdr_df)} null-condition groupings")
 
-  fdr_df
+  fpr_df
 }
 
-#' Compute power (TDR) across specifications
+#' Compute power (TPR) across specifications
 #'
 #' @param results_df Results tibble
 #' @param alpha Significance threshold
@@ -276,14 +274,14 @@ compute_fdr_by_null_type <- function(results_df,
 #'
 #' @return Tibble with power metrics
 #'
-compute_power <- function(results_df,
-                          alpha = 0.05,
-                          group_vars = c(
-                            "model", "sample_size",
-                            "transformation", "strip_method"
-                          )) {
+compute_power <- function(
+    results_df,
+    alpha = 0.05,
+    group_vars = c(
+      "model", "sample_size",
+      "transformation"
+    )) {
   prepared <- results_df %>%
-    compute_branch_diagnostics() %>%
     dplyr::filter(!error, converged_both, is_true_effect, strip_method == "none") %>%
     allowed_combinations_filter() %>%
     dplyr::mutate(is_significant = main_p_value < alpha)
@@ -310,7 +308,7 @@ compute_power <- function(results_df,
 # MULTIVERSE-LEVEL ANALYSIS
 # ==============================================================================
 
-#' Compute discovery rates (legacy function, now calls proper helpers)
+#' Compute discovery rates
 #'
 #' @param results_df Results tibble with all branches
 #' @param alpha Significance threshold
@@ -320,30 +318,22 @@ compute_power <- function(results_df,
 compute_discovery_rates <- function(results_df, alpha = 0.05) {
   logger::log_info("Computing discovery rates at alpha={alpha}")
 
-  # Use proper ROC computation
   roc_metrics <- compute_roc_metrics(
     results_df,
     alpha = alpha,
     group_vars = c("model", "strip_method", "sample_size", "transformation", "outlier")
   )
 
-  # Add FDR by null type for robustness checks
-  fdr_by_null <- compute_fdr_by_null_type(
-    results_df,
-    alpha = alpha,
-    group_vars = c("model", "strip_method", "sample_size", "transformation", "outlier")
-  )
 
   # Combine into single summary
   discovery_rates <- roc_metrics %>%
     dplyr::rename(
-      true_discovery_rate = TPR,
+      true_positive_rate = TPR,
       false_positive_rate = FPR
     ) %>%
     dplyr::mutate(
-      # For backwards compatibility
-      pct_significant_true = 100 * true_discovery_rate,
-      pct_significant_null = 100 * false_positive_rate
+      pct_tpr = 100 * true_discovery_rate,
+      pct_fpr = 100 * false_positive_rate
     )
 
   logger::log_info("Computed discovery rates for {nrow(discovery_rates)} combinations")
@@ -372,7 +362,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
 
     # Summary by model
     by_model = results_with_diag %>%
-      dplyr::filter(!error) %>%
+      dplyr::filter(!error, converged_both) %>%
       dplyr::group_by(model) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
@@ -380,8 +370,8 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
         mean_p = mean(main_p_value, na.rm = TRUE),
         median_p = median(main_p_value, na.rm = TRUE),
         # Separate power (true) from FDR (null)
-        power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
+        power = mean(is_significant[is_true_effect], na.rm = TRUE),
+        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
         mean_main_estimate = mean(main_estimate, na.rm = TRUE),
         sd_main_estimate = sd(main_estimate, na.rm = TRUE),
         .groups = "drop"
@@ -393,9 +383,9 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::group_by(transformation) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
+        power = mean(is_significant[is_true_effect], na.rm = TRUE),
+        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
+        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
         mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
         .groups = "drop"
       ),
@@ -407,7 +397,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::summarise(
         n_branches = dplyr::n(),
         power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
+        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
         mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
         .groups = "drop"
       ),
@@ -418,9 +408,9 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::group_by(sample_size) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
+        power = mean(is_significant[is_true_effect], na.rm = TRUE),
+        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
+        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
         .groups = "drop"
       ),
 
@@ -430,9 +420,13 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       dplyr::group_by(strip_method) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
+        power = if (unique(strip_method) == "none") {
+          mean(is_significant[is_true_effect], na.rm = TRUE)
+        } else {
+          NA_real_
+        },
+        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
+        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
         mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
         .groups = "drop"
       ),
@@ -441,12 +435,10 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
     roc_metrics = compute_roc_metrics(results_with_diag, alpha = alpha),
 
     # FDR by null type (robustness check)
-    fdr_by_null_type = compute_fdr_by_null_type(results_with_diag, alpha = alpha),
+    fdr_by_null_type = compute_fpr_by_null_type(results_with_diag, alpha = alpha),
 
     # Power analysis
     power_analysis = compute_power(results_with_diag, alpha = alpha),
-
-    # Legacy discovery rates
     discovery_rates = compute_discovery_rates(results_with_diag, alpha = alpha),
 
     # Specification inconsistencies
@@ -522,7 +514,6 @@ detect_specification_inconsistencies <- function(results_df, alpha = 0.05) {
     allowed_combinations_filter() %>%
     analysis_main_filter() %>%
     dplyr::filter(!error, !is.na(main_p_value)) %>%
-    compute_branch_diagnostics() %>%
     dplyr::filter(converged_both) %>%
     # Group by model and effect condition, vary preprocessing
     dplyr::group_by(model, effect_condition) %>%
@@ -540,7 +531,7 @@ detect_specification_inconsistencies <- function(results_df, alpha = 0.05) {
       # Effect size variation
       effect_mean = mean(main_estimate, na.rm = TRUE),
       effect_sd = sd(main_estimate, na.rm = TRUE),
-      effect_cv = effect_sd / (abs(effect_mean) + 0.01),
+      effect_cv = effect_sd / (abs(effect_mean) + 1e-6),
 
       # Inconsistent if not all agree
       is_inconsistent = pct_significant > 5 & pct_significant < 95,
@@ -565,177 +556,16 @@ analyze_specification_sensitivity <- function(results_df) {
   results_df %>%
     allowed_combinations_filter() %>%
     analysis_main_filter() %>%
-    compute_branch_diagnostics() %>%
     dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
     dplyr::group_by(transformation, outlier, sample_size) %>%
     dplyr::summarise(
       n_results = dplyr::n(),
       # Separate by condition type
-      power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
+      power = mean(is_significant[is_true_effect], na.rm = TRUE),
       fdr = mean(is_significant[is_null_effect], na.rm = TRUE),
-      mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
+      mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
       mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
       mean_rp = mean(main_p_value, na.rm = TRUE),
       .groups = "drop"
-    )
-}
-
-
-# ==============================================================================
-# VISUALIZATION
-# ==============================================================================
-
-
-plot_p_value_distribution <- function(results_df) {
-  results_df %>%
-    compute_branch_diagnostics() %>%
-    dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
-    ggplot2::ggplot(ggplot2::aes(x = main_p_value, fill = effect_condition)) +
-    ggplot2::geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
-    ggplot2::facet_grid(
-      rows = ggplot2::vars(model),
-      cols = ggplot2::vars(strip_method),
-      scales = "free_y"
-    ) +
-    ggplot2::geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
-    ggplot2::scale_fill_manual(
-      values = c(
-        "present" = "#2E7D32",
-        "null_interaction" = "#C62828",
-        "null_both" = "#6A1B9A"
-      ),
-      name = "Effect Condition"
-    ) +
-    ggplot2::theme_minimal() +
-    ggplot2::theme(
-      panel.spacing = ggplot2::unit(1, "lines"),
-      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
-    ) +
-    ggplot2::labs(
-      title = "P-value Distribution Across Branches",
-      subtitle = "Null conditions should be uniform; present should be left-skewed",
-      x = "P-value (Satterthwaite)",
-      y = "Frequency"
-    )
-}
-
-#' Specification curve plot
-#'
-plot_specification_curve <- function(results_df, alpha = 0.05) {
-  spec_curve <- results_df %>%
-    compute_branch_diagnostics() %>%
-    dplyr::filter(!error, converged_both, !is.na(LR_stat)) %>%
-    dplyr::arrange(main_estimate)
-
-  ggplot2::ggplot(spec_curve, ggplot2::aes(
-    x = seq_along(branch_id),
-    y = main_estimate,
-    color = is_significant
-  )) +
-    ggplot2::geom_point(alpha = 0.6, size = 1) +
-    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-    ggplot2::scale_color_manual(
-      values = c("TRUE" = "#2E7D32", "FALSE" = "#9E9E9E"),
-      labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
-      name = NULL
-    ) +
-    ggplot2::theme_minimal() +
-    ggplot2::theme(
-      panel.grid.major.x = ggplot2::element_blank(),
-      legend.position = "top"
-    ) +
-    ggplot2::labs(
-      title = "Specification Curve",
-      subtitle = "Effect estimates ranked from smallest to largest",
-      x = "Specification (ranked)",
-      y = "Effect Estimate"
-    )
-}
-
-#' Effect size distribution plot
-#'
-plot_main_estimate_distribution <- function(results_df) {
-  results_df %>%
-    compute_branch_diagnostics() %>%
-    dplyr::filter(!error, converged_both, !is.na(main_estimate)) %>%
-    ggplot2::ggplot(ggplot2::aes(x = main_estimate, fill = effect_condition)) +
-    ggplot2::geom_density(alpha = 0.6, color = NA) +
-    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
-    ggplot2::facet_wrap(~model, nrow = 2) +
-    ggplot2::scale_fill_manual(
-      values = c(
-        "present" = "#2E7D32",
-        "null_interaction" = "#C62828",
-        "null_both" = "#6A1B9A"
-      ),
-      name = "Effect Condition"
-    ) +
-    ggplot2::theme_minimal() +
-    ggplot2::labs(
-      title = "Effect Size Distribution",
-      subtitle = "Separation indicates discriminability",
-      x = "Effect Size",
-      y = "Density"
-    )
-}
-
-#' ROC plot
-#'
-plot_roc <- function(results_df,
-                     alpha = 0.05,
-                     cb_palette = c(
-                       "lmm_intercept" = "#332288",
-                       "lmm_cong_slope" = "#88CCEE",
-                       "lmm_full_slope" = "#117733",
-                       "rmanova" = "#CC6677"
-                     )) {
-  roc_table <- compute_roc_metrics(
-    results_df,
-    alpha = alpha,
-    group_vars = c("model", "strip_method", "sample_size", "transformation")
-  ) %>%
-    dplyr::mutate(
-      sample_size = factor(sample_size, levels = sort(unique(sample_size))),
-      model = factor(model)
-    )
-
-  ggplot2::ggplot(roc_table, ggplot2::aes(
-    x = FPR,
-    y = TPR,
-    group = model,
-    color = model
-  )) +
-    ggplot2::geom_abline(
-      slope = 1, intercept = 0,
-      linetype = "dotted", color = "grey50"
-    ) +
-    ggplot2::geom_vline(
-      xintercept = alpha, linetype = "dashed",
-      color = "red", alpha = 0.5
-    ) +
-    ggplot2::geom_path(linewidth = 0.8) +
-    ggplot2::geom_point(size = 2) +
-    ggplot2::scale_color_manual(values = cb_palette, name = "Model") +
-    ggplot2::scale_x_continuous(
-      limits = c(0, 0.25),
-      breaks = c(0, 0.05, 0.1, 0.15, 0.2, 0.25),
-      labels = scales::percent
-    ) +
-    ggplot2::scale_y_continuous(
-      limits = c(0, 1),
-      breaks = seq(0, 1, 0.2),
-      labels = scales::percent
-    ) +
-    ggplot2::facet_grid(
-      rows = ggplot2::vars(strip_method),
-      cols = ggplot2::vars(sample_size),
-      labeller = ggplot2::label_both
-    ) +
-    ggplot2::theme_minimal() +
-    ggplot2::labs(
-      title = "ROC Curves by Model and Sample Size",
-      subtitle = "Red dashed line = α = 0.05",
-      x = "False Positive Rate",
-      y = "True Positive Rate"
     )
 }

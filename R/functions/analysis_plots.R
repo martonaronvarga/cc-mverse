@@ -56,7 +56,7 @@ get_strip_palette <- function() {
 }
 
 # ==============================================================================
-# DATA PREPARATION (FIXED LOGIC)
+# DATA PREPARATION
 # ==============================================================================
 
 #' Prepare results with proper diagnostics

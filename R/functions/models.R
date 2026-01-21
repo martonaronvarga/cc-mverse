@@ -61,8 +61,7 @@ fit_rmanova <- function(data, spec) {
   full_model <- afex::aov_car(
     as.formula(spec$formula_full),
     data = data,
-    type = 3,
-    return = "aov"
+    type = 3
   )
 
   # Extract statistics
@@ -95,8 +94,10 @@ fit_lmm <- function(data, spec) {
   )
 
   # Check convergence
-  full_converged <- !any(grepl("convergence code", full_model@optinfo$conv$lme4))
-  null_converged <- !any(grepl("convergence code", null_model@optinfo$conv$lme4))
+  full_converged <- length(full_model@optinfo$conv$lme4$messages) == 0 &&
+    full_model@optinfo$conv$opt == 0
+  null_converged <- length(null_model@optinfo$conv$lme4$messages) == 0 &&
+    null_model@optinfo$conv$opt == 0
 
   logger::log_info(
     "LMM convergence: full={full_converged}, null={null_converged}"
@@ -108,8 +109,8 @@ fit_lmm <- function(data, spec) {
   # Extract coefficients and confidence intervals
   coefs <- broom.mixed::tidy(full_model, effects = "fixed", conf.int = TRUE)
   null_coefs <- broom.mixed::tidy(null_model, effects = "fixed", conf.int = TRUE)
-  random_effects <- broom.mixed::tidy(full_model, effects = "ran_vals")
-  null_random_effects <- broom.mixed::tidy(null_model, effects = "ran_vals")
+  random_effects <- broom.mixed::tidy(full_model, effects = "ran_pars")
+  null_random_effects <- broom.mixed::tidy(null_model, effects = "ran_pars")
 
   assumptions <- check_model_assumptions(full_model)
 
