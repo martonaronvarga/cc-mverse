@@ -67,14 +67,7 @@ rename_for_plots <- function(df) {
   df %>%
     dplyr::mutate(
       # Model type grouping
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      ),
-
+      model_type = derive_model(model),
       # Clean labels
       sample_size = paste0(sample_size * 100, "%"),
       transformation_label = dplyr::if_else(
@@ -153,7 +146,7 @@ plot_roc_by_outlier <- function(
     geom_path(linewidth = 0.8) +
     geom_point(aes(shape = model_type), alpha = 0.8) +
     ggrepel::geom_text_repel(
-      aes(label = scales::percent(model_type, accuracy = 1)),
+      aes(label = model_type),
       size = 2.5,
       max.overlaps = 10,
       show.legend = FALSE,
@@ -188,10 +181,8 @@ plot_roc_by_outlier <- function(
   p
 }
 #' Plot 2: FPR comparison across stripping methods
-
-#'
-plot_fdr_by_stripping <- function(fpr_by_null, cb_palette = get_strip_palette()) {
-  p <- ggplot(fpr_by_null, aes(x = strip_method, y = FPR, fill = strip_method)) +
+plot_fpr_by_stripping <- function(fpr_by_null, cb_palette = get_strip_palette()) {
+  p <- ggplot(fpr_by_null, aes(x = strip_method, y = FPR, group = sample_size, fill = sample_size)) +
     geom_col(position = "dodge", alpha = 0.8) +
     geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
     scale_fill_manual(values = cb_palette, guide = "none") +
@@ -201,10 +192,12 @@ plot_fdr_by_stripping <- function(fpr_by_null, cb_palette = get_strip_palette())
       expand = expansion(mult = c(0, 0.1))
     ) +
     facet_grid(
+      rows = vars(effect_condition),
       cols = vars(model_type),
       labeller = labeller(
         effect_condition = c(
-          "null_interaction" = "Null: Interaction only",
+          "null_interaction" = "Null: Interaction removed",
+          "null_both" = "Null: Everything removed"
         )
       )
     ) +
@@ -382,16 +375,16 @@ plot_stripping_robustness <- function(fpr_df) {
   fpr_wide <- fpr_df %>%
     dplyr::select(
       model_type, sample_size, transformation, effect_condition,
-      strip_method, FDR
+      strip_method, FPR
     ) %>%
     tidyr::pivot_wider(
       names_from = strip_method,
-      values_from = FDR,
-      names_prefix = "FDR_"
+      values_from = FPR,
+      names_prefix = "FPR_"
     )
 
-  # Plot: FDR with stripping vs without
-  p1 <- ggplot(fpr_wide, aes(x = FDR_qmap_5, y = FDR_shuffle)) +
+  # Plot: FPR with stripping vs without
+  p1 <- ggplot(fpr_wide, aes(x = FPR_qmap_5, y = FPR_shuffle)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
     geom_point(aes(color = model_type, shape = effect_condition), size = 3, alpha = 0.7) +
     geom_vline(xintercept = 0.05, linetype = "dotted", color = "red", alpha = 0.5) +
@@ -400,8 +393,8 @@ plot_stripping_robustness <- function(fpr_df) {
     scale_y_continuous(limits = c(0, 0.3), labels = scales::percent) +
     labs(
       title = "Shuffle vs Quantile Mapping",
-      x = "FDR (qmap_5)",
-      y = "FDR (shuffle)"
+      x = "FPR (qmap_5)",
+      y = "FPR (shuffle)"
     ) +
     theme_minimal(base_size = 10) +
     theme(legend.position = "right")
@@ -462,15 +455,15 @@ generate_multiverse_dashboard <- function(analysis_list,
 
 
   roc_metrics <- analysis_list$roc_metrics
-  fpr_by_null <- analysis_list$fpr_by_null
-  power_metrics <- analysis_list$power_analytics
+  fpr_by_null <- analysis_list$fpr_by_null_type
+  power_metrics <- analysis_list$power_analysis
   sensitivity_df <- analysis_list$spec_sensitivity
-  results_with_diag <- analysis_list$results_with_diagnostics
+  results_with_diag <- analysis_list$results_with_diag
 
   plots <- list(
     roc_by_outlier = plot_roc_by_outlier(roc_metrics),
     roc_by_model = plot_roc_by_model(roc_metrics),
-    fdr_by_stripping = plot_fdr_by_stripping(fpr_by_null),
+    fdr_by_stripping = plot_fpr_by_stripping(fpr_by_null),
     power_by_sample = plot_power_by_sample_size(power_metrics),
     spec_curve = plot_specification_curve_detailed(results_with_diag),
     effect_dist = plot_effect_distributions(results_with_diag),

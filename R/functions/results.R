@@ -7,7 +7,7 @@ RESULTS_COLUMNS <- c(
   "full_converged", "null_converged", "AIC_diff", "BIC_diff", "LR_stat",
   "LR_df", "LR_p", "main_estimate", "null_main_estimate", "main_std_error", "null_std_error", "main_t_stat",
   "null_t_stat",
-  "main_p_value", "null_main_p_value", "effect_size", "null_effect_size", "effect_ci_lower", "null_effect_ci_lower",
+  "main_p_value", "null_main_p_value", "effect_size", "null_effect", "effect_ci_lower", "null_effect_ci_lower",
   "effect_ci_upper", "null_effect_ci_upper",
   "random_intercept_var", "null_random_intercept_var", "random_slope_var", "null_random_slope_var", "residual_var",
   "null_residual_var",
@@ -27,7 +27,7 @@ get_results_schema <- function() {
     effect_condition = arrow::string(),
     strip_method = arrow::string(),
     n_obs = arrow::int32(),
-    null_n_obs = arrow::int32,
+    null_n_obs = arrow::int32(),
     n_participants = arrow::int32(),
     full_converged = arrow::bool(),
     null_converged = arrow::bool(),
@@ -153,7 +153,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   null_main_se <- null_interaction_rows$std.error[1] %||% 0
   null_tstat <- null_interaction_rows$statistic[1] %||% 0
   null_main_p <- null_interaction_rows$p.value[1] %||% 0
-  null_effect_size <- ifelse(null_main_tstat != 0, null_main_tstat / sqrt(nobs(null_model)), 0)
+  null_effect <- ifelse(null_tstat != 0, null_tstat / sqrt(nobs(null_model)), 0)
 
   # Confidence interval (already in tidy output if conf.int = TRUE)
   ci_lower <- interaction_rows$conf.low[1] %||% NA_real_
@@ -193,7 +193,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     main_est / sqrt(resid_var),
     NA_real_
   )
-  null_effect_size <- ifelse(
+  null_effect <- ifelse(
     (null_main_est != 0) && !is.na(null_resid_var) && null_resid_var > 0,
     null_main_est / sqrt(null_resid_var),
     NA_real_
@@ -247,7 +247,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 
     # Effect size
     effect_size = effect_size,
-    null_effect_size = null_effect_size,
+    null_effect = null_effect,
     effect_ci_lower = ci_lower,
     null_effect_ci_lower = null_ci_lower,
     effect_ci_upper = ci_upper,
@@ -290,21 +290,11 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     dplyr::filter(term != "Residuals")
 
   # For RMANOVA, extract main interaction effect
-  # Priority: "cong:prev_cong" > "cong" > first non-error effect
 
   interaction_row <- full_stats %>%
-    dplyr::filter(grepl(":", term)) %>%
+    dplyr::filter(term = "participant_id:cong:prev_cong") %>%
     dplyr::slice(1)
 
-  if (nrow(interaction_row) == 0) {
-    interaction_row <- full_stats %>%
-      dplyr::filter(grepl("cong", term, ignore.case = TRUE)) %>%
-      dplyr::slice(1)
-  }
-
-  if (nrow(interaction_row) == 0) {
-    interaction_row <- full_stats %>% dplyr::slice(1)
-  }
 
   # Extract statistics
   f_stat <- interaction_row$statistic[1] %||% NA_real_
@@ -347,7 +337,7 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     LR_p = p_value,
 
     # Fixed effect (main effect)
-    main_estimate = eta_sq,
+    main_estimate = NA_real_,
     null_main_estimate = NA_real_,
     main_std_error = NA_real_,
     null_std_error = NA_real_,
@@ -358,7 +348,7 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
 
     # Effect size
     effect_size = eta_sq,
-    null_effect_size = eta_sq,
+    null_effect = eta_sq,
     effect_ci_lower = NA_real_,
     null_effect_ci_lower = NA_real_,
     effect_ci_upper = NA_real_,
@@ -425,7 +415,7 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
     main_p_value = NA_real_,
     null_main_p_value = NA_real_,
     effect_size = NA_real_,
-    null_effect_size = NA_real_,
+    null_effect = NA_real_,
     effect_ci_lower = NA_real_,
     null_effect_ci_lower = NA_real_,
     effect_ci_upper = NA_real_,

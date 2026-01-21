@@ -61,7 +61,8 @@ fit_rmanova <- function(data, spec) {
   full_model <- afex::aov_car(
     as.formula(spec$formula_full),
     data = data,
-    type = 3
+    type = 3,
+    fun_aggregate = mean
   )
 
   # Extract statistics

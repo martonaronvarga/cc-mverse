@@ -1,5 +1,27 @@
 # R/functions/analysis.R - Results Aggregation & Discovery Rate Analysis
 
+
+
+# helpers
+
+#' Derive canonical model label from raw model name
+#'
+#' Converts raw model names (e.g., "lmm_intercept") to display labels (e.g., "LMM (intercept)")
+#'
+#' @param model Character vector of model names
+#'
+#' @return Character vector of display labels
+#'
+derive_model <- function(model) {
+  dplyr::case_when(
+    grepl("rmanova", model) ~ "rmANOVA",
+    grepl("full_slope", model) ~ "LMM (full)",
+    grepl("cong_slope", model) ~ "LMM (random congruency slope)",
+    grepl("intercept", model) ~ "LMM (random intercept)",
+    TRUE ~ model
+  )
+}
+
 # ==============================================================================
 # BRANCH-LEVEL ANALYSIS
 # ==============================================================================
@@ -69,6 +91,7 @@ compute_branch_diagnostics <- function(results_df) {
 
       # Statistical significance
       is_significant = main_p_value < 0.05,
+      model_type = derive_model(model),
 
       # Model quality flags
       small_sample = n_obs < 100,
@@ -95,7 +118,7 @@ branch_summary_by_model <- function(results_df) {
   results_df %>%
     analysis_main_filter() %>%
     dplyr::filter(!error) %>%
-    dplyr::group_by(model) %>%
+    dplyr::group_by(model_type) %>%
     dplyr::summarise(
       n_branches = dplyr::n(),
       n_converged = sum(converged_both, na.rm = TRUE),
@@ -129,7 +152,7 @@ identify_problematic_branches <- function(results_df) {
     analysis_main_filter() %>%
     dplyr::filter(error | !converged_both | poor_ci | small_sample) %>%
     dplyr::select(
-      branch_id, model, effect_condition,
+      branch_id, model_type, effect_condition,
       error, converged_both, small_sample, poor_ci,
       main_estimate, main_std_error, ci_width,
       main_p_value, n_obs
@@ -173,13 +196,15 @@ compute_roc_metrics <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "model", "sample_size",
+      "model_type", "sample_size",
       "transformation", "outlier"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both) %>%
     allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
+    dplyr::mutate(
+      is_significant = main_p_value < alpha
+    )
 
   # TPR: proportion significant when effect is PRESENT
   tpr_df <- prepared %>%
@@ -241,7 +266,7 @@ compute_fpr_by_null_type <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "strip_method"
+      "strip_method", "model_type", "sample_size", "transformation"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both, is_null_effect) %>%
@@ -277,7 +302,7 @@ compute_power <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "model", "sample_size",
+      "model_type", "sample_size",
       "transformation"
     )) {
   prepared <- results_df %>%
@@ -317,7 +342,7 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
   roc_metrics <- compute_roc_metrics(
     results_df,
     alpha = alpha,
-    group_vars = c("model", "sample_size", "transformation", "outlier")
+    group_vars = c("model_type", "sample_size", "transformation", "outlier")
   )
 
 
@@ -359,7 +384,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
     # Summary by model
     by_model = results_with_diag %>%
       dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(model) %>%
+      dplyr::group_by(model_type) %>%
       dplyr::summarise(
         n_branches = dplyr::n(),
         n_converged = sum(converged_both, na.rm = TRUE),
@@ -427,7 +452,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
     roc_metrics = compute_roc_metrics(results_with_diag, alpha = alpha),
 
     # FDR by null type (robustness check)
-    fdr_by_null_type = compute_fpr_by_null_type(results_with_diag, alpha = alpha),
+    fpr_by_null_type = compute_fpr_by_null_type(results_with_diag, alpha = alpha),
 
     # Power analysis
     power_analysis = compute_power(results_with_diag, alpha = alpha),
@@ -455,16 +480,6 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
 #'
 create_summary_table <- function(results_df) {
   # Add model_type grouping for display
-  prepared <- results_df %>%
-    dplyr::mutate(
-      model_type = dplyr::case_when(
-        grepl("rmanova", model) ~ "rmANOVA",
-        grepl("full_slope", model) ~ "LMM (full)",
-        grepl("cong_slope", model) ~ "LMM (cong slope)",
-        grepl("intercept", model) ~ "LMM (intercept)",
-        TRUE ~ model
-      )
-    )
 
   summary_tbl <- prepared %>%
     dplyr::group_by(model_type, transformation, effect_condition) %>%
@@ -542,7 +557,7 @@ analyze_and_save <- function(results_df, paths, alpha = 0.05) {
 detect_specification_inconsistencies <- function(results_df, alpha = 0.05) {
   logger::log_info("Detecting specification inconsistencies")
 
-  # Check within same (model, effect_condition) if different preprocessing
+  # Check within same (model_type, effect_condition) if different preprocessing
   # leads to different conclusions
 
   inconsistencies <- results_df %>%
@@ -550,8 +565,8 @@ detect_specification_inconsistencies <- function(results_df, alpha = 0.05) {
     analysis_main_filter() %>%
     dplyr::filter(!error, !is.na(main_p_value)) %>%
     dplyr::filter(converged_both) %>%
-    # Group by model and effect condition, vary preprocessing
-    dplyr::group_by(model, effect_condition) %>%
+    # Group by model_type and effect condition, vary preprocessing
+    dplyr::group_by(model_type, effect_condition) %>%
     dplyr::summarise(
       n_specs = dplyr::n(),
       n_significant = sum(is_significant, na.rm = TRUE),
