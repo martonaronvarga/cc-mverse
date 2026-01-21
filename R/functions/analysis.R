@@ -173,13 +173,22 @@ compute_roc_metrics <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "model", "sample_size",
+      "model_type", "sample_size",
       "transformation", "outlier"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both) %>%
     allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
+    dplyr::mutate(
+      is_significant = main_p_value < alpha,
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    )
 
   # TPR: proportion significant when effect is PRESENT
   tpr_df <- prepared %>%
@@ -241,12 +250,21 @@ compute_fpr_by_null_type <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "strip_method"
+      "strip_method", "model_type", "sample_size", "transformation"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both, is_null_effect) %>%
     allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
+    dplyr::mutate(
+      is_significant = main_p_value < alpha,
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    )
 
   fpr_df <- prepared %>%
     dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
@@ -277,13 +295,22 @@ compute_power <- function(
     results_df,
     alpha = 0.05,
     group_vars = c(
-      "model", "sample_size",
+      "model_type", "sample_size",
       "transformation"
     )) {
   prepared <- results_df %>%
     dplyr::filter(!error, converged_both, is_true_effect, strip_method == "none") %>%
     allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
+    dplyr::mutate(
+      is_significant = main_p_value < alpha,
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    )
 
   power_df <- prepared %>%
     dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
@@ -317,7 +344,7 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
   roc_metrics <- compute_roc_metrics(
     results_df,
     alpha = alpha,
-    group_vars = c("model", "sample_size", "transformation", "outlier")
+    group_vars = c("model_type", "sample_size", "transformation", "outlier")
   )
 
 
@@ -592,6 +619,15 @@ analyze_specification_sensitivity <- function(results_df) {
     allowed_combinations_filter() %>%
     analysis_main_filter() %>%
     dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
+    dplyr::mutate(
+      model_type = dplyr::case_when(
+        grepl("rmanova", model) ~ "rmANOVA",
+        grepl("full_slope", model) ~ "LMM (full)",
+        grepl("cong_slope", model) ~ "LMM (cong slope)",
+        grepl("intercept", model) ~ "LMM (intercept)",
+        TRUE ~ model
+      )
+    ) %>%
     dplyr::group_by(transformation, outlier, sample_size, model_type) %>%
     dplyr::summarise(
       n_results = dplyr::n(),

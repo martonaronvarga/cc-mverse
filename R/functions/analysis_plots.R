@@ -153,7 +153,7 @@ plot_roc_by_outlier <- function(
     geom_path(linewidth = 0.8) +
     geom_point(aes(shape = model_type), alpha = 0.8) +
     ggrepel::geom_text_repel(
-      aes(label = scales::percent(model_type, accuracy = 1)),
+      aes(label = model_type),
       size = 2.5,
       max.overlaps = 10,
       show.legend = FALSE,
@@ -375,23 +375,23 @@ plot_pvalue_distributions <- function(results_df, cb_palette = get_effect_palett
   p
 }
 
-#' Plot 7: Stripping robustness - FDR should NOT depend on stripping
+#' Plot 7: Stripping robustness - FPR should NOT depend on stripping
 #'
 plot_stripping_robustness <- function(fpr_df) {
   # Compare none vs shuffle vs qmap
   fpr_wide <- fpr_df %>%
     dplyr::select(
       model_type, sample_size, transformation, effect_condition,
-      strip_method, FDR
+      strip_method, FPR
     ) %>%
     tidyr::pivot_wider(
       names_from = strip_method,
-      values_from = FDR,
-      names_prefix = "FDR_"
+      values_from = FPR,
+      names_prefix = "FPR_"
     )
 
-  # Plot: FDR with stripping vs without
-  p1 <- ggplot(fpr_wide, aes(x = FDR_qmap_5, y = FDR_shuffle)) +
+  # Plot: FPR with stripping vs without
+  p1 <- ggplot(fpr_wide, aes(x = FPR_qmap_5, y = FPR_shuffle)) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
     geom_point(aes(color = model_type, shape = effect_condition), size = 3, alpha = 0.7) +
     geom_vline(xintercept = 0.05, linetype = "dotted", color = "red", alpha = 0.5) +
@@ -400,8 +400,8 @@ plot_stripping_robustness <- function(fpr_df) {
     scale_y_continuous(limits = c(0, 0.3), labels = scales::percent) +
     labs(
       title = "Shuffle vs Quantile Mapping",
-      x = "FDR (qmap_5)",
-      y = "FDR (shuffle)"
+      x = "FPR (qmap_5)",
+      y = "FPR (shuffle)"
     ) +
     theme_minimal(base_size = 10) +
     theme(legend.position = "right")
@@ -462,10 +462,10 @@ generate_multiverse_dashboard <- function(analysis_list,
 
 
   roc_metrics <- analysis_list$roc_metrics
-  fpr_by_null <- analysis_list$fpr_by_null
-  power_metrics <- analysis_list$power_analytics
+  fpr_by_null <- analysis_list$fdr_by_null_type
+  power_metrics <- analysis_list$power_analysis
   sensitivity_df <- analysis_list$spec_sensitivity
-  results_with_diag <- analysis_list$results_with_diagnostics
+  results_with_diag <- analysis_list$results_with_diag
 
   plots <- list(
     roc_by_outlier = plot_roc_by_outlier(roc_metrics),

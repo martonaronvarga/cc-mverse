@@ -27,7 +27,7 @@ get_results_schema <- function() {
     effect_condition = arrow::string(),
     strip_method = arrow::string(),
     n_obs = arrow::int32(),
-    null_n_obs = arrow::int32,
+    null_n_obs = arrow::int32(),
     n_participants = arrow::int32(),
     full_converged = arrow::bool(),
     null_converged = arrow::bool(),
@@ -153,7 +153,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   null_main_se <- null_interaction_rows$std.error[1] %||% 0
   null_tstat <- null_interaction_rows$statistic[1] %||% 0
   null_main_p <- null_interaction_rows$p.value[1] %||% 0
-  null_effect_size <- ifelse(null_main_tstat != 0, null_main_tstat / sqrt(nobs(null_model)), 0)
+  null_effect_size <- ifelse(null_tstat != 0, null_tstat / sqrt(nobs(null_model)), 0)
 
   # Confidence interval (already in tidy output if conf.int = TRUE)
   ci_lower <- interaction_rows$conf.low[1] %||% NA_real_
