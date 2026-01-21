@@ -7,6 +7,6 @@ at ELTE PPK.
 
 ## Contributors
 
-Marton A. Varga
-Boglarka Ludmany
-Dr. Miklos Bognar
+- Marton A. Varga
+- Boglarka Ludmany
+- Dr. Miklos Bognar
