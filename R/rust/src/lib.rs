@@ -1,5 +1,6 @@
 // src/lib.rs - Core library
 
+use ahash::AHasher;
 use anyhow::{anyhow, Result};
 use polars::prelude::*;
 use rand::rngs::StdRng;
@@ -7,9 +8,10 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt;
-use tracing::{debug, info, warn};
+use std::hash::Hasher;
+use std::{collections::HashMap, hash::Hash};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Transformation {
@@ -77,16 +79,47 @@ impl OutlierMethod {
 #[derive(Debug, Clone, Copy)]
 pub struct BranchConfig {
     pub sample_size: f64,
+    pub subsample_id: u32,
     pub transformation: Transformation,
     pub outlier_method: OutlierMethod,
     pub effect_condition: EffectCondition,
     pub strip_method: StripMethod,
+    pub global_seed: u64,
+}
+
+impl BranchConfig {
+    /// Deterministic seed derived from global seed + branch identity.
+    /// Two branches with different subsample_id get different seeds.
+    pub fn sampling_seed(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.global_seed.hash(&mut hasher);
+        self.sample_size.to_bits().hash(&mut hasher);
+        self.subsample_id.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Seed for effect stripping (shuffle / qmap).
+    /// Depends on subsample_id so different subsamples get different null realizations.
+    pub fn strip_seed(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.global_seed.hash(&mut hasher);
+        self.subsample_id.hash(&mut hasher);
+        // Include effect condition and strip method so present/null_both don't
+        // collide with null_interaction seeds
+        (self.effect_condition as u8).hash(&mut hasher);
+        (self.strip_method as u8).hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProcessingResult {
     pub branch_id: String,
+    pub data_id: String,
     pub sample_size: f64,
+    pub subsample_id: u32,
     pub transformation: String,
     pub outlier_method: String,
     pub effect_condition: String,
@@ -113,10 +146,26 @@ impl BranchPipeline {
         BranchPipeline { config }
     }
 
+    /// The data_id used for filenames (model-agnostic).
+    /// Format: sample_size__subsample_id__transformation__outlier__effect_condition__strip_method
+    pub fn data_id(&self) -> String {
+        let strip_label = match self.config.effect_condition {
+            EffectCondition::NullInteraction => self.config.strip_method.to_string(),
+            _ => "none".to_string(),
+        };
+        format!(
+            "{}__{}__{}__{}__{}__{}",
+            self.config.sample_size,
+            self.config.subsample_id,
+            self.config.transformation,
+            self.config.outlier_method.as_string(),
+            self.config.effect_condition,
+            strip_label,
+        )
+    }
+
     /// Process a single branch: sampling -> transformation -> outlier filtering
-    pub fn process(&self, data: &DataFrame) -> Result<(DataFrame, ProcessingResult)> {
-        let data = self.normalize_participant_id(data)?;
-        let data = self.normalize_rt_to_f64(&data)?;
+    pub fn process(&self, mut data: DataFrame) -> Result<(DataFrame, ProcessingResult)> {
         let start_time = std::time::Instant::now();
         let n_rows_input = data.height();
 
@@ -127,23 +176,24 @@ impl BranchPipeline {
         );
 
         // Step 0: Condition data
-        let conditioned = self.apply_effect_condition(&data)?;
-        debug!(n_tows = conditioned.height(), "After conditioning");
+        data = self.apply_effect_condition(data)?;
+        debug!(n_rows = data.height(), "After conditioning");
 
         // Step 1: Sample data
-        let sampled = self.sample_data(&conditioned)?;
-        debug!(n_rows = sampled.height(), "After sampling");
+        data = self.sample_data(&data)?;
+        debug!(n_rows = data.height(), "After sampling");
 
         // Step 2: Filter outliers
-        let filtered = self.filter_outliers(&sampled)?;
-        debug!(n_rows = filtered.height(), "After outlier filtering");
+        data = self.filter_outliers(data)?;
+        debug!(n_rows = data.height(), "After outlier filtering");
 
         // Step 3: Transform
-        let transformed = self.apply_transformation(&filtered)?;
-        debug!(n_rows = transformed.height(), "After transformation");
-        let n_rows_output = filtered.height();
+        data = self.apply_transformation(data)?;
+        debug!(n_rows = data.height(), "After transformation");
 
+        let n_rows_output = data.height();
         let processing_time_ms = start_time.elapsed().as_millis();
+        let data_id = self.data_id();
 
         let strip_label = match self.config.effect_condition {
             EffectCondition::NullInteraction => self.config.strip_method.to_string(),
@@ -151,8 +201,10 @@ impl BranchPipeline {
         };
 
         let result = ProcessingResult {
-            branch_id: self.branch_id_string(strip_label.as_str()),
+            branch_id: data_id.clone(),
+            data_id: data_id.clone(),
             sample_size: self.config.sample_size,
+            subsample_id: self.config.subsample_id,
             transformation: self.config.transformation.to_string(),
             outlier_method: self.config.outlier_method.as_string(),
             effect_condition: self.config.effect_condition.to_string(),
@@ -166,107 +218,73 @@ impl BranchPipeline {
         };
 
         info!(
-            branch = self.branch_id_string(strip_label.as_str()),
+            data_id = data_id,
             rows_kept = n_rows_output,
             rows_removed = n_rows_input - n_rows_output,
             time_ms = processing_time_ms,
             "Branch processing complete"
         );
 
-        Ok((transformed, result))
+        Ok((data, result))
     }
 
-    fn normalize_participant_id(&self, df: &DataFrame) -> Result<DataFrame> {
-        let col = df.column("participant_id")?;
-        if matches!(col.dtype(), DataType::String) {
-            return Ok(df.clone());
-        }
-        let mut out = df.clone();
-        let pid_str = col.cast(&DataType::String)?;
-        out.with_column(pid_str)?;
-        Ok(out)
-    }
-
-    fn normalize_rt_to_f64(&self, df: &DataFrame) -> Result<DataFrame> {
-        let col = df.column("rt")?;
-        if matches!(col.dtype(), DataType::Float64) {
-            return Ok(df.clone());
-        }
-        let mut out = df.clone();
-        let rt_f64 = col.cast(&DataType::Float64)?;
-        out.with_column(rt_f64)?;
-        Ok(out)
-    }
-
-    fn branch_id_string(&self, strip_label: &str) -> String {
-        format!(
-            "{}__{}__{}__{}__{}",
-            self.config.sample_size,
-            self.config.transformation,
-            self.config.outlier_method.as_string(),
-            self.config.effect_condition,
-            strip_label,
-        )
-    }
+    // fn branch_id_string(&self, strip_label: &str) -> String {
+    //     format!(
+    //         "{}__{}__{}__{}__{}",
+    //         self.config.sample_size,
+    //         self.config.transformation,
+    //         self.config.outlier_method.as_string(),
+    //         self.config.effect_condition,
+    //         strip_label,
+    //     )
+    // }
 
     fn sample_data(&self, data: &DataFrame) -> Result<DataFrame> {
         if (self.config.sample_size - 1.0).abs() < 1e-6 {
             return Ok(data.clone());
         }
 
-        let n_total = data.height();
-        let n_sample = ((n_total as f64) * self.config.sample_size) as usize;
-
-        debug!(total = n_total, sample = n_sample, "Sampling data");
-
-        let pid_series = data.column("participant_id")?;
-        let pid_series = match pid_series.dtype() {
-            DataType::String => pid_series.clone(),
-            _ => pid_series.cast(&DataType::String)?, // cast once
-        };
-        let pid_utf8 = pid_series.str()?;
-
-        // Sample by participant_id to maintain trial structure
-        let participant_ids: Vec<String> = pid_utf8
+        let pid_col = data.column("participant_id")?.str()?;
+        let unique_pids: Vec<String> = pid_col
             .unique()?
             .into_no_null_iter()
             .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+            .collect();
 
-        // Use seeded RNG for reproducibility
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        let mut selected_ids = participant_ids.clone();
-        let n_keep = ((participant_ids.len() as f64) * self.config.sample_size).ceil() as usize;
-        selected_ids.shuffle(&mut rng);
-        selected_ids.truncate(n_keep);
+        let n_keep = ((unique_pids.len() as f64) * self.config.sample_size).ceil() as usize;
+        let seed = self.config.sampling_seed();
+        let mut rng = StdRng::seed_from_u64(seed);
 
-        let id_set: PlHashSet<String> = selected_ids.into_iter().collect();
+        let mut selected = unique_pids;
+        selected.shuffle(&mut rng);
+        selected.truncate(n_keep);
 
-        let mask: BooleanChunked = pid_utf8
+        // Use a HashSet<&str> to avoid per-row String allocation
+        use ahash::AHashSet;
+        let id_set: AHashSet<&str> = selected.iter().map(|s| s.as_str()).collect();
+
+        let mask: BooleanChunked = pid_col
             .into_iter()
             .map(|opt_id| opt_id.map(|id| id_set.contains(id)).unwrap_or(false))
             .collect();
 
-        Ok(data.filter(&mask)?)
+        data.filter(&mask).map_err(Into::into)
     }
 
-    fn apply_transformation(&self, data: &DataFrame) -> Result<DataFrame> {
+    fn apply_transformation(&self, mut data: DataFrame) -> Result<DataFrame> {
         match self.config.transformation {
             Transformation::LogRt => {
-                let rt = data.column("rt")?;
-                let log_rt = rt.f64()?.apply(|opt_v| opt_v.map(|v| v.ln())).into_series();
+                let rt = data.column("rt")?.f64()?;
+                let log_rt = rt.apply(|opt_v| opt_v.map(|v| v.ln()));
 
-                let mut result = data.clone();
-                result = result.drop("rt")?;
-                result.with_column(log_rt.with_name("rt".into()))?;
-                Ok(result)
+                data.replace("rt", log_rt.into_series())?;
+                Ok(data)
             }
-            Transformation::NoLogRt => Ok(data.clone()),
+            Transformation::NoLogRt => Ok(data),
         }
     }
 
-    fn filter_outliers(&self, data: &DataFrame) -> Result<DataFrame> {
+    fn filter_outliers(&self, data: DataFrame) -> Result<DataFrame> {
         match self.config.outlier_method {
             OutlierMethod::None => Ok(data.clone()),
             OutlierMethod::Sd(threshold) => self.filter_sd(data, threshold),
@@ -275,49 +293,61 @@ impl BranchPipeline {
         }
     }
 
-    fn filter_sd(&self, data: &DataFrame, threshold: f64) -> Result<DataFrame> {
+    fn filter_sd(&self, data: DataFrame, threshold: f64) -> Result<DataFrame> {
         let rt = data.column("rt")?.f64()?;
 
-        let mean = rt.mean().unwrap_or(0.0);
-        let std = rt
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>()
-            / (rt.len() as f64);
-        let std = std.sqrt();
+        // Welford's single-pass mean + variance
+        let mut count = 0u64;
+        let mut mean = 0.0f64;
+        let mut m2 = 0.0f64;
+        for val in rt.into_iter().flatten() {
+            count += 1;
+            let delta = val - mean;
+            mean += delta / count as f64;
+            let delta2 = val - mean;
+            m2 += delta * delta2;
+        }
+        let std = if count > 1 {
+            (m2 / (count - 1) as f64).sqrt()
+        } else {
+            0.0
+        };
 
         let lower = mean - threshold * std;
         let upper = mean + threshold * std;
 
-        debug!(mean, std, lower, upper, "SD filtering");
-
-        let mask = rt
+        let mask: BooleanChunked = rt
             .into_iter()
             .map(|opt_v| opt_v.map(|v| v >= lower && v <= upper).unwrap_or(false))
             .collect();
 
-        Ok(data.filter(&mask)?)
+        data.filter(&mask).map_err(Into::into)
     }
 
-    fn filter_mad(&self, data: &DataFrame, threshold: f64) -> Result<DataFrame> {
+    fn filter_mad(&self, data: DataFrame, threshold: f64) -> Result<DataFrame> {
         let rt = data.column("rt")?.f64()?;
         let values: Vec<_> = rt.into_iter().flatten().collect();
 
         if values.is_empty() {
-            return Ok(data.clone());
+            return Ok(data);
         }
 
         let mut sorted = values.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[sorted.len() / 2];
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
 
         let deviations: Vec<_> = values.iter().map(|x| (x - median).abs()).collect();
         let mut sorted_dev = deviations.clone();
         sorted_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mad = sorted_dev[sorted_dev.len() / 2];
+        let mad = if sorted_dev.len() % 2 == 0 {
+            (sorted_dev[sorted_dev.len() / 2 - 1] + sorted_dev[sorted_dev.len() / 2]) / 2.0
+        } else {
+            sorted_dev[sorted_dev.len() / 2]
+        };
 
         let lower = median - threshold * mad;
         let upper = median + threshold * mad;
@@ -332,7 +362,7 @@ impl BranchPipeline {
         Ok(data.filter(&mask)?)
     }
 
-    fn filter_range(&self, data: &DataFrame, min: f64, max: f64) -> Result<DataFrame> {
+    fn filter_range(&self, data: DataFrame, min: f64, max: f64) -> Result<DataFrame> {
         let mask = data
             .column("rt")?
             .f64()?
@@ -345,11 +375,11 @@ impl BranchPipeline {
         Ok(data.filter(&mask)?)
     }
 
-    pub fn apply_effect_condition(&self, data: &DataFrame) -> Result<DataFrame> {
+    pub fn apply_effect_condition(&self, data: DataFrame) -> Result<DataFrame> {
         match self.config.effect_condition {
             EffectCondition::Present => {
                 // No modification
-                Ok(data.clone())
+                Ok(data)
             }
             EffectCondition::NullInteraction => {
                 // Estimate and remove interaction effect
@@ -364,12 +394,13 @@ impl BranchPipeline {
 
     /// Remove cong * prev_cong interaction effect
     /// Quantile mapping with kappa shrinkage
-    fn remove_interaction_effect(&self, data: &DataFrame) -> Result<DataFrame> {
+    fn remove_interaction_effect(&self, data: DataFrame) -> Result<DataFrame> {
         use tracing::debug;
         debug!("Removing interaction effect from RT");
 
+        let seed = self.config.strip_seed();
         match self.config.strip_method {
-            StripMethod::Shuffle => shuffle_null(data, "rt", 42),
+            StripMethod::Shuffle => shuffle_null(data, "rt", seed),
             StripMethod::Qmap5 => quantile_map_once(
                 data,
                 QuantileMapParams {
@@ -386,63 +417,59 @@ impl BranchPipeline {
 // BATCH PROCESSING
 // ============================================================================
 
-pub struct BatchProcessor {
-    configs: Vec<BranchConfig>,
-}
+// pub struct BatchProcessor {
+//     configs: Vec<BranchConfig>,
+// }
 
-impl BatchProcessor {
-    pub fn new(configs: Vec<BranchConfig>) -> Self {
-        BatchProcessor { configs }
-    }
+// impl BatchProcessor {
+//     pub fn new(configs: Vec<BranchConfig>) -> Self {
+//         BatchProcessor { configs }
+//     }
 
-    /// Process all branches in parallel
-    pub fn process_all(&self, data: &DataFrame) -> Vec<(DataFrame, ProcessingResult)> {
-        info!(
-            n_branches = self.configs.len(),
-            "Starting parallel batch processing"
-        );
+// Process all branches in parallel
+// pub fn process_all(&self, data: &DataFrame) -> Vec<(DataFrame, ProcessingResult)> {
+//     info!(
+//         n_branches = self.configs.len(),
+//         "Starting parallel batch processing"
+//     );
 
-        self.configs
-            .par_iter()
-            .map(|config| {
-                let pipeline = BranchPipeline::new(*config);
-                match pipeline.process(data) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!(error = ?e, config = ?config, "Branch processing failed");
-                        let mut result_data = data.clone();
-                        if let Ok(col) = data.column("rt") {
-                            result_data = result_data.filter(&col.is_null()).unwrap_or_default();
-                        }
-                        (
-                            result_data,
-                            ProcessingResult {
-                                branch_id: format!(
-                                    "{}__{}__{}__{}",
-                                    config.sample_size,
-                                    config.transformation,
-                                    config.outlier_method.as_string(),
-                                    config.strip_method.as_string(),
-                                ),
-                                sample_size: config.sample_size,
-                                transformation: config.transformation.to_string(),
-                                outlier_method: config.outlier_method.as_string(),
-                                effect_condition: config.effect_condition.to_string(),
-                                strip_method: config.strip_method.to_string(),
-                                n_rows_input: data.height(),
-                                n_rows_output: 0,
-                                n_rows_removed: data.height(),
-                                processing_time_ms: 0,
-                                success: false,
-                                error_message: Some(e.to_string()),
-                            },
-                        )
-                    }
-                }
-            })
-            .collect()
-    }
-}
+//     self.configs
+//         .par_iter()
+//         .map(|config| {
+//             let pipeline = BranchPipeline::new(*config);
+//             match pipeline.process(data) {
+//                 Ok(result) => result,
+//                 Err(e) => {
+//                     warn!(error = ?e, config = ?config, "Branch processing failed");
+//                     let mut result_data = data.clone();
+//                     if let Ok(col) = data.column("rt") {
+//                         result_data = result_data.filter(&col.is_null()).unwrap_or_default();
+//                     }
+//                     (
+//                         result_data,
+//                         ProcessingResult {
+//                             branch_id: pipeline.data_id(),
+//                             data_id: pipeline.data_id(),
+//                             sample_size: config.sample_size,
+//                             subsample_id: config.subsample_id,
+//                             transformation: config.transformation.to_string(),
+//                             outlier_method: config.outlier_method.as_string(),
+//                             effect_condition: config.effect_condition.to_string(),
+//                             strip_method: config.strip_method.to_string(),
+//                             n_rows_input: data.height(),
+//                             n_rows_output: 0,
+//                             n_rows_removed: data.height(),
+//                             processing_time_ms: 0,
+//                             success: false,
+//                             error_message: Some(e.to_string()),
+//                         },
+//                     )
+//                 }
+//             }
+//         })
+//         .collect()
+// }
+// }
 
 use std::str::FromStr;
 
@@ -484,7 +511,7 @@ impl std::fmt::Display for EffectCondition {
 pub enum StripMethod {
     /// Shuffle condition-wise
     Shuffle,
-    /// Quantile mapping with kappa = 5 shrinkage
+    /// Quantile mapping
     Qmap5,
 }
 
@@ -493,7 +520,6 @@ impl StripMethod {
         match self {
             StripMethod::Shuffle => "shuffle".to_string(),
             StripMethod::Qmap5 => "qmap_5".to_string(),
-            //_ => format!("{:?}", self),
         }
     }
 }
@@ -538,64 +564,53 @@ impl std::fmt::Display for StripMethod {
 ///
 /// Removes:
 /// - ONLY the stationary CSE interaction term
-
-/// Remove all fixed effects, keeping only intercept
+/// - Remove all fixed effects, keeping only intercept
 ///
 /// Strategy: Replace each RT with grand mean + residual
 /// This preserves random structure but eliminates all fixed effects
-fn null_all_effects(data: &DataFrame) -> Result<DataFrame> {
+fn null_all_effects(data: DataFrame) -> Result<DataFrame> {
     use tracing::debug;
-
     debug!("Nullifying all fixed effects");
 
-    // 1. Per-participant overall mean μ_i
-    let mean_overall = data
-        .clone()
+    let result = data
         .lazy()
-        .group_by([col("participant_id")])
-        .agg([col("rt").mean().alias("mean_overall")])
+        // Compute per-participant overall mean  →  "mean_overall"
+        .with_column(
+            col("rt")
+                .mean()
+                .over([col("participant_id")])
+                .alias("__mean_overall"),
+        )
+        // Compute per-participant × cell condition mean  →  "mean_cond"
+        .with_column(
+            col("rt")
+                .mean()
+                .over([col("participant_id"), col("cong"), col("prev_cong")])
+                .alias("__mean_cond"),
+        )
+        // nullified rt = μ_i + (rt − μ_cell)
+        .with_column((col("__mean_overall") + col("rt") - col("__mean_cond")).alias("rt"))
+        // Drop the temporary columns, keep everything else
+        .drop(cols(["__mean_overall", "__mean_cond"]))
         .collect()?;
 
-    // 2. Per-participant × cong × prev_cong condition mean μ_i(c,p)
-    let mean_condition = data
-        .clone()
-        .lazy()
-        .group_by([col("participant_id"), col("cong"), col("prev_cong")])
-        .agg([col("rt").mean().alias("mean_cond")])
-        .collect()?;
+    Ok(result)
+}
 
-    // Join means into main DF
-    let mut df = data.clone();
-    df = df.join(
-        &mean_overall,
-        ["participant_id"],
-        ["participant_id"],
-        JoinArgs::new(JoinType::Left),
-        None,
-    )?;
-    df = df.join(
-        &mean_condition,
-        ["participant_id", "cong", "prev_cong"],
-        ["participant_id", "cong", "prev_cong"],
-        JoinArgs::new(JoinType::Left),
-        None,
-    )?;
+pub fn shuffle_null(df: DataFrame, scale_col: &str, seed: u64) -> Result<DataFrame> {
+    info!("Applying shuffle null on column: {}", scale_col);
+    let mut rng = StdRng::seed_from_u64(seed);
 
-    // Compute residual: r = RT - μ_i(c,p)
-    // Then nullified RT = μ_i + r
-    let df = df
-        .lazy()
-        .with_column((col("rt") - col("mean_cond")).alias("residual"))
-        .with_column((col("mean_overall") + col("residual")).alias("rt"))
-        .select([
-            col("participant_id"),
-            col("cong"),
-            col("prev_cong"),
-            col("rt"),
-        ])
-        .collect()?;
+    let shuffled = df.group_by(["participant_id", "cong"])?.apply(|mut g| {
+        let col = g.column(scale_col)?.clone();
+        let mut vals: Vec<f64> = col.f64()?.into_no_null_iter().collect();
+        vals.shuffle(&mut rng);
+        g.replace("rt", Series::from_vec("rt".into(), vals))?;
+        Ok(g)
+    })?;
 
-    Ok(df)
+    info!("Shuffle complete: {} rows", shuffled.height());
+    Ok(shuffled)
 }
 
 pub fn quantile_map_shrink(
@@ -715,30 +730,13 @@ fn compute_quantiles(data: &[f64], probs: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-pub fn shuffle_null(df: &DataFrame, scale_col: &str, seed: u64) -> Result<DataFrame> {
-    info!("Applying shuffle null on column: {}", scale_col);
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    let shuffled = df.group_by(["participant_id", "cong"])?.apply(|g| {
-        let col = g.column(scale_col)?.clone();
-        let mut vals: Vec<f64> = col.f64()?.into_no_null_iter().collect();
-        vals.shuffle(&mut rng);
-        let mut out = g.clone();
-        out.with_column(Series::new("rt".into(), vals))?;
-        Ok(out)
-    })?;
-
-    info!("Shuffle complete: {} rows", shuffled.height());
-    Ok(shuffled)
-}
-
 pub struct QuantileMapParams {
     pub scale_col: String, // e.g., "rt"
     pub kappa: f64,
     pub ngrid: usize,
 }
 
-pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<DataFrame> {
+pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<DataFrame> {
     let scale = params.scale_col.as_str();
     let ngrid = params.ngrid.max(2);
     let kappa = params.kappa;
@@ -755,18 +753,13 @@ pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<Da
     // - cong, prev_cong, participant_id to Utf8 for easy grouping
     let mut df = df.clone();
     if df.column(scale)?.dtype() != &DataType::Float64 {
-        df = df
-            .lazy()
-            .with_columns([col(scale).cast(DataType::Float64)])
-            .collect()?;
+        let casted = df.column(scale)?.cast(&DataType::Float64)?;
+        df.with_column(casted)?;
     }
-
     for name in ["cong", "prev_cong", "participant_id"] {
         if df.column(name)?.dtype() != &DataType::String {
-            df = df
-                .lazy()
-                .with_columns([col(name).cast(DataType::String)])
-                .collect()?;
+            let casted = df.column(name)?.cast(&DataType::String)?;
+            df.with_column(casted)?;
         }
     }
 
@@ -823,7 +816,7 @@ pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<Da
 
     // Process each participant in parallel, producing rows with tau, q_row_tau, q_col_tau, q_grand_tau, lrt_adj
     let per_pid_outputs: Vec<Vec<PerRowOut>> = pats_unique
-        .iter()
+        .par_iter()
         .map(|pid| {
             let row_idxs = pid_rows.get(*pid).cloned().unwrap_or_default();
             if row_idxs.len() < 2 {
@@ -833,7 +826,7 @@ pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<Da
                     &rt_vec,
                     &cong_vec,
                     &prev_vec,
-                    *pid,
+                    pid,
                     &taus,
                     &global_cell_q,
                 );
@@ -920,7 +913,7 @@ pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<Da
                     let xs: Vec<f64> = rows.iter().map(|r| r.rt).collect();
                     let q_local = quantiles_type8(&xs, &taus);
                     // shrink against grand curve
-                    let q_shrunk: Vec<f64> = q_local
+                    let _q_shrunk: Vec<f64> = q_local
                         .iter()
                         .zip(grand_curve.iter())
                         .map(|(l, g)| shrink(*l, *g, kappa))
@@ -935,7 +928,7 @@ pub fn quantile_map_once(df: &DataFrame, params: QuantileMapParams) -> Result<Da
                     let xs: Vec<f64> = rows.iter().map(|r| r.rt).collect();
                     let q_local = quantiles_type8(&xs, &taus);
                     // shrink against grand curve
-                    let q_shrunk: Vec<f64> = q_local
+                    let _q_shrunk: Vec<f64> = q_local
                         .iter()
                         .zip(grand_curve.iter())
                         .map(|(l, g)| shrink(*l, *g, kappa))
@@ -1067,7 +1060,7 @@ fn compute_cell_quantiles(
 // Compute quantile curve for a sample xs at given taus (0..1), approximating R type=8.
 // xs can be unsorted; we sort internally.
 
-pub fn quantiles_type8(xs: &Vec<f64>, ps: &[f64]) -> Vec<f64> {
+pub fn quantiles_type8(xs: &[f64], ps: &[f64]) -> Vec<f64> {
     // filter NaNs
     let mut s: Vec<f64> = xs.iter().copied().filter(|v| v.is_finite()).collect();
     if s.is_empty() {
@@ -1117,7 +1110,7 @@ pub fn interp(x: &[f64], y: &[f64], xout: f64) -> f64 {
     let x1 = x[i];
     let y0 = y[i0];
     let y1 = y[i];
-    if (x1 - x0).abs() < std::f64::EPSILON {
+    if (x1 - x0).abs() < f64::EPSILON {
         return y0;
     }
     y0 + (y1 - y0) * (xout - x0) / (x1 - x0)
@@ -1149,7 +1142,7 @@ pub fn invert_monotone_interp(x: &[f64], y: &[f64], yout: f64) -> f64 {
     let y1 = y[i];
     let x0 = x[i0];
     let x1 = x[i];
-    if (y1 - y0).abs() < std::f64::EPSILON {
+    if (y1 - y0).abs() < f64::EPSILON {
         return x0;
     }
     x0 + (x1 - x0) * (yout - y0) / (y1 - y0)
@@ -1205,11 +1198,11 @@ fn group_by_key<F: Fn(&RowData) -> String>(
 // tau via global per-cell inverse; row/col/grand quantiles degenerate to single curve.
 fn per_pid_minimal(
     row_idxs: &Vec<usize>,
-    rt_vec: &Vec<f64>,
-    cong_vec: &Vec<String>,
-    prev_vec: &Vec<String>,
+    rt_vec: &[f64],
+    cong_vec: &[String],
+    prev_vec: &[String],
     _pid: &str,
-    taus: &Vec<f64>,
+    taus: &[f64],
     global_cell_q: &HashMap<(String, String), Vec<f64>>,
 ) -> Vec<PerRowOut> {
     // grand curve from the available rt(s)
@@ -1245,7 +1238,6 @@ fn per_pid_minimal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::*;
 
     fn make_dummy_df() -> DataFrame {
         // Build a small deterministic dataset with two participants and four trials each
@@ -1272,27 +1264,35 @@ mod tests {
 
         let cfg_present = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::Present,
             strip_method: StripMethod::Shuffle, // ignored
+            global_seed: 42,
         };
         let cfg_null_both = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullBoth,
             strip_method: StripMethod::Qmap5, // ignored
+            global_seed: 42,
         };
 
         let pipeline_present = BranchPipeline::new(cfg_present);
-        let (_df_out_p, res_p) = pipeline_present.process(&df).expect("present branch ok");
+        let (_df_out_p, res_p) = pipeline_present
+            .process(df.clone())
+            .expect("present branch ok");
         assert_eq!(res_p.effect_condition, "present");
         assert_eq!(res_p.strip_method, "none");
         assert!(res_p.branch_id.ends_with("__none"));
 
         let pipeline_nb = BranchPipeline::new(cfg_null_both);
-        let (_df_out_nb, res_nb) = pipeline_nb.process(&df).expect("null_both branch ok");
+        let (_df_out_nb, res_nb) = pipeline_nb
+            .process(df.clone())
+            .expect("null_both branch ok");
         assert_eq!(res_nb.effect_condition, "null_both");
         assert_eq!(res_nb.strip_method, "none");
         assert!(res_nb.branch_id.ends_with("__none"));
@@ -1304,27 +1304,33 @@ mod tests {
 
         let cfg_shuffle = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullInteraction,
             strip_method: StripMethod::Shuffle,
+            global_seed: 42,
         };
         let cfg_qmap = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullInteraction,
             strip_method: StripMethod::Qmap5,
+            global_seed: 42,
         };
 
         let pipeline_shuffle = BranchPipeline::new(cfg_shuffle);
-        let (_df_s, res_s) = pipeline_shuffle.process(&df).expect("shuffle branch ok");
+        let (_df_s, res_s) = pipeline_shuffle
+            .process(df.clone())
+            .expect("shuffle branch ok");
         assert_eq!(res_s.effect_condition, "null_interaction");
         assert_eq!(res_s.strip_method, "shuffle");
         assert!(res_s.branch_id.ends_with("__shuffle"));
 
         let pipeline_qmap = BranchPipeline::new(cfg_qmap);
-        let (_df_q, res_q) = pipeline_qmap.process(&df).expect("qmap branch ok");
+        let (_df_q, res_q) = pipeline_qmap.process(df).expect("qmap branch ok");
         assert_eq!(res_q.effect_condition, "null_interaction");
         assert_eq!(res_q.strip_method, "qmap_5");
         assert!(res_q.branch_id.ends_with("__qmap_5"));
@@ -1358,12 +1364,16 @@ mod tests {
         // Present should keep original RT distribution aside from downstream steps (none here)
         let cfg_present = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::Present,
             strip_method: StripMethod::Shuffle,
+            global_seed: 42,
         };
-        let (df_present, _res_p) = BranchPipeline::new(cfg_present).process(&df).unwrap();
+        let (df_present, _res_p) = BranchPipeline::new(cfg_present)
+            .process(df.clone())
+            .unwrap();
         // RTs should match original exactly
         assert_eq!(
             df.column("rt")
@@ -1384,12 +1394,14 @@ mod tests {
         // NullBoth should replace RTs with μ_i + residual (not equal to original in general)
         let cfg_nb = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullBoth,
             strip_method: StripMethod::Shuffle,
+            global_seed: 42,
         };
-        let (df_nb, _res_nb) = BranchPipeline::new(cfg_nb).process(&df).unwrap();
+        let (df_nb, _res_nb) = BranchPipeline::new(cfg_nb).process(df.clone()).unwrap();
         let rt_orig: Vec<f64> = df
             .column("rt")
             .unwrap()
@@ -1409,12 +1421,16 @@ mod tests {
         // NullInteraction + shuffle should permute within (participant_id, cong) groups
         let cfg_shuffle = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullInteraction,
             strip_method: StripMethod::Shuffle,
+            global_seed: 42,
         };
-        let (df_shuffle, _res_s) = BranchPipeline::new(cfg_shuffle).process(&df).unwrap();
+        let (df_shuffle, _res_s) = BranchPipeline::new(cfg_shuffle)
+            .process(df.clone())
+            .unwrap();
 
         // Compare per-group multisets of RTs, ignoring order and group ordering
         let orig_map = group_rt_multiset(&df);
@@ -1438,10 +1454,12 @@ mod tests {
         // Test with no transformations/filtering
         let config = BranchConfig {
             sample_size: 1.0,
+            subsample_id: 1,
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::Present,
             strip_method: StripMethod::Shuffle,
+            global_seed: 42,
         };
 
         let _pipeline = BranchPipeline::new(config);

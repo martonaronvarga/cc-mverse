@@ -1,155 +1,198 @@
 # R/functions/config.R - Configuration Management
 # Centralized configuration with validation
 
-#' Load and validate pipeline configuration
-#'
-#' @details
-#' Configuration is loaded from environment variables with sensible defaults.
-#' All paths are validated and created if necessary.
-#'
-#' @param run_mode One of: "local", "test", "hpc"
-#'
-#' @return List of validated configuration parameters
-#'
-load_pipeline_config <- function(run_mode = "local") {
-  logger::log_info("Loading pipeline configuration for mode: {run_mode}")
+load_config <- function(mode = "local",
+                        config_path = find_config_yaml(),
+                        overrides = list()) {
+  if (!file.exists(config_path)) {
+    stop("Config not found: ", config_path)
+  }
 
+  raw <- yaml::read_yaml(config_path)
+
+  # Start with defaults from top-level sections
   config <- list(
-    # Runtime mode
-    run_mode = run_mode,
-    is_local = run_mode %in% c("local", "test"),
-    is_hpc = run_mode == "hpc",
-    is_test = run_mode == "test",
-    use_hpc = as.logical(Sys.getenv("USE_HPC", tolower(run_mode) == "hpc")),
-    project_root = normalizePath(getwd()),
+    mode = mode,
+    is_hpc = (mode == "hpc"),
+    is_test = (mode == "test"),
 
-
-    # Data generation
-    use_simulated_data = as.logical(Sys.getenv("USE_SIMULATED_DATA", "TRUE")),
-    n_participants = as.numeric(Sys.getenv("N_PARTICIPANTS", "20")),
-    n_trials = as.numeric(Sys.getenv("N_TRIALS", "100")),
-    random_seed = as.numeric(Sys.getenv("RANDOM_SEED", "42")),
+    # Data
+    raw_csv = raw$data$raw_csv,
+    n_participants = raw$data$n_participants,
+    n_trials = raw$data$n_trials,
+    random_seed = raw$data$random_seed,
+    use_simulated_data = raw$data$use_simulated %||% TRUE,
 
     # Analysis axes
-    sample_sizes = c(0.5, 0.75, 1.0),
-    transformations = c("log_rt", "no_log_rt"),
-    outlier_methods = c(
-      "sd_2", "sd_2.5", "sd_3", "mad_2", "mad_2.5", "mad_3",
-      "range_1000", "range_1250", "range_1500", "none"
-    ),
-    effect_conditions = c("present", "null_interaction", "null_both"),
-    strip_methods = c("shuffle", "qmap_5"),
+    sample_sizes = as.numeric(raw$analysis$sample_sizes),
+    n_subsamples = raw$analysis$n_subsamples,
+    transformations = as.character(raw$analysis$transformations),
+    outlier_methods = as.character(raw$analysis$outlier_methods),
+    effect_conditions = as.character(raw$analysis$effect_conditions),
+    strip_methods = as.character(raw$analysis$strip_methods),
+    alpha = raw$analysis$alpha %||% 0.05,
 
-    # Model specifications
-    models = list(
-      rmanova = list(
-        type = "rmanova",
-        formula_full = "rt ~ cong * prev_cong + Error(participant_id/(cong * prev_cong))",
-        formula_null = "NA"
-      ),
-      lmm_intercept = list(
-        type = "lmm",
-        formula_full = "rt ~ cong * prev_cong + (1 | participant_id)",
-        formula_null = "rt ~ 1 + (1 | participant_id)",
-        control = list(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
-      ),
-      lmm_cong_slope = list(
-        type = "lmm",
-        formula_full = "rt ~ cong * prev_cong + (1 + cong | participant_id)",
-        formula_null = "rt ~ 1 + (1 + cong | participant_id)",
-        control = list(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
-      ),
-      lmm_full_slope = list(
-        type = "lmm",
-        formula_full = "rt ~ cong * prev_cong + (1 + cong * prev_cong | participant_id)",
-        formula_null = "rt ~ 1 + (1 + cong * prev_cong | participant_id)",
-        control = list(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
-      )
-    ),
+    # Models
+    models = build_model_specs(raw$models),
 
-    # Logging configuration
-    log_level = Sys.getenv("LOG_LEVEL", "INFO"),
-    log_targets = TRUE,
-    save_logs = TRUE,
-    show_warnings = TRUE,
+    # SLURM
+    slurm = raw$slurm,
 
-    # HPC configuration
-    n_workers = as.numeric(Sys.getenv("N_WORKERS", "4")),
-    slurm_mem_gb = as.numeric(Sys.getenv("SLURM_MEM_GB", "4")),
-    slurm_time_min = as.numeric(Sys.getenv("SLURM_TIME_MIN", "60")),
-    slurm_partition = Sys.getenv("SLURM_PARTITION", "hpc2019"),
+    # Rust
+    rust_release = raw$rust$release %||% TRUE,
+    rust_threads = raw$rust$threads %||% 0L,
+    writer_threads = raw$rust$writer_threads %||% 0L,
+    save_metadata = raw$rust$save_metadata %||% FALSE,
 
-    # Rust compilation
-    rust_release = TRUE, # Always use release builds for performance
-    rust_threads = as.numeric(Sys.getenv("RUST_THREADS", "0")), # 0 = auto
+    # Logging
+    log_level = raw$logging$level %||% "info",
 
-    # Output configuration
-    save_processed_data = TRUE, # Keep intermediate parquets
-    save_metadata = TRUE, # Save processing metadata
-    overwrite_results = as.logical(Sys.getenv("OVERWRITE_RESULTS", "FALSE"))
+    # Workers (will be overridden by mode)
+    n_workers = 4L
   )
 
-  # Validate configuration
+  # Apply mode-specific overrides
+  mode_cfg <- raw$modes[[mode]]
+  if (!is.null(mode_cfg)) {
+    for (key in names(mode_cfg)) {
+      config[[key]] <- mode_cfg[[key]]
+    }
+  }
+
+  # Apply CLI overrides (highest priority)
+  for (key in names(overrides)) {
+    if (!is.null(overrides[[key]])) {
+      config[[key]] <- overrides[[key]]
+    }
+  }
+
+  # Ensure numeric types
+  config$sample_sizes <- as.numeric(config$sample_sizes)
+  config$n_subsamples <- as.integer(config$n_subsamples)
+  config$n_workers <- as.integer(config$n_workers)
+  config$n_participants <- as.integer(config$n_participants)
+  config$n_trials <- as.integer(config$n_trials)
+
   validate_config(config)
-
-  logger::log_info("Configuration loaded: mode={run_mode}, workers={config$n_workers}")
-
   config
 }
 
-#' Validate configuration parameters
-#'
-#' @param config Configuration list
-#'
+#' Find pipeline.yaml by walking up from the working directory
+find_config_yaml <- function() {
+  candidates <- c(
+    "pipeline.yaml",
+    file.path("..", "pipeline.yaml"),
+    file.path(Sys.getenv("TAR_PROJECT", unset = "."), "pipeline.yaml")
+  )
+  for (p in candidates) {
+    if (file.exists(p)) {
+      return(normalizePath(p))
+    }
+  }
+  stop("Cannot find pipeline.yaml. Looked in: ", paste(candidates, collapse = ", "))
+}
+
+#' Build model specifications from YAML
+build_model_specs <- function(models_yaml) {
+  optimizer <- models_yaml$lmm_optimizer %||% list()
+  control <- list(
+    optimizer = optimizer$name %||% "bobyqa",
+    check.conv.grad = .makeCC("warning", tol = optimizer$check_conv_grad_tol %||% 1e-5),
+    check.conv.hess = .makeCC("warning", tol = optimizer$check_conv_hess_tol %||% 1e-6),
+    calc.derivs = TRUE,
+    optCtrl = list(maxfun = optimizer$maxfun %||% 300000L)
+  )
+
+  specs <- list()
+  for (name in setdiff(names(models_yaml), "lmm_optimizer")) {
+    m <- models_yaml[[name]]
+    spec <- list(
+      type = m$type,
+      formula_full = m$formula_full
+    )
+    if (!is.null(m$formula_null)) {
+      spec$formula_null <- m$formula_null
+    }
+    if (m$type == "lmm") {
+      spec$control <- control
+    }
+    specs[[name]] <- spec
+  }
+  specs
+}
+
+#' Validate configuration
 validate_config <- function(config) {
-  # Validate modes
-  if (!config$run_mode %in% c("local", "test", "hpc")) {
-    stop(glue::glue("Invalid run_mode: {config$run_mode}"))
-  }
-
-  # Validate numeric parameters
-  if (config$n_participants < 1) {
-    stop("n_participants must be >= 1")
-  }
-
-  if (config$n_trials < 1) {
-    stop("n_trials must be >= 1")
-  }
-
-  # For test mode, reduce data
-  if (config$is_test) {
-    logger::log_warn("TEST MODE: reducing data and branch count")
-    config$sample_sizes <- c(0.75)
-    config$transformations <- c("log_rt")
-    config$outlier_methods <- c("none")
-    config$effect_conditions <- c("present")
-    config$strip_methods <- c("shuffle")
-    config$n_workers <- 1
-  }
-
-  if (config$use_hpc) {
-    if (config$slurm_mem_gb < 2) {
-      stop("SLURM memory must be >= 2GB")
-    }
-    if (config$slurm_time_min < 10) {
-      stop("SLURM time must be >= 10 minutes")
-    }
-  }
-
+  stopifnot(
+    "mode must be test/local/hpc" = config$mode %in% c("test", "local", "hpc"),
+    "n_participants >= 1" = config$n_participants >= 1,
+    "n_trials >= 1" = config$n_trials >= 1,
+    "n_workers >= 1" = config$n_workers >= 1,
+    "sample_sizes non-empty" = length(config$sample_sizes) > 0,
+    "models non-empty" = length(config$models) > 0
+  )
   invisible(config)
+}
+
+#' Parse CLI arguments
+#'
+#' Returns mode, config path, and no other overrides —
+#' overrides are already baked into the resolved YAML by multiverse.sh.
+parse_cli <- function(args = commandArgs(trailingOnly = TRUE)) {
+  result <- list(
+    mode = "local",
+    config_path = find_config_yaml()
+  )
+
+  i <- 1L
+  while (i <= length(args)) {
+    arg <- args[i]
+    nxt <- if (i < length(args)) args[i + 1L] else NULL
+
+    switch(arg,
+      "--mode" = {
+        result$mode <- nxt
+        i <- i + 2L
+      },
+      "--config" = {
+        result$config_path <- nxt
+        i <- i + 2L
+      },
+      {
+        i <- i + 1L
+      }
+    )
+  }
+  result
 }
 
 #' Generate all branch combinations
 #'
+#' Branch design:
+#'   - Data branches (processed by Rust): unique by
+#'     (sample_size, subsample_id, transformation, outlier, effect_condition, strip_method)
+#'   - Model branches (fitted by R): each data branch × each model
+#'
+#' At sample_size = 1.0, only subsample_id = 1 (deterministic, no sampling).
+#' At all other fractions, n_subsamples independent draws.
+#'
 #' @param config Configuration list
-#'
 #' @return Tibble with one row per branch combination
-#'
 generate_all_branches <- function(config) {
-  logger::log_info("Generating branch specifications")
+  log_pipeline(logger::INFO, "Generating branch specifications")
 
-  branches_present <- tidyr::expand_grid(
-    sample_size = config$sample_sizes,
+  # Build subsample grid: at 1.0, only 1 subsample
+  subsample_grid <- purrr::map_dfr(config$sample_sizes, function(ss) {
+    n_sub <- if (abs(ss - 1.0) < 1e-6) 1L else config$n_subsamples
+    tidyr::expand_grid(
+      sample_size = ss,
+      subsample_id = seq_len(n_sub)
+    )
+  })
+
+  # Present and null_both: strip_method = "none"
+  branches_direct <- tidyr::expand_grid(
+    subsample_grid,
     transformation = config$transformations,
     outlier = config$outlier_methods,
     model = names(config$models),
@@ -157,22 +200,30 @@ generate_all_branches <- function(config) {
     strip_method = "none"
   )
 
-  branches_other <- tidyr::expand_grid(
-    sample_size = config$sample_sizes,
+  # null_interaction: real strip methods
+  branches_stripped <- tidyr::expand_grid(
+    subsample_grid,
     transformation = config$transformations,
     outlier = config$outlier_methods,
-    model = as.character(names(config$models)),
-    effect_condition = setdiff(config$effect_conditions, c("present", "null_both")),
+    model = names(config$models),
+    effect_condition = "null_interaction",
     strip_method = config$strip_methods
   )
 
-  branches <- dplyr::bind_rows(branches_present, branches_other) |>
+  branches <- dplyr::bind_rows(branches_direct, branches_stripped) |>
     dplyr::mutate(
-      branch_id = paste(sample_size, transformation, outlier, model, effect_condition, strip_method, sep = "__"),
+      # Branch ID includes model (unique per R fitting target)
+      branch_id = compose_branch_id(
+        sample_size, subsample_id, transformation, outlier,
+        model, effect_condition, strip_method
+      ),
+      # Data ID excludes model (unique per Rust processing unit)
+      data_id = data_id_from_branch_id(branch_id),
       n_total_branches = dplyr::n()
     ) |>
     tibble::rowid_to_column("idx")
 
+  # Validate constraints
   stopifnot(
     "present with non-none strip_method" =
       !any(branches$effect_condition == "present" & branches$strip_method != "none"),
@@ -180,12 +231,19 @@ generate_all_branches <- function(config) {
       !any(branches$effect_condition == "null_both" & branches$strip_method != "none"),
     "null_interaction with none strip_method" =
       !any(branches$effect_condition == "null_interaction" & branches$strip_method == "none"),
-    "duplicate branch_id" = length(unique(branches$branch_id)) == nrow(branches),
-    "all required columns present" = all(c("sample_size", "transformation", "outlier", "model", "effect_condition", "strip_method") %in% names(branches))
+    "duplicate branch_id" =
+      length(unique(branches$branch_id)) == nrow(branches)
   )
 
-  logger::log_info("Generated {nrow(branches)} branch combinations")
-  logger::log_info("Branch validation: all constraints satisfied")
+  log_pipeline(logger::INFO, "Generated {nrow(branches)} branch combinations")
+  log_pipeline(
+    logger::INFO,
+    "  Unique data branches (Rust): {length(unique(branches$data_id))}"
+  )
+  log_pipeline(
+    logger::INFO,
+    "  Subsample levels: {paste(config$sample_sizes, collapse=', ')} x {config$n_subsamples} draws"
+  )
 
   branches
 }
@@ -196,13 +254,11 @@ format_sample_size_for_rust <- function(x) {
   sub("\\.0$", "", s)
 }
 
-# Validate and normalize components to the exact strings used by Rust.
 normalize_transformation <- function(x) {
   x <- as.character(x)
-  if (x %in% c("log_rt", "no_log_rt")) {
-    return(x)
-  }
-  stop("Unknown transformation: ", x)
+  unknown <- x[!x %in% c("log_rt", "no_log_rt")]
+  if (length(unknown) > 0) stop("Unknown transformation(s): ", paste(unknown, collapse = ", "))
+  x
 }
 
 normalize_outlier <- function(x) {
@@ -213,42 +269,41 @@ normalize_outlier <- function(x) {
     "range_1000", "range_1250", "range_1500",
     "none"
   )
-  if (x %in% allowed) {
-    return(x)
-  }
-  stop("Unknown outlier method: ", x)
+  unknown <- x[!x %in% allowed]
+  if (length(unknown) > 0) stop("Unknown outlier method(s): ", paste(unknown, collapse = ", "))
+  x
 }
 
 normalize_effect_condition <- function(x) {
   x <- as.character(x)
-  if (x %in% c("present", "null_interaction", "null_both")) {
-    return(x)
-  }
-  stop("Unknown effect condition: ", x)
+  unknown <- x[!x %in% c("present", "null_interaction", "null_both")]
+  if (length(unknown) > 0) stop("Unknown effect condition(s): ", paste(unknown, collapse = ", "))
+  x
 }
 
 normalize_strip_method <- function(x, effect_condition) {
   effect_condition <- normalize_effect_condition(effect_condition)
   x <- as.character(x)
-  if (effect_condition == "null_interaction") {
-    if (x %in% c("shuffle", "qmap_5")) {
-      return(x)
-    }
-    stop("Unknown strip method for null_interaction: ", x)
-  } else {
-    # For present and null_both, Rust uses 'none' in branch_id and filenames
-    return("none")
+  bad_interaction <- effect_condition == "null_interaction" & !x %in% c("shuffle", "qmap_5")
+  if (any(bad_interaction)) {
+    stop(
+      "Unknown strip method(s) for null_interaction: ",
+      paste(unique(x[bad_interaction]), collapse = ", ")
+    )
   }
+  dplyr::if_else(effect_condition == "null_interaction", x, "none")
 }
 
 # Compose the Rust-consistent branch_id
-compose_branch_id <- function(sample_size, transformation, outlier, effect_condition, strip_method) {
+compose_branch_id <- function(sample_size, subsample_id, transformation, outlier, model, effect_condition, strip_method) {
   paste0(
-    format_sample_size_for_rust(sample_size), "__",
-    normalize_transformation(transformation), "__",
-    normalize_outlier(outlier), "__",
-    normalize_effect_condition(effect_condition), "__",
-    normalize_strip_method(strip_method, effect_condition)
+    trimws(format_sample_size_for_rust(sample_size)), "__",
+    trimws(as.integer(subsample_id)), "__",
+    trimws(normalize_transformation(transformation)), "__",
+    trimws(normalize_outlier(outlier)), "__",
+    trimws(as.character(model)), "__",
+    trimws(normalize_effect_condition(effect_condition)), "__",
+    trimws(normalize_strip_method(strip_method, effect_condition))
   )
 }
 
@@ -275,50 +330,31 @@ get_model_spec <- function(config, model_name) {
 
 #' Configure targets pipeline options
 #'
-#' Sets tar_option_set() with sensible defaults
-#'
 configure_targets <- function(config, paths) {
-  logger::log_info("Configuring targets pipeline")
+  log_pipeline(logger::INFO, "Configuring targets pipeline")
 
   controller <- create_crew_controller(config, paths)
 
   targets::tar_option_set(
     tidy_eval = TRUE,
-
-    # Parallelization options
     packages = packages_core,
-
-    # Storage
     format = "rds",
     repository = "local",
-
-    # Branching and aggregation type
     iteration = "list",
-
-    # Error handling
     error = "continue", # Don't stop entire pipeline on branch error
-
-    # Deployment (worker/local)
     deployment = "worker",
-    # deployment = "main",
     resources = targets::tar_resources(
       crew = targets::tar_resources_crew(
         controller = controller$name
       )
     ),
-    # Generate error workspaces for debugging
     workspace_on_error = TRUE,
-    # Set the seed
-    seed = set_reproducibility(config),
-
-    # Set the controller
+    seed = config$random_seed,
     controller = controller,
-
-    # Workspace
     envir = parent.frame()
   )
 
-  logger::log_debug("Targets pipeline configured with {config$n_workers} workers")
+  log_pipeline(logger::DEBUG, "Targets pipeline configured with {config$n_workers} workers")
   invisible(controller)
 }
 
@@ -333,90 +369,52 @@ configure_targets <- function(config, paths) {
 #' @return crew_controller object
 #'
 create_crew_controller <- function(config, paths) {
-  if (config$use_hpc) {
-    logger::log_info("Creating SLURM crew controller")
-
-    if (is.null(config$slurm_partition) || config$slurm_partition == "") {
-      config$slurm_partition <- "default"
-    }
+  if (config$is_hpc) {
+    slurm <- config$slurm
+    log_pipeline(logger::INFO, "Creating SLURM crew controller ({config$n_workers} workers)")
 
 
-    return(
-      crew.cluster::crew_controller_slurm(
-        name = "multiverse_slurm_controller",
-        workers = config$n_workers,
+    crew.cluster::crew_controller_slurm(
+      name = "multiverse_slurm",
+      workers = config$n_workers,
 
-        # Timeout and lifecycle
-        seconds_idle = 300,
-        seconds_timeout = 3600,
+      # Timeout and lifecycle
+      seconds_idle = 300,
+      seconds_timeout = 3600,
 
-        # SLURM resource allocation
-        options_cluster = crew.cluster::crew_options_slurm(
-          verbose = config$verbose_crew,
-          script_lines = c(
-            "#!/bin/bash",
-            "source ~/.bashrc"
-          ),
-          log_output = "crew_log_%A.log",
-          log_error = "crew_log_%A.log",
-          memory_gigabytes_required = config$slurm_mem_gb,
-          cpus_per_task = 1,
-          time_minutes = config$slurm_time_min,
-          partition = config$slurm_partition
+      # SLURM resource allocation
+      options_cluster = crew.cluster::crew_options_slurm(
+        verbose = TRUE,
+        script_lines = c(
+          "#!/bin/bash",
+          paste0("source ", slurm$bashrc_source)
         ),
-        options_metrics = crew::crew_options_metrics(
-          path = paths$logs
-        )
+        log_output = "crew_log_%A.log",
+        log_error = "crew_log_%A.log",
+        memory_gigabytes_required = config$slurm_mem_gb,
+        cpus_per_task = slurm$worker$cpus,
+        time_minutes = slurm$worker$time_min,
+        partition = slurm$slurm_partition
+      ),
+      options_metrics = crew::crew_options_metrics(
+        path = paths$logs
       )
     )
   } else {
-    logger::log_info("Creating local crew controller ({config$n_workers} workers)")
+    log_pipeline(logger::INFO, "Creating local crew controller ({config$n_workers} workers)")
 
-    return(
-      crew::crew_controller_local(
-        name = "multiverse_local_controller",
-        workers = parallelly::availableCores(omit = 1),
-        seconds_idle = 60,
-        seconds_timeout = 3600,
-        options_local = crew::crew_options_local(
-          log_directory = paths$logs,
-          log_join = FALSE
-        ),
-        options_metrics = crew::crew_options_metrics(
-          path = paths$logs
-        )
+    crew::crew_controller_local(
+      name = "multiverse_local",
+      workers = parallelly::availableCores(omit = 1),
+      seconds_idle = 60,
+      seconds_timeout = 3600,
+      options_local = crew::crew_options_local(
+        log_directory = paths$logs,
+        log_join = FALSE
+      ),
+      options_metrics = crew::crew_options_metrics(
+        path = paths$logs
       )
     )
   }
-}
-
-
-
-# ============================================================================
-# SEED AND REPRODUCIBILITY
-# ============================================================================
-
-#' Set reproducibility options
-#'
-#' @param config Configuration list
-#'
-set_reproducibility <- function(config) {
-  # Ensure factors ordered consistently
-  options(
-    stringsAsFactors = FALSE,
-    warnPartialMatchDollar = TRUE,
-    warnPartialMatchAttr = TRUE,
-    warnPartialMatchArgs = TRUE
-  )
-
-  set.seed(config$random_seed)
-
-  # Suppress warnings for cleaner logs (use with caution)
-  if (!config$show_warnings) {
-    options(warn = -1)
-  }
-
-  logger::log_debug("Reproducibility seed set: {config$random_seed}")
-
-  config$random_seed
 }

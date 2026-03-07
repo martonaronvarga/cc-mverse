@@ -1,8 +1,5 @@
-# R/functions/results.R
-# Result extraction, storage, and metadata tracking
-
 RESULTS_COLUMNS <- c(
-  "branch_id", "branch_idx", "sample_size", "transformation", "outlier",
+  "branch_id", "branch_idx", "sample_size", "subsample_id", "transformation", "outlier",
   "model", "effect_condition", "strip_method", "n_obs", "null_n_obs", "n_participants",
   "full_converged", "null_converged", "AIC_diff", "BIC_diff", "LR_stat",
   "LR_df", "LR_p", "main_estimate", "null_main_estimate", "main_std_error", "null_std_error", "main_t_stat",
@@ -21,6 +18,7 @@ get_results_schema <- function() {
     branch_id = arrow::string(),
     branch_idx = arrow::int32(),
     sample_size = arrow::float64(),
+    subsample_id = arrow::int32(),
     transformation = arrow::string(),
     outlier = arrow::string(),
     model = arrow::string(),
@@ -93,7 +91,7 @@ extract_results <- function(model_result, branch_spec, branch_idx) {
     "lmm" = extract_lmm_results(model_result, branch_spec, branch_idx),
     "rmanova" = extract_rmanova_results(model_result, branch_spec, branch_idx),
     create_error_result(
-      model_result = list(error = TRUE, error_message = glue::glue("Unknown model type: {model_result$type}")),
+      model_result = list(error = TRUE, message = glue::glue("Unknown model type: {model_result$type}")),
       branch_spec = branch_spec,
       branch_idx = branch_idx
     )
@@ -139,7 +137,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 
 
   main_est <- interaction_rows$estimate[1] %||% {
-    logger::log_debug("No interaction term found for {branch_spec$branch_id}")
+    log_branch(logger::DEBUG, "No interaction term found for {branch_spec$branch_id}", branch_spec$branch_id)
     NA_real_
   }
   main_se <- interaction_rows$std.error[1] %||% NA_real_
@@ -147,13 +145,12 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   main_p <- interaction_rows$p.value[1] %||% NA_real_
 
   null_main_est <- null_interaction_rows$estimate[1] %||% {
-    logger::log_debug("No interaction term in null model for {branch_spec$branch_id}")
+    log_branch(logger::DEBUG, "No interaction term in null model for {branch_spec$branch_id}", branch_spec$branch_id)
     0
   }
   null_main_se <- null_interaction_rows$std.error[1] %||% 0
   null_tstat <- null_interaction_rows$statistic[1] %||% 0
   null_main_p <- null_interaction_rows$p.value[1] %||% 0
-  null_effect <- ifelse(null_tstat != 0, null_tstat / sqrt(nobs(null_model)), 0)
 
   # Confidence interval (already in tidy output if conf.int = TRUE)
   ci_lower <- interaction_rows$conf.low[1] %||% NA_real_
@@ -173,14 +170,14 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 
   vc <- lme4::VarCorr(full_model)
   null_vc <- lme4::VarCorr(null_model)
-  random_int_var <- as.numeric(attr(vc$participant_id, "stddev")["(Intercept)"]^2)
-  null_random_int_var <- as.numeric(attr(null_vc$participant_id, "stddev")["(Intercept)"]^2)
+  random_int_var <- as.numeric(attr(vc$participant_id, "stddev")["(Intercept)"])^2
+  null_random_int_var <- as.numeric(attr(null_vc$participant_id, "stddev")["(Intercept)"])^2
 
-  if (!is.null(vc$participant_id) && "cong" %in% colnames(vc$participant_id)) {
-    random_slope_var <- as.numeric(attr(vc$participant_id, "stddev")["cong:prev_cong"]^2)
+  if (!is.null(vc$participant_id) && "cong" %in% colnames(vc$participant_id.1)) {
+    random_slope_var <- as.numeric(attr(vc$participant_id, "stddev")["cong:prev_cong"])^2
   }
-  if (!is.null(null_vc$participant_id) && "cong" %in% colnames(null_vc$participant_id)) {
-    null_random_slope_var <- as.numeric(attr(null_vc$participant_id, "stddev")["cong:prev_cong"]^2)
+  if (!is.null(null_vc$participant_id) && "cong" %in% colnames(null_vc$participant_id.1)) {
+    null_random_slope_var <- as.numeric(attr(null_vc$participant_id, "stddev")["cong:prev_cong"])^2
   }
 
   # Model fit metrics from lme4::VarCorr
@@ -200,12 +197,15 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   )
 
   # Log-likelihood
-  ll_full <- logLik(full_model) %>% as.numeric()
-  ll_null <- logLik(null_model) %>% as.numeric()
+  ll_full_obj <- stats::logLik(model_result$refit_full)
+  ll_null_obj <- stats::logLik(model_result$refit_null)
 
   # Number of parameters
-  npar_full <- attr(logLik(full_model), "df") %>% as.numeric()
-  npar_null <- attr(logLik(null_model), "df") %>% as.numeric()
+  npar_full <- attr(ll_full_obj, "df") %>% as.numeric()
+  npar_null <- attr(ll_null_obj, "df") %>% as.numeric()
+
+  ll_full <- as.numeric(ll_full_obj)
+  ll_null <- as.numeric(ll_null_obj)
 
   performance <- model_result$performance
 
@@ -215,6 +215,7 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     branch_id = branch_spec$branch_id,
     branch_idx = branch_idx,
     sample_size = branch_spec$sample_size,
+    subsample_id = as.integer(branch_spec$subsample_id),
     transformation = branch_spec$transformation,
     outlier = branch_spec$outlier,
     model = branch_spec$model,
@@ -222,8 +223,8 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     strip_method = branch_spec$strip_method,
 
     # Data characteristics
-    n_obs = nobs(full_model) %>% as.integer(),
-    null_n_obs = nobs(null_model) %>% as.integer(),
+    n_obs = stats::nobs(full_model) %>% as.integer(),
+    null_n_obs = stats::nobs(null_model) %>% as.integer(),
     n_participants = model_result$n_participants %>% as.integer(),
 
     # Convergence
@@ -286,26 +287,22 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 #' @return Single-row tibble with extracted values
 #'
 extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
-  full_stats <- model_result$full_stats %>%
-    dplyr::filter(term != "Residuals")
+  full_stats <- model_result$full_stats
 
   # For RMANOVA, extract main interaction effect
-
   interaction_row <- full_stats %>%
-    dplyr::filter(term = "participant_id:cong:prev_cong") %>%
-    dplyr::slice(1)
-
+    dplyr::slice(3)
 
   # Extract statistics
-  f_stat <- interaction_row$statistic[1] %||% NA_real_
-  p_value <- interaction_row$p.value[1] %||% NA_real_
-  num_df <- interaction_row$df[1] %||% NA_integer_
+  f_stat <- interaction_row$F[1] %||% NA_real_
+  p_value <- interaction_row$`Pr(>F)`[1] %||% NA_real_
+  num_df <- interaction_row$`num Df`[1] %||% NA_integer_
 
   # Convert F-statistic to approximate LR statistic
   # F = LR / df_full, so LR ≈ F * df
   lr_stat <- ifelse(!is.na(f_stat), f_stat * (num_df %||% 1), NA_real_)
 
-  # Effect size NA
+  # Effect size
   eta_sq <- interaction_row$ges[1] %||% NA_real_
 
   # Build result tibble
@@ -314,6 +311,7 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     branch_id = branch_spec$branch_id,
     branch_idx = branch_idx,
     sample_size = branch_spec$sample_size,
+    subsample_id = as.integer(branch_spec$subsample_id),
     transformation = branch_spec$transformation,
     outlier = branch_spec$outlier,
     model = branch_spec$model,
@@ -391,6 +389,7 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
     branch_id = branch_spec$branch_id,
     branch_idx = branch_idx,
     sample_size = branch_spec$sample_size,
+    subsample_id = as.integer(branch_spec$subsample_id),
     transformation = branch_spec$transformation,
     outlier = branch_spec$outlier,
     model = branch_spec$model,
@@ -431,7 +430,7 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
     npar_full = NA_integer_,
     npar_null = NA_integer_,
     error = TRUE,
-    error_message = model_result$error_message %||% "Unknown error",
+    error_message = model_result$message %||% "Unknown error",
     stage_completed = "failed",
     timestamp = Sys.time()
   )
@@ -456,11 +455,11 @@ append_results <- function(results_tbl, paths, branch_id) {
   tryCatch(
     {
       arrow::write_parquet(results_tbl, branch_file)
-      logger::log_info("Saved {nrow(results_tbl)} results to {branch_file}")
-      return(normalizePath(results_dir))
+      log_branch(logger::INFO, "Saved {length(results_tbl)} results to {branch_file}", branch_id)
+      return(normalizePath(branch_file))
     },
     error = function(e) {
-      logger::log_error("Failed to save branch {branch_id}: {e$message}")
+      log_branch(logger::ERROR, "Failed to save branch {branch_id}: {e$message}", branch_id)
       stop(e)
     }
   )
@@ -475,7 +474,7 @@ append_results <- function(results_tbl, paths, branch_id) {
 #' @return Invisibly TRUE
 #'
 save_processing_metadata <- function(metadata_tbl, metadata_path) {
-  logger::log_debug("Saving metadata: {nrow(metadata_tbl)} entries")
+  log_pipeline(logger::DEBUG, "Saving metadata: {nrow(metadata_tbl)} entries")
 
   dir <- dirname(metadata_path)
   if (!dir.exists(dir)) {
@@ -493,12 +492,11 @@ save_processing_metadata <- function(metadata_tbl, metadata_path) {
 
       arrow::write_parquet(combined, metadata_path)
 
-      logger::log_info("Saved metadata to {metadata_path}")
 
       invisible(TRUE)
     },
     error = function(e) {
-      logger::log_error("Failed to save metadata: {e$message}")
+      log_pipeline(logger::ERROR, "Failed to save metadata: {e$message}")
       stop(e)
     }
   )
@@ -513,7 +511,7 @@ load_results <- function(paths, validate = TRUE) {
   results_dir <- get_results_path(paths)
 
   if (!dir.exists(results_dir)) {
-    logger::log_warn("Results directory does not exist: {results_dir}")
+    log_pipeline(logger::WARN, "Results directory does not exist: {results_dir}")
     return(tibble::tibble())
   }
 
@@ -521,7 +519,7 @@ load_results <- function(paths, validate = TRUE) {
   branch_files <- list.files(results_dir, pattern = "^results_.*\\.parquet$")
 
   if (length(branch_files) == 0) {
-    logger::log_warn("No result files found in {results_dir}")
+    log_pipeline(logger::WARN, "No result files found in {results_dir}")
     return(tibble::tibble())
   }
 
@@ -530,12 +528,12 @@ load_results <- function(paths, validate = TRUE) {
       ds <- arrow::open_dataset(results_dir, format = "parquet")
       results <- ds %>% dplyr::collect()
 
-      logger::log_info("Aggregated {nrow(results)} rows from {length(list.files(results_dir))} branch files")
+      log_pipeline(logger::INFO, "Aggregated {nrow(results)} rows from {length(list.files(results_dir))} branch files")
 
       if (validate) {
         missing <- setdiff(RESULTS_COLUMNS, names(results))
         if (length(missing) > 0) {
-          logger::log_error("Missing columns: {paste(missing, collapse = ', ')}")
+          log_pipeline(logger::ERROR, "Missing columns: {paste(missing, collapse = ', ')}")
           stop("Schema validation failed")
         }
       }
@@ -543,7 +541,7 @@ load_results <- function(paths, validate = TRUE) {
       results
     },
     error = function(e) {
-      logger::log_error("Failed to aggregate results: {e$message}")
+      log_pipeline(logger::ERROR, "Failed to aggregate results: {e$message}")
       stop(e)
     }
   )
@@ -572,12 +570,6 @@ initialize_results_schema <- function(results_dir, schema = NULL, schema_filenam
   # Write a hidden schema file to anchor the directory’s schema.
   schema_file <- file.path(results_dir, schema_filename)
   arrow::write_parquet(empty_table, schema_file)
-
-
-  if (exists("logger") && is.function(get("log_debug", asNamespace("logger"), inherits = TRUE))) {
-    logger::log_debug("Results schema validated and stored at {schema_file}")
-  }
-
   invisible(TRUE)
 }
 
@@ -635,8 +627,14 @@ empty_tibble_from_schema <- function(schema) {
 #'
 #' @return Result tibble (1 row)
 #'
-fit_and_save_branch <- function(idx, branch_id, sample_size, transformation, outlier, model, effect_condition, strip_method, paths, config) {
-  logger::log_info("Processing branch {idx}: {branch_id}")
+fit_and_save_branch <- function(
+    idx,
+    branch_id, sample_size, subsample_id,
+    transformation, outlier, model, effect_condition,
+    strip_method, paths, config) {
+  # Ensure logging is active on this worker (idempotent — no-ops if already set up)
+  setup_logging(log_level = config$log_level, log_dir = paths$logs)
+  log_branch(logger::INFO, "START branch {idx}: {branch_id}", branch_id)
 
   model_result <- NULL
   results_tbl <- NULL
@@ -645,6 +643,7 @@ fit_and_save_branch <- function(idx, branch_id, sample_size, transformation, out
     idx = idx,
     branch_id = branch_id,
     sample_size = sample_size,
+    subsample_id = subsample_id,
     transformation = transformation,
     outlier = outlier,
     model = model,
@@ -654,15 +653,16 @@ fit_and_save_branch <- function(idx, branch_id, sample_size, transformation, out
   tryCatch(
     {
       # Load processed data
-      data_file <- get_processed_data_path(paths, branch_id)
+      data_id <- data_id_from_branch_id(branch_id)
+      data_file <- get_processed_data_path(paths, data_id)
 
       if (!file.exists(data_file)) {
-        logger::log_error("Processed data not found: {data_file}")
+        log_branch(logger::ERROR, "Processed data not found: {data_file}", branch_id)
         stop("Missing processed data")
       }
 
       data <- safe_read_parquet(data_file)
-      logger::log_debug("Loaded {nrow(data)} observations")
+      log_branch(logger::DEBUG, "Loaded {nrow(data)} observations", branch_id)
 
       # Get model specification
       model_spec <- get_model_spec(config, model)
@@ -685,32 +685,19 @@ fit_and_save_branch <- function(idx, branch_id, sample_size, transformation, out
         branch_id
       )
 
-      logger::log_info(
-        "Branch complete: p={results_tbl$LR_p}, converged={results_tbl$full_converged}"
+      log_branch(
+        logger::INFO,
+        "DONE branch {idx}: p={results_tbl$main_p_value}, converged={results_tbl$full_converged}",
+        branch_id
       )
 
       return(output_path)
     },
     error = function(e) {
-      logger::log_error("Branch {idx} failed: {e$message}")
-
-      # Reconstruct branch_spec for error handling
-      branch_spec <- list(
-        idx = idx,
-        branch_id = branch_id,
-        sample_size = sample_size,
-        transformation = transformation,
-        outlier = outlier,
-        model = model,
-        effect_condition = effect_condition,
-        strip_method = strip_method
-      )
-
-      # Create error record and save
-      error_tbl <- extract_results(model_result, branch_spec, idx)
-
+      log_branch(logger::ERROR, "FAILED branch {idx}: {e$message}", branch_id)
+      error_result <- list(error = TRUE, message = e$message)
+      error_tbl <- create_error_result(error_result, branch_spec, idx)
       output_path <- append_results(error_tbl, paths, branch_id)
-
       return(output_path)
     }
   )

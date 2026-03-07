@@ -8,7 +8,7 @@
 #' @return List of validated project paths
 #'
 init_project_paths <- function(project_root = ".") {
-  logger::log_info("Initializing project paths at: {project_root}")
+  log_pipeline(logger::INFO, "Initializing project paths at: {project_root}")
 
   paths <- list(
     root = normalizePath(project_root),
@@ -36,7 +36,7 @@ init_project_paths <- function(project_root = ".") {
   purrr::walk(paths, ~ {
     if (!dir.exists(.x)) {
       dir.create(.x, recursive = TRUE, showWarnings = FALSE)
-      logger::log_debug("Created directory: {.x}")
+      log_pipeline(logger::DEBUG, "Created directory: {.x}")
     }
   })
 
@@ -44,7 +44,7 @@ init_project_paths <- function(project_root = ".") {
   all_exist <- purrr::map_lgl(paths, dir.exists)
   if (!all(all_exist)) {
     failed <- names(paths)[!all_exist]
-    logger::log_error("Failed to create directories: {paste(failed, collapse=', ')}")
+    log_pipeline(logger::ERROR, "Failed to create directories: {paste(failed, collapse=', ')}")
     stop("Path initialization failed")
   }
 
@@ -55,85 +55,40 @@ init_project_paths <- function(project_root = ".") {
   )
 }
 
-#' Save pipeline configuration/state objects for `_targets.R`
+#' Save pipeline state for _targets.R
 #'
-#' @param config Pipeline configuration list
-#' @param paths Project paths object
-#' @param branches Tibble of branch specifications
-#' @param targets_conf Targets configuration object
-#' @param logging Logging configuration
-#'
-#' @return Invisibly returns TRUE on success
-#'
-save_pipeline_state <- function(config, paths, branches, targets_conf, logging) {
-  # Ensure directory exists
-  if (!dir.exists(paths$config_objects)) {
-    dir.create(paths$config_objects, recursive = TRUE, showWarnings = FALSE)
-  }
+#' Only saves what _targets.R cannot reconstruct from pipeline.yaml alone:
+#' the expanded branch table and the run identity.
+save_pipeline_state <- function(config, paths, branches, logging) {
+  dir <- paths$config_objects
+  if (!dir.exists(dir)) dir.create(dir, recursive = TRUE, showWarnings = FALSE)
 
-  logger::log_info("Saving pipeline state to {paths$config_objects}")
+  qs2::qs_save(config, file.path(dir, "config.qs2"))
+  qs2::qs_save(paths, file.path(dir, "paths.qs2"))
+  qs2::qs_save(branches, file.path(dir, "branches.qs2"))
+  qs2::qs_save(logging, file.path(dir, "logging.qs2"))
 
-  tryCatch(
-    {
-      qs2::qs_save(config, file.path(paths$config_objects, "config.qs2"))
-      qs2::qs_save(paths, file.path(paths$config_objects, "paths.qs2"))
-      qs2::qs_save(branches, file.path(paths$config_objects, "branches.qs2"))
-      qs2::qs_save(targets_conf, file.path(paths$config_objects, "targets_conf.qs2"))
-      qs2::qs_save(logging, file.path(paths$config_objects, "logging.qs2"))
-
-      logger::log_debug("Pipeline state saved: config, paths, branches, targets_conf, logging")
-      invisible(TRUE)
-    },
-    error = function(e) {
-      logger::log_error("Failed to save pipeline state: {e$message}")
-      stop(e)
-    }
-  )
+  log_pipeline(logger::INFO, "Pipeline state saved to {dir}")
+  invisible(TRUE)
 }
 
-#' Load pipeline configuration/state objects for targets
-#'
-#' Loads the 5 objects saved by `save_pipeline_state()`
-#'
-#' @param config_dir Path to config storage directory (default: "_config")
-#'
-#' @return Named list: config, paths, branches, targets_conf, logging
-#'
+#' Load pipeline state for _targets.R
 load_pipeline_state <- function(config_dir = "_config") {
-  logger::log_info("Loading pipeline state from {config_dir}")
+  required <- c("config.qs2", "paths.qs2", "branches.qs2", "logging.qs2")
+  missing <- required[!file.exists(file.path(config_dir, required))]
 
-  required <- c(
-    "config.qs2",
-    "paths.qs2",
-    "branches.qs2",
-    "targets_conf.qs2",
-    "logging.qs2"
-  )
-
-  full_paths <- file.path(config_dir, required)
-
-  # Check existence
-  missing <- !file.exists(full_paths)
-  if (any(missing)) {
-    missing_files <- required[missing]
-    logger::log_error("Missing pipeline state files: {paste(missing_files, collapse=', ')}")
-    stop("Cannot load pipeline state: missing files")
+  if (length(missing) > 0) {
+    stop(
+      "Missing state files in ", config_dir, ": ", paste(missing, collapse = ", "),
+      "\nRun `Rscript run.R` first."
+    )
   }
 
-  tryCatch(
-    {
-      list(
-        config        = qs2::qs_read(file.path(config_dir, "config.qs2")),
-        paths         = qs2::qs_read(file.path(config_dir, "paths.qs2")),
-        branches      = qs2::qs_read(file.path(config_dir, "branches.qs2")),
-        targets_conf  = qs2::qs_read(file.path(config_dir, "targets_conf.qs2")),
-        logging       = qs2::qs_read(file.path(config_dir, "logging.qs2"))
-      )
-    },
-    error = function(e) {
-      logger::log_error("Failed to load pipeline state: {e$message}")
-      stop(e)
-    }
+  list(
+    config   = qs2::qs_read(file.path(config_dir, "config.qs2")),
+    paths    = qs2::qs_read(file.path(config_dir, "paths.qs2")),
+    branches = qs2::qs_read(file.path(config_dir, "branches.qs2")),
+    logging  = qs2::qs_read(file.path(config_dir, "logging.qs2"))
   )
 }
 
@@ -144,35 +99,32 @@ load_pipeline_state <- function(config_dir = "_config") {
 #'
 #' @return Path to processed data file
 #'
-get_processed_data_path <- function(paths, branch_id) {
-  # filename <- glue::glue(
-  #   "processed__{branch_spec$sample_size}__{branch_spec$transformation}__{branch_spec$outlier}__{branch_spec$effect_condition}__{branch_spec$strip_method}.parquet"
-  # )
-  # Parse branch_id to extract components (without model)
-  # branch_id format: <sample_size>__<transformation>__<outlier>__<model>__<effect_condition>__<strip_method>
-
-  parts <- strsplit(branch_id, "__", fixed = TRUE)[[1]]
-
-  if (length(parts) != 6) {
-    stop("Invalid branch_id format:  ", branch_id, " (expected 6 parts)")
-  }
-
-  # Extract components
-  sample_size <- parts[1]
-  transformation <- parts[2]
-  outlier <- parts[3]
-  # parts[4] is model - SKIP IT
-  effect_condition <- parts[5]
-  strip_method <- parts[6]
-
-  # Construct processed file ID WITHOUT model
-  processed_id <- paste(sample_size, transformation, outlier, effect_condition, strip_method, sep = "__")
-
-  # Construct full path
+get_processed_data_path <- function(paths, data_id) {
   file.path(
     paths$data_processed,
-    paste0("processed__", processed_id, ".parquet")
+    paste0("processed__", data_id, ".parquet")
   )
+}
+
+#' Derive data_id from branch_id
+#'
+#' branch_id format (7 segments):
+#'   sample_size__subsample_id__transformation__outlier__model__effect_condition__strip_method
+#' data_id format (6 segments, model dropped):
+#'   sample_size__subsample_id__transformation__outlier__effect_condition__strip_method
+data_id_from_branch_id <- function(branch_id) {
+  vapply(branch_id, function(bid) {
+    bid <- trimws(bid)
+    parts <- trimws(strsplit(bid, "__", fixed = TRUE)[[1]])
+    if (length(parts) != 7L) {
+      stop(
+        "branch_id must have exactly 7 '__'-separated segments, got ",
+        length(parts), ": ", bid
+      )
+    }
+    # Drop segment 5 (model) — keep 1,2,3,4,6,7
+    paste(parts[c(1L, 2L, 3L, 4L, 6L, 7L)], collapse = "__")
+  }, character(1), USE.NAMES = FALSE)
 }
 
 #' Check if processed data exists for a branch
@@ -233,11 +185,11 @@ get_metadata_path <- function(paths) {
 #'
 safe_read_parquet <- function(filepath, required_cols = NULL) {
   if (!file.exists(filepath)) {
-    logger::log_error("File not found: {filepath}")
+    log_pipeline(logger::ERROR, "File not found: {filepath}")
     stop(glue::glue("File not found: {filepath}"))
   }
 
-  logger::log_debug("Reading parquet: {filepath}")
+  log_pipeline(logger::DEBUG, "Reading parquet: {filepath}")
 
   tryCatch(
     {
@@ -246,7 +198,7 @@ safe_read_parquet <- function(filepath, required_cols = NULL) {
       if (!is.null(required_cols)) {
         missing <- setdiff(required_cols, names(df))
         if (length(missing) > 0) {
-          logger::log_error("Missing columns in {filepath}: {paste(missing, collapse=', ')}")
+          log_pipeline(logger::ERROR, "Missing columns in {filepath}: {paste(missing, collapse=', ')}")
           stop(glue::glue("Missing columns: {paste(missing, collapse=', ')}"))
         }
       }
@@ -254,7 +206,7 @@ safe_read_parquet <- function(filepath, required_cols = NULL) {
       df
     },
     error = function(e) {
-      logger::log_error("Failed to read {filepath}: {e$message}")
+      log_pipeline(logger::ERROR, "Failed to read {filepath}: {e$message}")
       stop(glue::glue("Failed to read {filepath}: {e$message}"))
     }
   )
@@ -269,7 +221,7 @@ safe_read_parquet <- function(filepath, required_cols = NULL) {
 #' @return Invisibly returns filepath
 #'
 safe_write_parquet <- function(data, filepath, append = FALSE) {
-  logger::log_debug("Writing parquet: {filepath}")
+  log_pipeline(logger::DEBUG, "Writing parquet: {filepath}")
 
   # Create directory if needed
   dir <- dirname(filepath)
@@ -280,7 +232,7 @@ safe_write_parquet <- function(data, filepath, append = FALSE) {
   tryCatch(
     {
       if (append && file.exists(filepath)) {
-        logger::log_debug("Appending to existing file: {filepath}")
+        log_pipeline(logger::DEBUG, "Appending to existing file: {filepath}")
         existing <- arrow::read_parquet(filepath)
         combined <- dplyr::bind_rows(existing, data)
         arrow::write_parquet(combined, filepath)
@@ -288,11 +240,11 @@ safe_write_parquet <- function(data, filepath, append = FALSE) {
         arrow::write_parquet(data, filepath)
       }
 
-      logger::log_info("Wrote {nrow(data)} rows to {filepath}")
+      log_pipeline(logger::DEBUG, "Wrote {nrow(data)} rows to {filepath}")
       invisible(filepath)
     },
     error = function(e) {
-      logger::log_error("Failed to write {filepath}: {e$message}")
+      log_pipeline(logger::ERROR, "Failed to write {filepath}: {e$message}")
       stop(glue::glue("Failed to write {filepath}: {e$message}"))
     }
   )

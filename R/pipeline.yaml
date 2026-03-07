@@ -1,0 +1,131 @@
+# pipeline.yaml — Single source of truth for the multiverse pipeline
+#
+# Usage:
+#   ./multiverse.sh test              # overrides mode only
+#   ./multiverse.sh hpc               # uses hpc section below
+#   ./multiverse.sh local --workers 8 # CLI overrides this file
+
+# ==========================================================================
+# Data
+# ==========================================================================
+data:
+  raw_csv: data/raw/merged_data.csv
+  n_participants: 20
+  n_trials: 100
+  random_seed: 42
+  use_simulated: false
+
+# ==========================================================================
+# Analysis axes (Rust + R both read these)
+# ==========================================================================
+analysis:
+  sample_sizes: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  n_subsamples: 5
+  transformations: [log_rt, no_log_rt]
+  outlier_methods:
+    - sd_2
+    - sd_2.5
+    - sd_3
+    - mad_2
+    - mad_2.5
+    - mad_3
+    - range_1000
+    - range_1250
+    - range_1500
+    - none
+  effect_conditions: [present, null_interaction, null_both]
+  strip_methods: [shuffle, qmap_5]
+  alpha: 0.05
+
+# ==========================================================================
+# Models (R only)
+# ==========================================================================
+models:
+  rmanova:
+    type: rmanova
+    formula_full: "rt ~ cong * prev_cong + Error(participant_id/(cong * prev_cong))"
+
+  lmm_intercept:
+    type: lmm
+    formula_full: "rt ~ cong * prev_cong + (1 | participant_id)"
+    formula_null: "rt ~ 1 + (1 | participant_id)"
+
+  lmm_cong_slope:
+    type: lmm
+    formula_full: "rt ~ cong * prev_cong + (1 + cong | participant_id)"
+    formula_null: "rt ~ 1 + (1 + cong | participant_id)"
+
+  lmm_full_slope:
+    type: lmm
+    formula_full: "rt ~ cong * prev_cong + (1 + cong * prev_cong | participant_id)"
+    formula_null: "rt ~ 1 + (1 + cong * prev_cong | participant_id)"
+
+  lmm_optimizer:
+    name: bobyqa
+    maxfun: 300000
+    check_conv_grad_tol: 1.0e-3
+    check_conv_hess_tol: 1.0e-6
+
+# ==========================================================================
+# Execution modes — multiverse.sh picks one, CLI can override fields
+# ==========================================================================
+modes:
+  test:
+    n_participants: 5
+    n_trials: 20
+    n_workers: 1
+    log_level: info
+    # Reduced axes for quick smoke test
+    sample_sizes: [0.5]
+    n_subsamples: 1
+    transformations: [log_rt]
+    outlier_methods: [none]
+    effect_conditions: [present]
+    strip_methods: [shuffle]
+
+  local:
+    n_workers: 4
+    log_level: info
+
+  hpc:
+    n_workers: 300
+    log_level: info
+
+# ==========================================================================
+# HPC / SLURM resources
+# ==========================================================================
+slurm:
+  partition: hpc2019
+
+  rust:
+    cpus: 18
+    mem_gb: 32
+    time_min: 360
+
+  controller:
+    cpus: 4
+    mem_gb: 8
+    time_min: 480
+
+  worker:
+    cpus: 1
+    mem_gb: 2.5
+    time_min: 120
+
+  bashrc_source: "/mnt/st04pool/users/usumusu/.bashrc"
+
+# ==========================================================================
+# Rust binary
+# ==========================================================================
+rust:
+  release: true
+  threads: 14  # 0 = auto (use all available cores)
+  writer_threads: 4 # threads + writer_threads must not exceed cpu count
+  save_metadata: true
+
+# ==========================================================================
+# Logging
+# ==========================================================================
+logging:
+  level: info
+  save_logs: true

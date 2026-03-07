@@ -1,5 +1,5 @@
 {
-  description = "R with helix flake";
+  description = "Multiverse analysis pipeline - R + Rust";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -23,6 +23,14 @@
         pkgs = import nixpkgs {
           inherit system;
         };
+        pkgsMusl = import nixpkgs {
+          inherit system;
+          crossSystem = {
+            config = "x86_64-unknown-linux-musl";
+            isStatic = true;
+          };
+        };
+
         R-dev = pkgs.rWrapper.override {
           packages = with pkgs.rPackages; [
             languageserver
@@ -56,11 +64,13 @@
             xgboost
             matrixStats
             progressr
+            processx
             qs2
+            yaml
           ];
         };
 
-        rustToolchain = fenix.packages.${system}.stable.withComponents [
+        rustToolchainHost = fenix.packages.${system}.stable.withComponents [
           "rustc"
           "rust-src"
           "cargo"
@@ -68,19 +78,81 @@
           "rustfmt"
         ];
 
-        naersk-lib = pkgs.callPackage naersk {
-          rustc = rustToolchain;
-          cargo = rustToolchain;
+        rustToolchainMusl = fenix.packages.${system}.combine [
+          fenix.packages.${system}.stable.rustc
+          fenix.packages.${system}.stable.cargo
+          fenix.packages.${system}.targets."x86_64-unknown-linux-musl".stable.rust-std
+        ];
+
+        naersk-host = pkgs.callPackage naersk {
+          rustc = rustToolchainHost;
+          cargo = rustToolchainHost;
+        };
+
+        naersk-musl = pkgs.callPackage naersk {
+          rustc = rustToolchainMusl;
+          cargo = rustToolchainMusl;
         };
       in {
-        packages.default = naersk-lib.buildPackage {src = ./rust;};
+        packages.default = naersk-host.buildPackage {
+          src = ../R/rust;
+          nativeBuildInputs = [pkgs.pkg-config pkgs.gfortran];
+          buildInputs = [pkgs.openssl pkgs.openblas];
+
+          # Tell openblas-src to use the system library instead of building from source
+          OPENBLAS_LIB_DIR = "${pkgs.openblas}/lib";
+          OPENBLAS_INCLUDE_DIR = "${pkgs.openblas}/include";
+          OPENBLAS_SYSTEM = "1";
+
+          CARGO_FEATURE_SYSTEM_OPENBLAS = "1";
+        };
+
+        # Static musl binary for HPC deployment
+        packages.process-static = naersk-musl.buildPackage {
+          src = ../R/rust;
+          nativeBuildInputs = with pkgs; [pkg-config gfortran];
+          buildInputs = with pkgsMusl; [openssl.dev openblas stdenv.cc];
+
+          CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+          OPENBLAS_LIB_DIR = "${pkgsMusl.openblas}/lib";
+          OPENBLAS_INCLUDE_DIR = "${pkgsMusl.openblas}/include";
+          OPENBLAS_SYSTEM = "1";
+          CARGO_FEATURE_SYSTEM_OPENBLAS = "1";
+
+          OPENSSL_DIR = "${pkgsMusl.openssl.dev}";
+          OPENSSL_LIB_DIR = "${pkgsMusl.openssl.out}/lib";
+          OPENSSL_STATIC = "1";
+
+          # Tell cargo/cc where the musl linker lives
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = let
+            cc = pkgsMusl.stdenv.cc;
+          in "${cc}/bin/${cc.targetPrefix}cc";
+
+          # Post-build verification
+          doCheck = false; # Tests may not run under cross
+          postInstall = ''
+            echo "verifying static binary"
+            file $out/bin/process
+            # Ensure it's statically linked
+            if ldd $out/bin/process 2>&1 | grep -q "not a dynamic"; then
+              echo "OK: binary is statically linked"
+            elif ! ldd $out/bin/process 2>/dev/null; then
+              echo "OK: ldd reports not dynamic (static binary)"
+            else
+              echo "WARNING: binary may be dynamically linked"
+              ldd $out/bin/process || true
+            fi
+          '';
+        };
+
         devShells.default = pkgs.mkShell rec {
           name = "R";
           nativeBuildInputs = [pkgs.pkg-config];
           buildInputs = [
             R-dev
             pkgs.rlwrap
-            rustToolchain
+            rustToolchainHost
             pkgs.rust-analyzer
             pkgs.openssl
             pkgs.cargo
@@ -91,27 +163,13 @@
           ];
           shellHook = ''
             echo "dev shell with R & Rust available"
-
+            echo "  nix build ./flake#process-static  — static musl binary for HPC"
+            echo "  nix build                   — native debug/dev binary"
+            echo "  ./rust_to_hpc.sh user@host  — deploy to HPC"
           '';
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ nativeBuildInputs);
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
-        };
-
-        packages.pipeline-runner = pkgs.stdenv.writeShellApplication {
-          pname = "pipeline-runner";
-          runtimeInputs = [R-dev];
-          text = ''
-            set -euo pipefail
-            REPO="$PWD"
-            cd "$REPO/R"
-            exec Rscript run.R "$@"
-          '';
-        };
-
-        apps.pipeline = {
-          type = "app";
-          program = "${self.packages.${system}.pipeline-runner}/bin/run-pipeline";
         };
       }
     );

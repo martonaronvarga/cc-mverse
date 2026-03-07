@@ -1,17 +1,23 @@
 # R/functions/analysis.R - Results Aggregation & Discovery Rate Analysis
+# Multiverse Analysis: Results Aggregation & Discovery Rate Analysis
+#
+# Design principles:
+#   1. Non-convergence is data, not dirt.
+#   2. Singular fits are flagged, not dropped.
+#   3. Scales (log_rt vs no_log_rt) are never mixed.
+#   4. Null types are never pooled.
+#   5. Power and FPR are modeled separately.
+#   6. subsample_id provides genuine within-cell replication.
+#
+# Cell sizes with expanded design (9 sample_sizes × 5 subsamples + 1×1):
+#   Per (model, transformation, effect_condition, null_type): ~230 branches
+#   Per (model, transformation, sample_size): ~50 branches
+#   Per (model, transformation, sample_size, outlier): 5 branches
+#   Per full spec (model, transform, sample_size, outlier, subsample): 1 branch
 
 
-
-# helpers
-
-#' Derive canonical model label from raw model name
-#'
-#' Converts raw model names (e.g., "lmm_intercept") to display labels (e.g., "LMM (intercept)")
-#'
-#' @param model Character vector of model names
-#'
-#' @return Character vector of display labels
-#'
+#' Assign semantic name for model object in analysis
+#' @param model name from config, in model result list
 derive_model <- function(model) {
   dplyr::case_when(
     grepl("rmanova", model) ~ "rmANOVA",
@@ -22,153 +28,12 @@ derive_model <- function(model) {
   )
 }
 
-# ==============================================================================
-# BRANCH-LEVEL ANALYSIS
-# ==============================================================================
-# Analysis of individual branch results (single models, convergence, fit)
-
-analysis_main_filter <- function(
-    df,
-    remove_singular = TRUE # remove singular fits via lme4 message or random effects var
-    ) {
-  out <- df
-
-
-  if (remove_singular) {
-    # Often found as "singular fit" message in error_message or model_result$message
-    if ("error_message" %in% names(out)) {
-      out <- out %>%
-        dplyr::filter(
-          is.na(error_message) | !grepl("singular", error_message, ignore.case = TRUE)
-        )
-    }
-
-    # Or if random_intercept_var/random_slope_var exists and is exactly zero (typical lme4 indicator)
-    if (all(c("random_intercept_var", "random_slope_var") %in% names(out))) {
-      out <- out %>%
-        dplyr::filter(
-          is.na(random_intercept_var) | random_intercept_var > 0,
-          is.na(random_slope_var) | random_slope_var > 0
-        )
-    }
-  }
-  out
-}
-
-#' Compute branch-level diagnostics
+#' Filter to allowed (effect_condition, strip_method) combinations.
 #'
-#' Single-branch metrics: convergence, fit, effect estimates
-#'
-#' @param results_df Results tibble (can be multiple branches)
-#'
-#' @return Tibble with one row per branch containing diagnostics
-#'
-compute_branch_diagnostics <- function(results_df) {
-  diagn <- results_df %>%
-    dplyr::mutate(
-      # Convergence status
-      converged_both = full_converged & dplyr::coalesce(null_converged, TRUE),
-
-      # Effect classification (define early for downstream use)
-      is_true_effect = (effect_condition == "present" & strip_method == "none"),
-      is_null_effect = (
-        (effect_condition == "null_interaction" & strip_method %in% c("shuffle", "qmap_5")) |
-          (effect_condition == "null_both" & strip_method == "none")
-      ),
-
-      # Effect size magnitude
-      main_estimate_abs = abs(main_estimate),
-
-      # Model fit delta (relative improvement of full vs null)
-      aic_improvement = -AIC_diff, # Negative AIC_diff = better full model
-      bic_improvement = -BIC_diff,
-
-      # Effect size precision (inverse of SE)
-      effect_precision = 1 / (main_std_error + 1e-6),
-
-      # Confidence interval width
-      ci_width = effect_ci_upper - effect_ci_lower,
-
-      # Statistical significance
-      is_significant = main_p_value < 0.05,
-      model_type = derive_model(model),
-
-      # Model quality flags
-      small_sample = n_obs < 100,
-      poor_ci = ci_width > 2 * main_estimate_abs, # Very wide CI
-
-      .keep = "all"
-    )
-
-  diagn <- analysis_main_filter(diagn)
-
-  stopifnot(
-    "Overlapping effect definitions" = !any(diagn$is_true_effect & diagn$is_null_effect, na.rm = TRUE)
-  )
-  diagn
-}
-
-#' Summarize branch-level results by model specification
-#'
-#' @param results_df Results tibble with branch diagnostics
-#'
-#' @return Tibble: one row per model type
-#'
-branch_summary_by_model <- function(results_df) {
-  results_df %>%
-    analysis_main_filter() %>%
-    dplyr::filter(!error) %>%
-    dplyr::group_by(model_type) %>%
-    dplyr::summarise(
-      n_branches = dplyr::n(),
-      n_converged = sum(converged_both, na.rm = TRUE),
-      convergence_rate = mean(converged_both, na.rm = TRUE),
-      # Effect estimates (only converged)
-      mean_main_estimate = mean(main_estimate[converged_both], na.rm = TRUE),
-      median_main_estimate = median(main_estimate[converged_both], na.rm = TRUE),
-      sd_main_estimate = sd(main_estimate[converged_both], na.rm = TRUE),
-
-      # Model fit
-      mean_aic_diff = mean(AIC_diff[converged_both], na.rm = TRUE),
-      mean_bic_diff = mean(BIC_diff[converged_both], na.rm = TRUE),
-
-      # Inference precision
-      mean_main_se = mean(main_std_error[converged_both], na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::arrange(mean_main_estimate)
-}
-
-#' Identify problematic branches
-#'
-#' Flags branches with convergence failures, small samples, or wide CIs
-#'
-#' @param results_df Results tibble with diagnostics
-#'
-#' @return Tibble of problematic branches
-#'
-identify_problematic_branches <- function(results_df) {
-  results_df %>%
-    analysis_main_filter() %>%
-    dplyr::filter(error | !converged_both | poor_ci | small_sample) %>%
-    dplyr::select(
-      branch_id, model_type, effect_condition,
-      error, converged_both, small_sample, poor_ci,
-      main_estimate, main_std_error, ci_width,
-      main_p_value, n_obs
-    ) %>%
-    dplyr::mutate(
-      problem = dplyr::case_when(
-        error ~ "Model fitting error",
-        !converged_both ~ "Non-convergence",
-        poor_ci ~ "Very wide confidence interval",
-        small_sample ~ "Small sample size",
-        TRUE ~ "Unknown issue"
-      )
-    ) %>%
-    dplyr::arrange(branch_id)
-}
-
+#' Ensures that:
+#'   - "present"          only appears with strip_method == "none"
+#'   - "null_both"        only appears with strip_method == "none"
+#'   - "null_interaction"  only appears with strip_method != "none"
 allowed_combinations_filter <- function(df) {
   df %>%
     dplyr::filter(
@@ -178,189 +43,744 @@ allowed_combinations_filter <- function(df) {
     )
 }
 
-
-#' Compute ROC metrics (TPR and FPR) properly
+#' Build the analysis-ready data frame.
 #'
-#' @details
-#' - TPR computed ONLY from effect_condition == "present"
-#' - FPR computed ONLY from effect_condition %in% c("null_interaction", "null_both")
-#' - Grouping is appropriate to avoid single-row groups
-#'
-#' @param results_df Results tibble with diagnostics
-#' @param alpha Significance threshold
-#' @param group_vars Variables to group by for aggregation
-#'
-#' @return Tibble with TPR, FPR, and derived metrics
-#'
-compute_roc_metrics <- function(
-    results_df,
-    alpha = 0.05,
-    group_vars = c(
-      "model_type", "sample_size",
-      "transformation", "outlier"
-    )) {
-  prepared <- results_df %>%
-    dplyr::filter(!error, converged_both) %>%
+#' Applies allowed-combination and singularity filters, then attaches all
+#' derived columns used downstream. Every subsequent function receives this
+#' prepared frame and does not re-filter.
+prepare_analysis_df <- function(results_df) {
+  out <- results_df %>%
     allowed_combinations_filter() %>%
     dplyr::mutate(
-      is_significant = main_p_value < alpha
+      # --- convergence (rmANOVA: null_converged is NA → treat as TRUE) ---
+      converged_both = full_converged & dplyr::coalesce(null_converged, TRUE),
+      is_singular = dplyr::case_when(
+        error ~ NA,
+        !is.na(error_message) &
+          grepl("singular", error_message, ignore.case = TRUE) ~ TRUE,
+        !is.na(random_intercept_var) & random_intercept_var == 0 ~ TRUE,
+        !is.na(random_slope_var) & random_slope_var == 0 ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      numerically_usable = !error & converged_both & !is_singular,
+
+      # --- effect-type flags (mutually exclusive after allowed_combinations) ---
+      is_true_effect = (effect_condition == "present"),
+      is_null_effect = (effect_condition %in% c("null_interaction", "null_both")),
+
+      # --- null sub-type: encodes the null-generation mechanism ---
+      null_type = dplyr::case_when(
+        effect_condition == "null_interaction" ~
+          paste0("null_interaction:", strip_method),
+        effect_condition == "null_both" ~ "null_both",
+        TRUE ~ NA_character_
+      ),
+      model_type = derive_model(model),
+      is_significant = dplyr::if_else(
+        numerically_usable, main_p_value < 0.05, NA
+      ),
+      aic_improvement = dplyr::if_else(numerically_usable, -AIC_diff, NA_real_),
+      bic_improvement = dplyr::if_else(numerically_usable, -BIC_diff, NA_real_),
+      ci_width = dplyr::if_else(
+        numerically_usable,
+        effect_ci_upper - effect_ci_lower,
+        NA_real_
+      ),
+      small_sample = n_obs < 100,
+      poor_ci = dplyr::if_else(
+        numerically_usable & is_true_effect &
+          !is.na(main_estimate) & abs(main_estimate) > 1e-6 &
+          !is.na(ci_width),
+        ci_width > 2 * abs(main_estimate),
+        FALSE
+      ),
+      subsample_id = as.integer(subsample_id),
+      .keep = "all"
     )
 
-  # TPR: proportion significant when effect is PRESENT
-  tpr_df <- prepared %>%
+  # sanity: the two flags must be mutually exclusive.
+  stopifnot(
+    "Overlapping effect definitions" =
+      !any(out$is_true_effect & out$is_null_effect, na.rm = TRUE)
+  )
+
+  out
+}
+
+branch_health <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::group_by(model_type, transformation, effect_condition, null_type) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_error = sum(error, na.rm = TRUE),
+      n_no_error = sum(!error, na.rm = TRUE),
+      n_converged = sum(converged_both & !error, na.rm = TRUE),
+      n_singular = sum(is_singular & !error, na.rm = TRUE),
+      n_usable = sum(numerically_usable, na.rm = TRUE),
+      pct_error = 100 * n_error / n_total,
+      pct_converged = dplyr::if_else(
+        n_no_error > 0, 100 * n_converged / n_no_error, NA_real_
+      ),
+      pct_singular = dplyr::if_else(
+        n_no_error > 0, 100 * n_singular / n_no_error, NA_real_
+      ),
+      pct_usable = 100 * n_usable / n_total,
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(model_type, transformation, effect_condition, null_type)
+}
+
+branch_health_by_spec <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::group_by(
+      model_type, transformation, effect_condition, null_type,
+      sample_size, outlier
+    ) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_usable = sum(numerically_usable, na.rm = TRUE),
+      n_subsamples = dplyr::n_distinct(subsample_id),
+      pct_usable = 100 * n_usable / n_total,
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(
+      model_type, transformation, effect_condition, sample_size, outlier
+    )
+}
+
+identify_problematic_branches <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::filter(error | !converged_both | is_singular | poor_ci | small_sample) %>%
+    dplyr::select(
+      branch_id, model_type, effect_condition, null_type, transformation,
+      subsample_id, error, converged_both, is_singular, numerically_usable,
+      small_sample, poor_ci,
+      main_estimate, main_std_error, ci_width,
+      main_p_value, n_obs
+    ) %>%
+    dplyr::mutate(
+      problems = paste0(
+        dplyr::if_else(error, "error;", ""),
+        dplyr::if_else(!error & !converged_both, "non-converged;", ""),
+        dplyr::if_else(!error & is_singular, "singular;", ""),
+        dplyr::if_else(poor_ci, "wide-CI;", ""),
+        dplyr::if_else(small_sample, "small-n;", "")
+      )
+    ) %>%
+    dplyr::arrange(branch_id)
+}
+
+estimate_summary <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::filter(numerically_usable) %>%
+    dplyr::group_by(model_type, transformation, effect_condition, null_type) %>%
+    dplyr::summarise(
+      n_usable = dplyr::n(),
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      median_estimate = median(main_estimate, na.rm = TRUE),
+      sd_estimate = sd(main_estimate, na.rm = TRUE),
+      mad_estimate = mad(main_estimate, na.rm = TRUE),
+      mean_se = mean(main_std_error, na.rm = TRUE),
+      mean_aic_improvement = mean(-AIC_diff, na.rm = TRUE),
+      mean_bic_improvement = mean(-BIC_diff, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(transformation, effect_condition, null_type, model_type)
+}
+
+# POWER ANALYSIS (true-effect branches only)
+
+compute_power_tables <- function(prepared_df, alpha = 0.05) {
+  usable_present <- prepared_df %>%
+    dplyr::filter(numerically_usable, is_true_effect) %>%
+    dplyr::mutate(sig = main_p_value < alpha)
+
+  coarse <- usable_present %>% # ~ 230 branches per cell
+    dplyr::group_by(model_type, transformation) %>%
+    dplyr::summarise(
+      n = dplyr::n(), detected = sum(sig),
+      power = detected / n,
+      mean_p = mean(main_p_value, na.rm = TRUE),
+      median_p = median(main_p_value, na.rm = TRUE),
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      sd_estimate = sd(main_estimate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # ~50 per cell (5 subsamples × 10 outliers)
+  medium <- usable_present %>%
+    dplyr::group_by(model_type, transformation, sample_size) %>%
+    dplyr::summarise(
+      n = dplyr::n(), detected = sum(sig),
+      power = detected / n,
+      mean_p = mean(main_p_value, na.rm = TRUE),
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Fine: ~5 per cell (one per subsample)
+  fine <- usable_present %>%
+    dplyr::transmute(
+      model_type, transformation, sample_size, outlier,
+      significant = sig,
+      p_value = main_p_value,
+      estimate = main_estimate,
+      std_error = main_std_error
+    )
+
+  per_branch <- usable_present %>%
+    dplyr::transmute(
+      model_type, transformation, sample_size, subsample_id, outlier,
+      significant = sig, p_value = main_p_value,
+      estimate = main_estimate, std_error = main_std_error
+    )
+
+  list(coarse = coarse, by_sample_size = medium, by_outlier = fine, per_branch = per_branch)
+}
+
+compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
+  usable_null <- prepared_df %>%
+    dplyr::filter(numerically_usable, is_null_effect) %>%
+    dplyr::mutate(sig = main_p_value < alpha)
+
+  coarse <- usable_null %>%
+    dplyr::group_by(null_type, model_type, transformation) %>%
+    dplyr::summarise(
+      n = dplyr::n(), false_positives = sum(sig),
+      FPR = false_positives / n,
+      mean_p = mean(main_p_value, na.rm = TRUE),
+      median_p = median(main_p_value, na.rm = TRUE),
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  medium <- usable_null %>%
+    dplyr::group_by(null_type, model_type, transformation, sample_size) %>%
+    dplyr::summarise(
+      n = dplyr::n(), false_positives = sum(sig),
+      FPR = false_positives / n,
+      mean_p = mean(main_p_value, na.rm = TRUE),
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  fine <- usable_null %>%
+    dplyr::group_by(null_type, model_type, transformation, sample_size, outlier) %>%
+    dplyr::summarise(
+      n = dplyr::n(), false_positives = sum(sig),
+      FPR = false_positives / n,
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  per_branch <- usable_null %>%
+    dplyr::transmute(
+      null_type, model_type, transformation, sample_size, subsample_id, outlier,
+      significant = sig, p_value = main_p_value,
+      estimate = main_estimate, std_error = main_std_error
+    )
+
+  list(coarse = coarse, by_sample_size = medium, by_outlier = fine, per_branch = per_branch)
+}
+
+compute_roc_metrics <- function(prepared_df, alpha = 0.05) {
+  usable <- prepared_df %>%
+    dplyr::filter(numerically_usable)
+
+  join_vars <- c("model_type", "transformation", "sample_size")
+
+  tpr_df <- usable %>%
     dplyr::filter(is_true_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(join_vars))) %>%
     dplyr::summarise(
       n_true = dplyr::n(),
-      n_detected = sum(is_significant, na.rm = TRUE),
-      TPR = ifelse(n_true > 0, n_detected / n_true, NA_real_),
+      detected = sum(main_p_value < alpha),
+      TPR = detected / n_true,
       mean_effect_present = mean(main_estimate, na.rm = TRUE),
       .groups = "drop"
     )
 
-  # FPR: proportion significant when effect is NULL
-  fpr_df <- prepared %>%
+  fpr_df <- usable %>%
     dplyr::filter(is_null_effect) %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars)))) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(join_vars, "null_type")))) %>%
     dplyr::summarise(
       n_null = dplyr::n(),
-      n_false_positive = sum(is_significant, na.rm = TRUE),
-      FPR = ifelse(n_null > 0, n_false_positive / n_null, NA_real_),
+      false_positives = sum(main_p_value < alpha),
+      FPR = false_positives / n_null,
       mean_effect_null = mean(main_estimate, na.rm = TRUE),
       .groups = "drop"
     )
 
-  # Join TPR and FPR
-  roc_df <- tpr_df %>%
-    dplyr::left_join(fpr_df, by = group_vars, suffix = c("_present", "_null")) %>%
+  roc_df <- fpr_df %>%
+    dplyr::left_join(tpr_df, by = join_vars) %>%
     dplyr::mutate(
-      # d-prime (sensitivity index)
-      d_prime = qnorm(pmin(TPR, 0.999)) - qnorm(pmax(FPR, 0.001)),
-      # Youden's J statistic
-      youden_j = TPR - FPR,
-      # Diagnostic odds ratio
+      has_tpr = !is.na(TPR),
+      tpr_adj = pmin(pmax(dplyr::coalesce(TPR, 0), 1 / (2 * n_true)), 1 - 1 / (2 * n_true)),
+      fpr_adj = pmin(pmax(FPR, 1 / (2 * n_null)), 1 - 1 / (2 * n_null)),
+      d_prime = stats::qnorm(tpr_adj) - stats::qnorm(fpr_adj),
+      youden_j = dplyr::coalesce(TPR, 0) - FPR,
       DOR = dplyr::case_when(
-        FPR == 0 | TPR == 1 ~ NA_real_,
+        is.na(TPR) | is.na(FPR) ~ NA_real_,
+        TPR == 0 ~ 0,
+        FPR == 0 | TPR == 1 | FPR == 1 ~ NA_real_,
         TRUE ~ (TPR / (1 - TPR)) / (FPR / (1 - FPR))
       )
-    )
+    ) %>%
+    dplyr::select(-tpr_adj, -fpr_adj)
 
-  logger::log_info("Computed ROC metrics for {nrow(roc_df)} groupings")
-
+  log_pipeline(logger::INFO, "Computed ROC metrics for {nrow(roc_df)} groupings")
   roc_df
 }
 
-#' Compute FPR by null condition type
-#'
-#' @details
-#' Separates null_interaction vs null_both to verify stripping method works
-#' and doesn't artificially inflate false discoveries
-#'
-#' @param results_df Results tibble
-#' @param alpha Significance threshold
-#' @param group_vars Grouping variables
-#'
-#' @return Tibble with FPR by null type
-#'
-compute_fpr_by_null_type <- function(
-    results_df,
-    alpha = 0.05,
-    group_vars = c(
-      "strip_method", "model_type", "sample_size", "transformation"
-    )) {
-  prepared <- results_df %>%
-    dplyr::filter(!error, converged_both, is_null_effect) %>%
-    allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
+#' ROC metrics at outlier granularity (for outlier-comparison plots)
+compute_roc_metrics_by_outlier <- function(prepared_df, alpha = 0.05) {
+  usable <- prepared_df %>%
+    dplyr::filter(numerically_usable)
 
-  fpr_df <- prepared %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(c(group_vars, "effect_condition")))) %>%
+  join_vars <- c("model_type", "transformation", "sample_size", "outlier")
+
+  tpr_df <- usable %>%
+    dplyr::filter(is_true_effect) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(join_vars))) %>%
     dplyr::summarise(
-      n = dplyr::n(),
-      n_significant = sum(is_significant, na.rm = TRUE),
-      FPR = ifelse(n > 0, n_significant / n, NA_real_),
-      mean_p = mean(main_p_value, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      mean_effect = mean(main_estimate, na.rm = TRUE),
+      n_true = dplyr::n(),
+      detected = sum(main_p_value < alpha),
+      TPR = detected / n_true,
       .groups = "drop"
     )
 
-  logger::log_info("Computed FPR for {nrow(fpr_df)} null-condition groupings")
-
-  fpr_df
-}
-
-#' Compute power (TPR) across specifications
-#'
-#' @param results_df Results tibble
-#' @param alpha Significance threshold
-#' @param group_vars Grouping variables
-#'
-#' @return Tibble with power metrics
-#'
-compute_power <- function(
-    results_df,
-    alpha = 0.05,
-    group_vars = c(
-      "model_type", "sample_size",
-      "transformation"
-    )) {
-  prepared <- results_df %>%
-    dplyr::filter(!error, converged_both, is_true_effect, strip_method == "none") %>%
-    allowed_combinations_filter() %>%
-    dplyr::mutate(is_significant = main_p_value < alpha)
-
-  power_df <- prepared %>%
-    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+  fpr_df <- usable %>%
+    dplyr::filter(is_null_effect) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(join_vars, "null_type")))) %>%
     dplyr::summarise(
-      n = dplyr::n(),
-      n_detected = sum(is_significant, na.rm = TRUE),
-      power = ifelse(n > 0, n_detected / n, NA_real_),
-      mean_p = mean(main_p_value, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      mean_effect = mean(main_estimate, na.rm = TRUE),
-      sd_effect = sd(main_estimate, na.rm = TRUE),
+      n_null = dplyr::n(),
+      false_positives = sum(main_p_value < alpha),
+      FPR = false_positives / n_null,
       .groups = "drop"
     )
 
-  logger::log_info("Computed power for {nrow(power_df)} present-condition groupings")
-
-  power_df
+  fpr_df %>%
+    dplyr::left_join(tpr_df, by = join_vars)
 }
 
 
-#' Compute discovery rates
-#'
-#' @param results_df Results tibble with all branches
-#' @param alpha Significance threshold
-#'
-#' @return Tibble with discovery metrics
-#'
-compute_discovery_rates <- function(results_df, alpha = 0.05) {
-  logger::log_info("Computing discovery rates at alpha={alpha}")
+# ==============================================================================
+# META-ANALYTIC MODELS OF THE MULTIVERSE
+# ==============================================================================
 
-  roc_metrics <- compute_roc_metrics(
-    results_df,
-    alpha = alpha,
-    group_vars = c("model_type", "sample_size", "transformation", "outlier")
-  )
+#' Prepare model data frame for a logistic regression.
+#'
+#' Encodes sample_size as an ordered factor (not continuous, because three
+#' unevenly-spaced levels spanning [0.5, 1.0] lack the leverage for a linear
+#' log-odds slope — the continuous parameterization produces a near-zero,
+#' undetectable effect). As an ordered factor, each level gets its own
+#' contrast, which can capture nonlinear jumps (e.g., power plateau between
+#' 0.75 and 1.0).
+#'
+#' Consolidates outlier methods that cause complete separation into a
+#' combined level. Methods with zero (or all) significant outcomes across
+#' the modeled subset produce infinite log-odds and enormous standard
+#' errors. Grouping them prevents separation while preserving the
+#' information that these methods behave differently.
+prepare_model_data <- function(df, alpha = 0.05) {
+  df %>%
+    dplyr::mutate(
+      sig = as.integer(main_p_value < alpha),
+      model_type_f = factor(model_type),
+      transformation_f = factor(transformation),
+      sample_size_c = sample_size,
+      outlier_f = factor(outlier),
+      subsample_id_f = factor(subsample_id)
+    ) %>%
+    # Detect and collapse outlier levels with complete separation
+    collapse_separated_levels(
+      outcome_col = "sig",
+      factor_col = "outlier_f"
+    )
+}
 
-
-  # Combine into single summary
-  discovery_rates <- roc_metrics %>%
-    dplyr::rename(
-      true_positive_rate = TPR,
-      false_positive_rate = FPR
+#' Collapse factor levels that cause complete separation.
+#'
+#' A factor level causes separation when all its observations have the same
+#' outcome (all 0 or all 1). The logistic regression cannot estimate a finite
+#' coefficient for such levels.
+#'
+#' Strategy: identify separated levels and merge them into a single
+#' "other_separated" bucket. This loses information about which specific
+#' level it was, but the original per-branch tables preserve that.
+#' The coefficient for "other_separated" is interpretable as "the group of
+#' methods that uniformly produced (non-)significance".
+collapse_separated_levels <- function(df, outcome_col, factor_col) {
+  separation_check <- df %>%
+    dplyr::group_by(.data[[factor_col]]) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_pos = sum(.data[[outcome_col]], na.rm = TRUE),
+      n_neg = n - n_pos,
+      .groups = "drop"
     ) %>%
     dplyr::mutate(
-      pct_tpr = 100 * true_positive_rate,
-      pct_fpr = 100 * false_positive_rate
+      is_separated = (n_pos == 0) | (n_neg == 0)
     )
 
-  logger::log_info("Computed discovery rates for {nrow(discovery_rates)} combinations")
+  separated_levels <- separation_check %>%
+    dplyr::filter(is_separated) %>%
+    dplyr::pull(!!rlang::sym(factor_col))
 
-  discovery_rates
+  if (length(separated_levels) > 0) {
+    log_pipeline(
+      logger::INFO,
+      "Collapsing {length(separated_levels)} separated level(s) in {factor_col}: {paste(separated_levels, collapse = ', ')}"
+    )
+
+    current_levels <- levels(df[[factor_col]])
+    new_levels <- c(
+      setdiff(current_levels, as.character(separated_levels)),
+      "other_separated"
+    )
+    df[[factor_col]] <- forcats::fct_other(
+      df[[factor_col]],
+      drop = as.character(separated_levels),
+      other_level = "other_separated"
+    )
+  }
+
+  df
 }
+
+
+#' Fit separate models for power, each FPR type, and convergence.
+#'
+#' Design decisions:
+#'
+#'   1. NO random effect for branch_id. Each branch_id is unique (n=1 per
+#'      group), making a random intercept unidentifiable. The variance
+#'      collapses to zero and adds nothing.
+#'
+#'   2. SEPARATE models for present vs each null_type. These conditions have
+#'      completely different base rates (~70% vs ~2-5%). A combined model
+#'      requires intercept + null_type offsets that span ~20 log-odds units,
+#'      causing quasi-complete separation on the null_type dimension.
+#'
+#'   3. sample_size as ordered factor. With only 3 levels in [0.5, 1.0],
+#'      a continuous parameterization has negligible leverage. An ordered
+#'      factor can capture nonlinear jumps between levels.
+#'
+#'   4. model_type × transformation interaction. Log-transformation changes
+#'      the error distribution and may affect which model structures succeed.
+#'      This is the only scientifically motivated interaction; adding more
+#'      would risk overfitting on ~60-120 branches per model.
+#'
+#'   5. Collapsed separated outlier levels. Methods like range_1000/range_1250
+#'      may produce zero significant results, causing infinite coefficients.
+#'      These are merged into "other_separated" to allow estimation.
+model_multiverse <- function(prepared_df, alpha = 0.05) {
+  usable <- prepared_df %>% dplyr::filter(numerically_usable)
+
+  formula_sig <- sig ~ model_type_f * transformation_f +
+    outlier_f + sample_size_c
+
+  formula_sig_re <- sig ~ model_type_f * transformation_f +
+    outlier_f + sample_size_c + (1 | subsample_id_f)
+
+  models <- list()
+
+  # ---- POWER model (present condition only) ----
+  present_df <- usable %>%
+    dplyr::filter(is_true_effect) %>%
+    prepare_model_data(alpha = alpha)
+
+  models$power <- fit_with_optional_re(
+    present_df, formula_sig_re, formula_sig,
+    label = "power"
+  )
+
+  # ---- FPR models (one per null_type) ----
+  null_types <- unique(usable$null_type[usable$is_null_effect])
+
+  for (nt in null_types) {
+    null_df <- usable %>%
+      dplyr::filter(null_type == nt) %>%
+      prepare_model_data(alpha = alpha)
+
+    safe_name <- gsub(":", "_", nt)
+    models[[paste0("fpr_", safe_name)]] <- fit_with_optional_re(
+      null_df, formula_sig_re, formula_sig,
+      label = paste("FPR", nt)
+    )
+  }
+
+  # ---- CONVERGENCE model (all non-error branches, all conditions) ----
+  conv_df <- prepared_df %>%
+    dplyr::filter(!error) %>%
+    dplyr::mutate(
+      failed = as.integer(!converged_both | is_singular),
+      model_type_f = factor(model_type),
+      transformation_f = factor(transformation),
+      sample_size_c = sample_size,
+      outlier_f = factor(outlier),
+      effect_condition_f = factor(effect_condition),
+      subsample_id_f = factor(subsample_id)
+    ) %>%
+    collapse_separated_levels(
+      outcome_col = "failed",
+      factor_col = "outlier_f"
+    )
+
+  formula_conv <- failed ~ model_type_f * transformation_f +
+    outlier_f + sample_size_c + effect_condition_f
+
+  formula_conv_re <-
+    failed ~ model_type_f * transformation_f +
+    outlier_f + sample_size_c + effect_condition_f + (1 | subsample_id_f)
+
+  models$convergence <- fit_with_optional_re(
+    conv_df, formula_conv_re, formula_conv,
+    label = "convergence"
+  )
+
+  log_pipeline(
+    logger::INFO,
+    "Fit {sum(!sapply(models, is.null))} multiverse logistic models"
+  )
+  models
+}
+
+
+#' Fit a single logistic model with diagnostics.
+#'
+#' Returns coefficients (odds ratios), predicted probabilities,
+#' and model diagnostics. Returns NULL on failure with a warning.
+fit_with_optional_re <- function(df, formula_re, formula_fixed, label = "") {
+  if (nrow(df) < 10) {
+    log_pipeline(logger::WARN, "{label}: too few rows ({nrow(df)}), skipping")
+    return(NULL)
+  }
+
+  outcome_var <- all.vars(formula_re)[1]
+  outcome_vals <- df[[outcome_var]]
+  if (all(outcome_vals == 0) || all(outcome_vals == 1)) {
+    log_pipeline(logger::WARN, "{label}: constant outcome, skipping")
+    return(NULL)
+  }
+
+  # Check if there are multiple subsamples
+  has_re <- dplyr::n_distinct(df$subsample_id_f) > 1
+
+  fit <- NULL
+  used_re <- FALSE
+
+  if (has_re) {
+    fit <- tryCatch(
+      {
+        m <- lme4::glmer(formula_re,
+          data = df, family = binomial(link = "logit"),
+          control = lme4::glmerControl(optimizer = "bobyqa")
+        )
+        # Check for singular fit (RE variance ~ 0)
+        re_var <- lme4::VarCorr(m)
+        if (any(sapply(re_var, function(x) attr(x, "stddev")) < 1e-4)) {
+          log_pipeline(logger::INFO, "{label}: RE singular, falling back to GLM")
+          NULL
+        } else {
+          used_re <- TRUE
+          m
+        }
+      },
+      error = function(e) {
+        log_pipeline(logger::INFO, "{label}: GLMER failed ({e$message}), falling back to GLM")
+        NULL
+      }
+    )
+  }
+
+  if (is.null(fit)) {
+    fit <- tryCatch(
+      stats::glm(formula_fixed, data = df, family = binomial(link = "logit")),
+      error = function(e) {
+        log_pipeline(logger::WARN, "{label}: GLM also failed: {e$message}")
+        NULL
+      }
+    )
+  }
+
+  if (is.null(fit)) {
+    return(NULL)
+  }
+
+  coef_tbl <- broom.mixed::tidy(fit, conf.int = TRUE)
+  has_separation <- any(
+    abs(coef_tbl$estimate) > 10 & coef_tbl$std.error > 100,
+    na.rm = TRUE
+  )
+
+  if (has_separation) {
+    log_pipeline(logger::WARN, "{label}: quasi-separation in {sum(abs(coef_tbl$estimate) > 10 & coef_tbl$std.error > 100)} term(s)")
+  }
+
+  or_tbl <- coef_tbl %>%
+    dplyr::filter(term != "(Intercept)", effects != "ran_pars" | is.na(effects)) %>%
+    dplyr::mutate(
+      odds_ratio = exp(estimate),
+      or_ci_lower = exp(conf.low),
+      or_ci_upper = exp(conf.high),
+      has_separation = abs(estimate) > 10 & std.error > 100
+    )
+
+  pred_tbl <- tryCatch(
+    broom::augment(fit, type.predict = "response") %>%
+      dplyr::rename(predicted_prob = .fitted, pred_se = .se.fit),
+    error = function(e) tibble::tibble()
+  )
+
+  deviance <- if (inherits(fit, "glmerMod")) fit@devcomp$cmp["dev"] else fit$deviance
+  null_deviance <- if (inherits(fit, "glmerMod")) NA_real_ else fit$null.deviance
+  aic_val <- AIC(fit)
+
+  list(
+    label = label, fit = fit, used_re = used_re,
+    n_obs = nrow(df), n_positive = sum(outcome_vals == 1),
+    base_rate = mean(outcome_vals), has_separation = has_separation,
+    coefficients = coef_tbl, odds_ratios = or_tbl, predictions = pred_tbl,
+    deviance = as.numeric(deviance), null_deviance = as.numeric(null_deviance),
+    aic = aic_val,
+    pseudo_r2_mcfadden = if (!is.na(null_deviance) && null_deviance > 0) {
+      1 - (as.numeric(deviance) / as.numeric(null_deviance))
+    } else {
+      NA_real_
+    }
+  )
+}
+
+specification_curve_data <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::transmute(
+      branch_id, model_type, transformation, outlier, sample_size, subsample_id,
+      effect_condition, null_type, strip_method,
+      status = dplyr::case_when(
+        error ~ "error",
+        !converged_both ~ "non-converged",
+        is_singular ~ "singular",
+        TRUE ~ "usable"
+      ),
+      numerically_usable,
+      significant = is_significant,
+      p_value = dplyr::if_else(numerically_usable, main_p_value, NA_real_),
+      estimate = dplyr::if_else(numerically_usable, main_estimate, NA_real_),
+      std_error = dplyr::if_else(numerically_usable, main_std_error, NA_real_),
+      ci_lower = dplyr::if_else(numerically_usable, effect_ci_lower, NA_real_),
+      ci_upper = dplyr::if_else(numerically_usable, effect_ci_upper, NA_real_)
+    ) %>%
+    dplyr::arrange(
+      effect_condition, model_type, transformation, sample_size, outlier
+    )
+}
+
+detect_specification_inconsistencies <- function(prepared_df, alpha = 0.05) {
+  prepared_df %>%
+    dplyr::group_by(
+      model_type, effect_condition, null_type, transformation, sample_size
+    ) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_usable = sum(numerically_usable, na.rm = TRUE),
+      n_subsamples = dplyr::n_distinct(subsample_id[numerically_usable]),
+      n_sig = sum(
+        main_p_value[numerically_usable] < alpha,
+        na.rm = TRUE
+      ),
+      n_nonsig = n_usable - n_sig,
+      pct_significant = dplyr::if_else(
+        n_usable > 0, 100 * n_sig / n_usable, NA_real_
+      ),
+      is_inconsistent = (n_sig > 0) & (n_nonsig > 0),
+      n_failed = n_total - n_usable,
+      pct_failed = 100 * n_failed / n_total,
+      effect_mean = mean(main_estimate[numerically_usable], na.rm = TRUE),
+      effect_sd = sd(main_estimate[numerically_usable], na.rm = TRUE),
+      effect_cv = dplyr::if_else(
+        n_usable >= 2 & abs(effect_mean) > 1e-6,
+        effect_sd / abs(effect_mean),
+        NA_real_
+      ),
+      p_min = min(main_p_value[numerically_usable], na.rm = TRUE),
+      p_max = max(main_p_value[numerically_usable], na.rm = TRUE),
+      p_range = p_max - p_min,
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(is_inconsistent), dplyr::desc(pct_failed))
+}
+
+summarise_by_factor <- function(prepared_df, group_vars, label = "factor") {
+  health <- prepared_df %>%
+    dplyr::group_by(
+      dplyr::across(dplyr::all_of(c(group_vars, "effect_condition", "null_type")))
+    ) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_usable = sum(numerically_usable, na.rm = TRUE),
+      pct_usable = 100 * n_usable / n_total,
+      .groups = "drop"
+    )
+
+  rates <- prepared_df %>%
+    dplyr::filter(numerically_usable) %>%
+    dplyr::group_by(
+      dplyr::across(dplyr::all_of(c(group_vars, "effect_condition", "null_type")))
+    ) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_significant = sum(main_p_value < 0.05, na.rm = TRUE),
+      pct_significant = 100 * n_significant / n,
+      mean_estimate = mean(main_estimate, na.rm = TRUE),
+      median_estimate = median(main_estimate, na.rm = TRUE),
+      mean_p = mean(main_p_value, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  health %>%
+    dplyr::left_join(
+      rates,
+      by = c(group_vars, "effect_condition", "null_type")
+    ) %>%
+    dplyr::arrange(dplyr::across(dplyr::all_of(c(
+      "effect_condition", "null_type", group_vars
+    ))))
+}
+
+create_summary_table <- function(prepared_df) {
+  prepared_df %>%
+    dplyr::group_by(model_type, transformation, effect_condition, null_type) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_usable = sum(numerically_usable, na.rm = TRUE),
+      pct_usable = 100 * n_usable / n_total,
+      pct_significant = dplyr::if_else(
+        n_usable > 0,
+        100 * sum(
+          main_p_value[numerically_usable] < 0.05,
+          na.rm = TRUE
+        ) / n_usable,
+        NA_real_
+      ),
+      mean_effect = mean(main_estimate[numerically_usable], na.rm = TRUE),
+      sd_effect = sd(main_estimate[numerically_usable], na.rm = TRUE),
+      median_p = median(main_p_value[numerically_usable], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      metric_type = dplyr::case_when(
+        effect_condition == "present" ~ "Power (TPR)",
+        effect_condition == "null_both" ~ "FPR (null_both)",
+        effect_condition == "null_interaction" ~ paste0("FPR (", null_type, ")"),
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::arrange(model_type, transformation, effect_condition, null_type)
+}
+
+
+# MAIN ENTRY POINT
 
 
 #' Analyze multiverse results across all branches
@@ -369,138 +789,84 @@ compute_discovery_rates <- function(results_df, alpha = 0.05) {
 #'
 #' @return List containing multiple analysis tables
 #'
-
 analyze_multiverse_results <- function(results_df, alpha = 0.05) {
-  logger::log_info("Performing multiverse analysis on {nrow(results_df)} branches")
-
-  results_with_diag <- compute_branch_diagnostics(results_df)
-  results_with_diag <- allowed_combinations_filter(results_with_diag)
-
-  analyses <- list(
-    # Branch-level summaries
-    branch_by_model = branch_summary_by_model(results_with_diag),
-    branch_issues = identify_problematic_branches(results_with_diag),
-
-    # Summary by model
-    by_model = results_with_diag %>%
-      dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(model_type) %>%
-      dplyr::summarise(
-        n_branches = dplyr::n(),
-        n_converged = sum(converged_both, na.rm = TRUE),
-        mean_p = mean(main_p_value, na.rm = TRUE),
-        median_p = median(main_p_value, na.rm = TRUE),
-        # Separate power (true) from FDR (null)
-        power = mean(is_significant[is_true_effect], na.rm = TRUE),
-        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_main_estimate = mean(main_estimate, na.rm = TRUE),
-        sd_main_estimate = sd(main_estimate, na.rm = TRUE),
-        .groups = "drop"
-      ),
-
-    # Summary by transformation (separate true/null)
-    by_transformation = results_with_diag %>%
-      dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(transformation) %>%
-      dplyr::summarise(
-        n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect], na.rm = TRUE),
-        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
-        mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
-        .groups = "drop"
-      ),
-
-    # Summary by outlier method
-    by_outlier = results_with_diag %>%
-      dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(outlier) %>%
-      dplyr::summarise(
-        n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect & strip_method == "none"], na.rm = TRUE),
-        .groups = "drop"
-      ),
-
-    # Summary by sample size
-    by_sample_size = results_with_diag %>%
-      dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(sample_size) %>%
-      dplyr::summarise(
-        n_branches = dplyr::n(),
-        power = mean(is_significant[is_true_effect], na.rm = TRUE),
-        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
-        .groups = "drop"
-      ),
-
-    # Summary by strip method (CRITICAL for robustness)
-    by_strip_method = results_with_diag %>%
-      dplyr::filter(!error, converged_both) %>%
-      dplyr::group_by(strip_method) %>%
-      dplyr::summarise(
-        n_branches = dplyr::n(),
-        power = ifelse(strip_method[1] == "none", mean(is_significant[is_true_effect], na.rm = TRUE), NA_real_),
-        fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-        mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
-        mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
-        .groups = "drop"
-      ),
-
-    # ROC metrics (proper TPR/FPR)
-    roc_metrics = compute_roc_metrics(results_with_diag, alpha = alpha),
-
-    # FDR by null type (robustness check)
-    fpr_by_null_type = compute_fpr_by_null_type(results_with_diag, alpha = alpha),
-
-    # Power analysis
-    power_analysis = compute_power(results_with_diag, alpha = alpha),
-    discovery_rates = compute_discovery_rates(results_with_diag, alpha = alpha),
-
-    # Specification inconsistencies
-    spec_inconsistencies = detect_specification_inconsistencies(results_with_diag, alpha = alpha),
-
-    # Sensitivity analysis
-    spec_sensitivity = analyze_specification_sensitivity(results_with_diag),
-    summary_table = create_summary_table(results_with_diag),
-    results_with_diag = results_with_diag
+  log_pipeline(
+    logger::INFO,
+    "Performing multiverse analysis on {nrow(results_df)} branches"
   )
 
-  logger::log_info("Multiverse analysis complete:  {length(analyses)} tables generated")
+  prepared <- prepare_analysis_df(results_df)
+  power_tables <- compute_power_tables(prepared, alpha = alpha)
+  fpr_tables <- compute_fpr_tables(prepared, alpha = alpha)
+  # mv_models <- model_multiverse(prepared, alpha = alpha)
 
+  # # Extract exportable tables from model objects
+  model_coefs <- list()
+  model_odds <- list()
+  model_predictions <- list()
+  model_diagnostics <- list()
+
+  # for (nm in names(mv_models)) {
+  #   m <- mv_models[[nm]]
+  #   if (is.null(m)) next
+
+  #   model_coefs[[paste0("coef_", nm)]] <- m$coefficients
+  #   model_odds[[paste0("or_", nm)]] <- m$odds_ratios
+  #   model_predictions[[paste0("pred_", nm)]] <- m$predictions
+  #   model_diagnostics[[nm]] <- tibble::tibble(
+  #     model = nm,
+  #     label = m$label,
+  #     used_re = m$used_re,
+  #     n_obs = m$n_obs,
+  #     n_positive = m$n_positive,
+  #     base_rate = m$base_rate,
+  #     has_separation = m$has_separation,
+  #     deviance = m$deviance,
+  #     null_deviance = m$null_deviance,
+  #     aic = m$aic,
+  #     pseudo_r2 = m$pseudo_r2_mcfadden
+  #   )
+  # }
+
+  diagnostics_tbl <- if (length(model_diagnostics) > 0) {
+    dplyr::bind_rows(model_diagnostics)
+  } else {
+    tibble::tibble()
+  }
+
+  analyses <- c(
+    list(
+      branch_health = branch_health(prepared),
+      branch_health_by_spec = branch_health_by_spec(prepared),
+      branch_issues = identify_problematic_branches(prepared),
+      estimate_summary = estimate_summary(prepared),
+      power_coarse = power_tables$coarse,
+      power_by_sample_size = power_tables$by_sample_size,
+      power_by_outlier = power_tables$by_outlier,
+      power_per_branch = power_tables$per_branch,
+      fpr_coarse = fpr_tables$coarse,
+      fpr_by_sample_size = fpr_tables$by_sample_size,
+      fpr_by_outlier = fpr_tables$by_outlier,
+      fpr_per_branch = fpr_tables$per_branch,
+      roc_metrics = compute_roc_metrics(prepared, alpha = alpha),
+      roc_metrics_by_outlier = compute_roc_metrics_by_outlier(prepared, alpha = alpha),
+      by_outlier = summarise_by_factor(prepared, c("outlier", "transformation")),
+      by_sample_size = summarise_by_factor(prepared, c("sample_size", "transformation")),
+      by_model = summarise_by_factor(prepared, c("model_type", "transformation")),
+      spec_curve = specification_curve_data(prepared),
+      spec_inconsistencies = detect_specification_inconsistencies(prepared, alpha = alpha),
+      summary_table = create_summary_table(prepared),
+      model_diagnostics = diagnostics_tbl,
+      results_with_diag = prepared
+    ),
+    model_coefs, model_odds, model_predictions
+  )
+
+  log_pipeline(
+    logger::INFO,
+    "Multiverse analysis complete: {length(analyses)} tables generated"
+  )
   analyses
-}
-
-#' Generate summary statistics table
-#'
-#' @param results_df Results with diagnostics
-#'
-#' @return Summary tibble
-#'
-create_summary_table <- function(results_df) {
-  # Add model_type grouping for display
-
-  summary_tbl <- prepared %>%
-    dplyr::group_by(model_type, transformation, effect_condition) %>%
-    dplyr::summarise(
-      n = dplyr::n(),
-      n_converged = sum(converged_both, na.rm = TRUE),
-      pct_significant = mean(is_significant, na.rm = TRUE) * 100,
-      mean_effect = mean(main_estimate, na.rm = TRUE),
-      sd_effect = sd(main_estimate, na.rm = TRUE),
-      median_p = median(main_p_value, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(
-      metric_type = dplyr::case_when(
-        effect_condition == "present" ~ "Power (TPR)",
-        TRUE ~ "FPR"
-      )
-    ) %>%
-    dplyr::arrange(model_type, transformation, effect_condition)
-
-  summary_tbl
 }
 
 #' Analyze results and save to disk
@@ -512,110 +878,32 @@ create_summary_table <- function(results_df) {
 #' @return List of written file paths
 #'
 analyze_and_save <- function(results_df, paths, alpha = 0.05) {
-  logger::log_info("Saving multiverse analysis results...")
+  log_pipeline(logger::INFO, "Saving multiverse analysis results...")
 
-  # Ensure output directory
   if (!dir.exists(paths$outputs_analysis)) {
     dir.create(paths$outputs_analysis, recursive = TRUE, showWarnings = FALSE)
   }
 
+  analyses <- analyze_multiverse_results(results_df, alpha = alpha)
   output_files <- list()
 
-  # Run analyses
-  analyses <- analyze_multiverse_results(results_df, alpha = alpha)
-
-  # Save each analysis table
   for (name in names(analyses)) {
     df <- analyses[[name]]
-
     if (!is.data.frame(df) || nrow(df) == 0) {
-      logger::log_warn("Skipping empty analysis:  {name}")
+      log_pipeline(logger::WARN, "Skipping empty or non-df analysis: {name}")
       next
     }
 
     filename <- glue::glue("{name}_{format(Sys.time(), '%Y%m%d_%H%M%S')}.csv")
     filepath <- file.path(paths$outputs_analysis, filename)
-
     readr::write_csv(df, filepath)
-    logger::log_info("Wrote analysis:  {filepath}")
+    log_pipeline(logger::INFO, "Wrote analysis: {filepath}")
     output_files[[name]] <- filepath
   }
 
-  logger::log_info("Analysis complete, {length(output_files)} files saved")
-
-  invisible(output_files)
-}
-
-
-#' Detect inconsistent findings
-#'
-#' @param results_df Results tibble
-#' @param alpha Significance threshold
-#'
-#' @return Tibble with inconsistent specification sets
-#'
-detect_specification_inconsistencies <- function(results_df, alpha = 0.05) {
-  logger::log_info("Detecting specification inconsistencies")
-
-  # Check within same (model_type, effect_condition) if different preprocessing
-  # leads to different conclusions
-
-  inconsistencies <- results_df %>%
-    allowed_combinations_filter() %>%
-    analysis_main_filter() %>%
-    dplyr::filter(!error, !is.na(main_p_value)) %>%
-    dplyr::filter(converged_both) %>%
-    # Group by model_type and effect condition, vary preprocessing
-    dplyr::group_by(model_type, effect_condition) %>%
-    dplyr::summarise(
-      n_specs = dplyr::n(),
-      n_significant = sum(is_significant, na.rm = TRUE),
-      pct_significant = 100 * n_significant / n_specs,
-
-      # P-value range indicates sensitivity
-      p_min = min(main_p_value, na.rm = TRUE),
-      p_max = max(main_p_value, na.rm = TRUE),
-      p_range = p_max - p_min,
-      p_iqr = IQR(main_p_value, na.rm = TRUE),
-
-      # Effect size variation
-      effect_mean = mean(main_estimate, na.rm = TRUE),
-      effect_sd = sd(main_estimate, na.rm = TRUE),
-      effect_cv = effect_sd / (abs(effect_mean) + 1e-6),
-
-      # Inconsistent if not all agree
-      is_inconsistent = pct_significant > 5 & pct_significant < 95,
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(is_inconsistent) %>%
-    dplyr::arrange(dplyr::desc(effect_cv))
-
-  logger::log_info("Found {nrow(inconsistencies)} inconsistent specification sets")
-
-  inconsistencies
-}
-
-
-#' Analyze specification sensitivity
-#'
-#' @param results_df Results tibble
-#'
-#' @return Sensitivity summary tibble
-#'
-analyze_specification_sensitivity <- function(results_df) {
-  results_df %>%
-    allowed_combinations_filter() %>%
-    analysis_main_filter() %>%
-    dplyr::filter(!error, converged_both, !is.na(main_p_value)) %>%
-    dplyr::group_by(transformation, outlier, sample_size, model_type) %>%
-    dplyr::summarise(
-      n_results = dplyr::n(),
-      # Separate by condition type
-      power = mean(is_significant[is_true_effect], na.rm = TRUE),
-      fpr = mean(is_significant[is_null_effect], na.rm = TRUE),
-      mean_effect_present = mean(main_estimate[is_true_effect], na.rm = TRUE),
-      mean_effect_null = mean(main_estimate[is_null_effect], na.rm = TRUE),
-      mean_rp = mean(main_p_value, na.rm = TRUE),
-      .groups = "drop"
-    )
+  log_pipeline(
+    logger::INFO,
+    "Analysis complete, {length(output_files)} files saved"
+  )
+  invisible(analyses)
 }

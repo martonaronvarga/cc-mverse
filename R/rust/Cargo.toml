@@ -7,7 +7,6 @@ edition = "2024"
 
 [dependencies]
 polars = { version = "0.52", features = ["parquet", "is_in", "lazy", "timezones", "csv", "polars-io", "dtype-full", "log"] }
-polars-lazy = "0.52"
 crossbeam-channel = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -34,12 +33,15 @@ env_logger = "0.11"                    # Logging implementation
 
 # Linear algebra & numerical
 ndarray = "0.17"
-ndarray-linalg = { version = "0.18", features = ["openblas-static"] }  # Optional: for matrix ops
+# ndarray-linalg = { version = "0.18", features = ["openblas-static"] }
+ 
 # Optional C++ interop (for statistical models)
 cxx = { version = "1.0", optional = true }
 
 rayon = "1.10"                         # Data-parallel operations with work stealing
 which = "8.0.0"
+ahash = "0.8.12"
+polars-core = "0.53.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -64,6 +66,7 @@ path = "src/bin/process.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
+debug = 1
 
 [profile.bench]
 inherits = "release"

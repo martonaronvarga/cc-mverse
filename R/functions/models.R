@@ -11,12 +11,21 @@
 #'
 #' @return List with results: fitted models, comparisons, diagnostics
 fit_model <- function(data, model_spec, model_name, branch_id) {
-  logger::log_info("Fitting {model_name} model for branch: {branch_id}")
+  log_branch(logger::INFO, "Fitting {model_name} model for branch: {branch_id}", branch_id)
 
   # Convert to data.frame if needed
   if (!is.data.frame(data)) {
     data <- as.data.frame(data)
   }
+
+  # Avoid anomalies
+  data <- data %>%
+    dplyr::filter(rt > 0) %>%
+    dplyr::filter(is.finite(rt) & !is.na(rt)) %>%
+    dplyr::mutate(
+      cong = dplyr::if_else(cong == 1, 0.5, -0.5),
+      prev_cong = dplyr::if_else(prev_cong == 1, 0.5, -0.5)
+    )
 
   tryCatch(
     {
@@ -24,7 +33,7 @@ fit_model <- function(data, model_spec, model_name, branch_id) {
         "rmanova" = fit_rmanova(data, model_spec),
         "lmm" = fit_lmm(data, model_spec),
         {
-          logger::log_error("Unknown model type: {model_spec$type}")
+          log_branch(logger::ERROR, "Unknown model type: {model_spec$type}", branch_id)
           list(error = TRUE, message = "Unknown model type")
         }
       )
@@ -34,15 +43,15 @@ fit_model <- function(data, model_spec, model_name, branch_id) {
       result$n_obs <- nrow(data)
       result$n_participants <- dplyr::n_distinct(data$participant_id)
 
-      logger::log_info(
-        "Model fitting complete for {model_name}: ",
-        "n_obs={result$n_obs}, n_subs={result$n_participants}"
+      log_branch(
+        logger::INFO,
+        "Model fitting complete for {model_name}: n_obs={result$n_obs}, n_subs={result$n_participants}", branch_id
       )
 
       result
     },
     error = function(e) {
-      logger::log_error("Model fitting failed for {branch_id}: {e$message}")
+      log_branch(logger::ERROR, "Model fitting failed for {branch_id}: {e$message}", branch_id)
       list(
         error = TRUE,
         message = e$message,
@@ -55,7 +64,7 @@ fit_model <- function(data, model_spec, model_name, branch_id) {
 
 #' Fit repeated measures ANOVA
 fit_rmanova <- function(data, spec) {
-  logger::log_debug("Fitting RMANOVA with afex::aov_car()")
+  log_pipeline(logger::DEBUG, "Fitting RMANOVA with afex::aov_car()")
 
   # Parse formula for RMANOVA (within/between structure)
   full_model <- afex::aov_car(
@@ -65,8 +74,7 @@ fit_rmanova <- function(data, spec) {
     fun_aggregate = mean
   )
 
-  # Extract statistics
-  full_stats <- broom::tidy(full_model)
+  full_stats <- as_tibble(anova(full_model))
 
   list(
     type = "rmanova",
@@ -77,20 +85,21 @@ fit_rmanova <- function(data, spec) {
 
 #' Fit linear mixed model
 fit_lmm <- function(data, spec) {
-  logger::log_debug("Fitting LMM with lme4 package")
+  log_pipeline(logger::DEBUG, "Fitting LMM with lme4 package")
+  log_pipeline(logger::INFO, "LMM formulas: full='{spec$formula_full}' null='{spec$formula_null}'")
 
   # Fit both full and null models
   full_model <- lmerTest::lmer(
     as.formula(spec$formula_full),
     data = data,
-    REML = FALSE,
+    REML = TRUE,
     control = do.call(lme4::lmerControl, spec$control %||% list())
   )
 
   null_model <- lmerTest::lmer(
     as.formula(spec$formula_null),
     data = data,
-    REML = FALSE,
+    REML = TRUE,
     control = do.call(lme4::lmerControl, spec$control %||% list())
   )
 
@@ -100,12 +109,17 @@ fit_lmm <- function(data, spec) {
   null_converged <- length(null_model@optinfo$conv$lme4$messages) == 0 &&
     null_model@optinfo$conv$opt == 0
 
-  logger::log_info(
+  log_pipeline(
+    logger::DEBUG,
     "LMM convergence: full={full_converged}, null={null_converged}"
   )
 
+  # ML models
+  #
+  refit_full <- lme4::refitML(full_model)
+  refit_null <- lme4::refitML(null_model)
   # Model comparison
-  comparison <- anova(full_model, null_model, test = "Chisq")
+  comparison <- anova(refit_full, refit_null, test = "Chisq")
 
   # Extract coefficients and confidence intervals
   coefs <- broom.mixed::tidy(full_model, effects = "fixed", conf.int = TRUE)
@@ -118,10 +132,10 @@ fit_lmm <- function(data, spec) {
 
   # Performance metrics
   performance <- list(
-    full_AIC = AIC(full_model),
-    full_BIC = BIC(full_model),
-    null_AIC = AIC(null_model),
-    null_BIC = BIC(null_model),
+    full_AIC = AIC(refit_full),
+    full_BIC = BIC(refit_full),
+    null_AIC = AIC(refit_null),
+    null_BIC = BIC(refit_null),
     LR_stat = comparison$Chisq[2],
     LR_df = comparison$`Df`[2],
     LR_p = comparison$`Pr(>Chisq)`[2]
@@ -131,6 +145,8 @@ fit_lmm <- function(data, spec) {
     type = "lmm",
     full_model = full_model,
     null_model = null_model,
+    refit_full = refit_full,
+    refit_null = refit_null,
     full_converged = full_converged,
     null_converged = null_converged,
     coefficients = coefs,

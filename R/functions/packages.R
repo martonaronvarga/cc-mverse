@@ -8,6 +8,7 @@ packages_core <- c(
   "tidyverse", # dplyr, tidyr, ggplot2, readr, etc.
   "arrow", # Parquet I/O
   "readr", # CSV reading/writing
+  "patchwork", # Plotting
 
   # Logging & monitoring
   "logger", # Structured logging
@@ -46,7 +47,7 @@ load_all_packages <- function() {
   missing <- setdiff(packages_core, rownames(installed.packages()))
 
   if (length(missing) > 0) {
-    logger::log_warn("Installing missing packages: {paste(missing, collapse=', ')}")
+    log_pipeline(logger::WARN, "Installing missing packages: {paste(missing, collapse=', ')}")
 
     templib <- tempfile("rpkgs_")
     dir.create(templib)
@@ -69,13 +70,13 @@ load_all_packages <- function() {
     tryCatch(
       suppressPackageStartupMessages(library(pkg, character.only = TRUE, quietly = TRUE)),
       error = function(e) {
-        logger::log_error("Failed to load package {pkg}: {e$message}")
+        log_pipeline(logger::ERROR, "Failed to load package {pkg}: {e$message}")
         stop(e)
       }
     )
   }
 
-  logger::log_debug("Loaded {length(packages_core)} packages")
+  log_pipeline(logger::DEBUG, "Loaded {length(packages_core)} packages")
 
   invisible(TRUE)
 }
