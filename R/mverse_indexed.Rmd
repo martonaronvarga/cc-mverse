@@ -73,7 +73,7 @@ zeng_block <- zeng_processed %>%
 
 ### write csv
 ```{r}
-write.csv(zeng_block, "R/data/processed/zeng_indexed.csv", row.names = FALSE)
+write.csv(zeng_block, "data/processed/zeng_indexed.csv", row.names = FALSE)
 ```
 
 
@@ -133,7 +133,7 @@ zhang_processed <- zhang_raw %>%
 
 ### write csv
 ```{r}
-write.csv(zhang_processed, "R/data/processed/zhang_indexed.csv", row.names = FALSE)
+write.csv(zhang_processed, "data/processed/zhang_indexed.csv", row.names = FALSE)
 ```
 
 
@@ -198,7 +198,7 @@ yang_processed <- yang_block %>%
 
 ### write csv
 ```{r}
-write.csv(yang_processed, "R/data/processed/yang_indexed.csv", row.names = FALSE)
+write.csv(yang_processed, "data/processed/yang_indexed.csv", row.names = FALSE)
 ```
 
 
@@ -235,7 +235,7 @@ primeprobe_processed <- t_primeprobe_data %>%
 
 ### write csv
 ```{r}
-write.csv(primeprobe_processed, "R/data/processed/primeprobe_indexed.csv", row.names = FALSE)
+write.csv(primeprobe_processed, "data/processed/primeprobe_indexed.csv", row.names = FALSE)
 ```
 
 
@@ -272,7 +272,7 @@ flanker_processed <- t_flanker_data %>%
 
 ### write csv
 ```{r}
-write.csv(flanker_processed, "R/data/processed/flanker_indexed.csv", row.names = FALSE)
+write.csv(flanker_processed, "data/processed/flanker_indexed.csv", row.names = FALSE)
 ```
 
 # ===============================================================
@@ -287,6 +287,6 @@ zeng_block$rt <- as.numeric(zeng_block$rt)
 all_indexed <- bind_rows(flanker_processed, primeprobe_processed, yang_processed, zhang_processed, zeng_block) %>%
   mutate(source_row = row_number())
 
-write.csv(all_indexed, "R/all_indexed.csv", row.names = FALSE)
+write.csv(all_indexed, "all_indexed.csv", row.names = FALSE)
 ```
 
