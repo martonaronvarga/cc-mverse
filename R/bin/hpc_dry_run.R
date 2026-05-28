@@ -4,6 +4,7 @@ source("R/functions/logging.R")
 source("R/functions/paths.R")
 source("R/functions/config.R")
 source("R/functions/rust_interop.R")
+source("R/functions/packages.R")
 
 config_path <- "R/pipeline.yaml"
 config <- load_config("hpc", config_path = config_path)
