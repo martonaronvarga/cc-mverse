@@ -4,9 +4,9 @@ use polars::prelude::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// Basic integration check that qmap_5 runs and adjusts RTs (not identical to input),
+/// Basic integration check that additive_qmap runs and adjusts RTs (not identical to input),
 /// but preserves schema and row count. We don't assert strong distributional properties
-/// because qmap_5 is shrinkage-based and depends on data details.
+/// because additive_qmap is shrinkage-based and depends on data details.
 #[test]
 fn qmap5_runs_and_adjusts_rts_with_preserved_schema_and_row_count() {
     let tempdir = TempDir::new().expect("create temp dir");
@@ -30,7 +30,7 @@ fn qmap5_runs_and_adjusts_rts_with_preserved_schema_and_row_count() {
         .arg("--effect-conditions")
         .arg("null_interaction")
         .arg("--strip-methods")
-        .arg("qmap_5")
+        .arg("additive_qmap")
         .arg("--threads")
         .arg("2");
 
@@ -41,7 +41,7 @@ fn qmap5_runs_and_adjusts_rts_with_preserved_schema_and_row_count() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Find the one output parquet for qmap_5
+    // Find the one output parquet for additive_qmap
     let mut candidates: Vec<_> = std::fs::read_dir(output_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -49,14 +49,14 @@ fn qmap5_runs_and_adjusts_rts_with_preserved_schema_and_row_count() {
         .filter(|p| p.extension().map(|e| e == "parquet").unwrap_or(false))
         .filter(|p| {
             let name = p.file_name().unwrap().to_string_lossy();
-            name.contains("__null_interaction__") && name.contains("__qmap_5")
+            name.contains("__null_interaction__") && name.contains("__additive_qmap")
         })
         .collect();
 
     assert_eq!(
         candidates.len(),
         1,
-        "expected 1 qmap_5 output parquet, got {}",
+        "expected 1 additive_qmap output parquet, got {}",
         candidates.len()
     );
 
@@ -107,6 +107,6 @@ fn qmap5_runs_and_adjusts_rts_with_preserved_schema_and_row_count() {
 
     assert_ne!(
         rt_in, rt_out,
-        "qmap_5 should alter RT values compared to input"
+        "additive_qmap should alter RT values compared to input"
     );
 }

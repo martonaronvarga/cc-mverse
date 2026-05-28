@@ -95,10 +95,11 @@ find_config_yaml <- function() {
 #' Build model specifications from YAML
 build_model_specs <- function(models_yaml) {
   optimizer <- models_yaml$lmm_optimizer %||% list()
+  make_lmer_check <- getFromNamespace(".makeCC", "lme4")
   control <- list(
     optimizer = optimizer$name %||% "bobyqa",
-    check.conv.grad = .makeCC("warning", tol = optimizer$check_conv_grad_tol %||% 1e-5),
-    check.conv.hess = .makeCC("warning", tol = optimizer$check_conv_hess_tol %||% 1e-6),
+    check.conv.grad = make_lmer_check("warning", tol = optimizer$check_conv_grad_tol %||% 1e-5),
+    check.conv.hess = make_lmer_check("warning", tol = optimizer$check_conv_hess_tol %||% 1e-6),
     calc.derivs = TRUE,
     optCtrl = list(maxfun = optimizer$maxfun %||% 300000L)
   )
@@ -124,7 +125,7 @@ build_model_specs <- function(models_yaml) {
 #' Validate configuration
 validate_config <- function(config) {
   stopifnot(
-    "mode must be test/local/hpc" = config$mode %in% c("test", "local", "hpc"),
+    "mode must be test/local/focused/resampling_pilot/hpc" = config$mode %in% c("test", "local", "focused", "resampling_pilot", "hpc"),
     "n_participants >= 1" = config$n_participants >= 1,
     "n_trials >= 1" = config$n_trials >= 1,
     "n_workers >= 1" = config$n_workers >= 1,
@@ -190,13 +191,13 @@ generate_all_branches <- function(config) {
     )
   })
 
-  # Present and null_both: strip_method = "none"
+  # Present branches use the unstripped data with strip_method = "none".
   branches_direct <- tidyr::expand_grid(
     subsample_grid,
     transformation = config$transformations,
     outlier = config$outlier_methods,
     model = names(config$models),
-    effect_condition = c("present", "null_both"),
+    effect_condition = "present",
     strip_method = "none"
   )
 
@@ -227,8 +228,8 @@ generate_all_branches <- function(config) {
   stopifnot(
     "present with non-none strip_method" =
       !any(branches$effect_condition == "present" & branches$strip_method != "none"),
-    "null_both with non-none strip_method" =
-      !any(branches$effect_condition == "null_both" & branches$strip_method != "none"),
+    "null_both is absent" =
+      !any(branches$effect_condition == "null_both"),
     "null_interaction with none strip_method" =
       !any(branches$effect_condition == "null_interaction" & branches$strip_method == "none"),
     "duplicate branch_id" =
@@ -276,7 +277,7 @@ normalize_outlier <- function(x) {
 
 normalize_effect_condition <- function(x) {
   x <- as.character(x)
-  unknown <- x[!x %in% c("present", "null_interaction", "null_both")]
+  unknown <- x[!x %in% c("present", "null_interaction")]
   if (length(unknown) > 0) stop("Unknown effect condition(s): ", paste(unknown, collapse = ", "))
   x
 }
@@ -284,7 +285,8 @@ normalize_effect_condition <- function(x) {
 normalize_strip_method <- function(x, effect_condition) {
   effect_condition <- normalize_effect_condition(effect_condition)
   x <- as.character(x)
-  bad_interaction <- effect_condition == "null_interaction" & !x %in% c("shuffle", "qmap_5")
+  x <- dplyr::recode(x, qmap_5 = "additive_qmap", qmap_5_trial_bin = "additive_qmap_trial_bin")
+  bad_interaction <- effect_condition == "null_interaction" & !x %in% c("shuffle", "additive_qmap", "additive_qmap_trial_bin", "local_mean_residual", "local_median_residual")
   if (any(bad_interaction)) {
     stop(
       "Unknown strip method(s) for null_interaction: ",
@@ -296,6 +298,10 @@ normalize_strip_method <- function(x, effect_condition) {
 
 # Compose the Rust-consistent branch_id
 compose_branch_id <- function(sample_size, subsample_id, transformation, outlier, model, effect_condition, strip_method) {
+  model <- as.character(model)
+  if (any(grepl("__", model, fixed = TRUE))) {
+    stop("Model names cannot contain '__' because branch_id uses it as a field separator: ", paste(model[grepl("__", model, fixed = TRUE)], collapse = ", "))
+  }
   paste0(
     trimws(format_sample_size_for_rust(sample_size)), "__",
     trimws(as.integer(subsample_id)), "__",
@@ -371,8 +377,13 @@ configure_targets <- function(config, paths) {
 create_crew_controller <- function(config, paths) {
   if (config$is_hpc) {
     slurm <- config$slurm
+    worker <- slurm$worker
     log_pipeline(logger::INFO, "Creating SLURM crew controller ({config$n_workers} workers)")
 
+    script_lines <- "#!/bin/bash"
+    if (!is.null(slurm$bashrc_source) && nzchar(slurm$bashrc_source)) {
+      script_lines <- c(script_lines, paste("source", shQuote(slurm$bashrc_source)))
+    }
 
     crew.cluster::crew_controller_slurm(
       name = "multiverse_slurm",
@@ -385,16 +396,14 @@ create_crew_controller <- function(config, paths) {
       # SLURM resource allocation
       options_cluster = crew.cluster::crew_options_slurm(
         verbose = TRUE,
-        script_lines = c(
-          "#!/bin/bash",
-          paste0("source ", slurm$bashrc_source)
-        ),
-        log_output = "crew_log_%A.log",
-        log_error = "crew_log_%A.log",
-        memory_gigabytes_required = config$slurm_mem_gb,
-        cpus_per_task = slurm$worker$cpus,
-        time_minutes = slurm$worker$time_min,
-        partition = slurm$slurm_partition
+        script_directory = paths$logs,
+        script_lines = script_lines,
+        log_output = file.path(paths$logs, "crew_worker_%A.out"),
+        log_error = file.path(paths$logs, "crew_worker_%A.err"),
+        memory_gigabytes_required = worker$mem_gb,
+        cpus_per_task = worker$cpus,
+        time_minutes = worker$time_min,
+        partition = slurm$partition
       ),
       options_metrics = crew::crew_options_metrics(
         path = paths$logs
@@ -405,7 +414,7 @@ create_crew_controller <- function(config, paths) {
 
     crew::crew_controller_local(
       name = "multiverse_local",
-      workers = parallelly::availableCores(omit = 1),
+      workers = config$n_workers,
       seconds_idle = 60,
       seconds_timeout = 3600,
       options_local = crew::crew_options_local(

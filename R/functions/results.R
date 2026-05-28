@@ -1,14 +1,18 @@
 RESULTS_COLUMNS <- c(
   "branch_id", "branch_idx", "sample_size", "subsample_id", "transformation", "outlier",
   "model", "effect_condition", "strip_method", "n_obs", "null_n_obs", "n_participants",
-  "full_converged", "null_converged", "AIC_diff", "BIC_diff", "LR_stat",
+  "full_converged", "null_converged", "full_is_singular", "null_is_singular",
+  "full_repca_min_sd", "null_repca_min_sd", "AIC_diff", "BIC_diff", "LR_stat",
   "LR_df", "LR_p", "main_estimate", "null_main_estimate", "main_std_error", "null_std_error", "main_t_stat",
   "null_t_stat",
   "main_p_value", "null_main_p_value", "effect_size", "null_effect", "effect_ci_lower", "null_effect_ci_lower",
   "effect_ci_upper", "null_effect_ci_upper",
-  "random_intercept_var", "null_random_intercept_var", "random_slope_var", "null_random_slope_var", "residual_var",
+  "random_intercept_var", "null_random_intercept_var", "random_slope_var", "null_random_slope_var",
+  "random_cong_slope_var", "null_random_cong_slope_var", "random_prev_cong_slope_var", "null_random_prev_cong_slope_var",
+  "random_cse_slope_var", "null_random_cse_slope_var", "residual_var",
   "null_residual_var",
   "loglik_full", "loglik_null", "npar_full", "npar_null",
+  "fallback_level", "fallback_formula", "fallback_p_value", "inference_source",
   "error", "error_message", "stage_completed", "timestamp"
 )
 
@@ -29,6 +33,10 @@ get_results_schema <- function() {
     n_participants = arrow::int32(),
     full_converged = arrow::bool(),
     null_converged = arrow::bool(),
+    full_is_singular = arrow::bool(),
+    null_is_singular = arrow::bool(),
+    full_repca_min_sd = arrow::float64(),
+    null_repca_min_sd = arrow::float64(),
     AIC_diff = arrow::float64(),
     BIC_diff = arrow::float64(),
     LR_stat = arrow::float64(),
@@ -52,12 +60,22 @@ get_results_schema <- function() {
     null_random_intercept_var = arrow::float64(),
     random_slope_var = arrow::float64(),
     null_random_slope_var = arrow::float64(),
+    random_cong_slope_var = arrow::float64(),
+    null_random_cong_slope_var = arrow::float64(),
+    random_prev_cong_slope_var = arrow::float64(),
+    null_random_prev_cong_slope_var = arrow::float64(),
+    random_cse_slope_var = arrow::float64(),
+    null_random_cse_slope_var = arrow::float64(),
     residual_var = arrow::float64(),
     null_residual_var = arrow::float64(),
     loglik_full = arrow::float64(),
     loglik_null = arrow::float64(),
     npar_full = arrow::int32(),
     npar_null = arrow::int32(),
+    fallback_level = arrow::string(),
+    fallback_formula = arrow::string(),
+    fallback_p_value = arrow::float64(),
+    inference_source = arrow::string(),
     error = arrow::bool(),
     error_message = arrow::string(),
     stage_completed = arrow::string(),
@@ -124,16 +142,14 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   coefs <- model_result$coefficients
   null_coefs <- model_result$null_coefficients
 
-  # Find main effect (interaction term if present, else main cong effect)
-
-  interaction_rows <- coefs %>%
-    dplyr::filter(
-      stringr::str_detect(term, ":")
-    )
-  null_interaction_rows <- null_coefs %>%
-    dplyr::filter(
-      stringr::str_detect(term, ":")
-    )
+  # Find the intended CSE interaction explicitly; do not select unrelated ':' terms.
+  if (!exists("select_cse_coefficient_row", mode = "function")) {
+    cse_path <- file.path("functions", "cse_term_extraction.R")
+    if (!file.exists(cse_path)) cse_path <- file.path("R", "functions", "cse_term_extraction.R")
+    source(cse_path)
+  }
+  interaction_rows <- select_cse_coefficient_row(coefs)
+  null_interaction_rows <- select_cse_coefficient_row(null_coefs)
 
 
   main_est <- interaction_rows$estimate[1] %||% {
@@ -160,25 +176,46 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
   null_ci_upper <- null_interaction_rows$conf.high[1] %||% NA_real_
 
 
-  # Extract random effects variance
+  # Extract random effects and singularity diagnostics
   ranef_tib <- model_result$random_effects
   null_ranef_tib <- model_result$null_random_effects
+  if (!exists("safe_lmm_singularity", mode = "function")) {
+    diag_path <- file.path("functions", "lmm_diagnostics.R")
+    if (!file.exists(diag_path)) diag_path <- file.path("R", "functions", "lmm_diagnostics.R")
+    source(diag_path)
+  }
+  full_is_singular <- safe_lmm_singularity(full_model)
+  null_is_singular <- safe_lmm_singularity(null_model)
+  full_repca_min_sd <- safe_repca_min_sd(full_model)
+  null_repca_min_sd <- safe_repca_min_sd(null_model)
   random_int_var <- NA_real_
+  random_cong_slope_var <- NA_real_
+  random_prev_cong_slope_var <- NA_real_
+  random_cse_slope_var <- NA_real_
   random_slope_var <- NA_real_
   null_random_int_var <- NA_real_
+  null_random_cong_slope_var <- NA_real_
+  null_random_prev_cong_slope_var <- NA_real_
+  null_random_cse_slope_var <- NA_real_
   null_random_slope_var <- NA_real_
 
   vc <- lme4::VarCorr(full_model)
   null_vc <- lme4::VarCorr(null_model)
-  random_int_var <- as.numeric(attr(vc$participant_id, "stddev")["(Intercept)"])^2
-  null_random_int_var <- as.numeric(attr(null_vc$participant_id, "stddev")["(Intercept)"])^2
-
-  if (!is.null(vc$participant_id) && "cong" %in% colnames(vc$participant_id.1)) {
-    random_slope_var <- as.numeric(attr(vc$participant_id, "stddev")["cong:prev_cong"])^2
+  if (!exists("extract_varcorr_variance", mode = "function")) {
+    re_path <- file.path("functions", "random_effect_extraction.R")
+    if (!file.exists(re_path)) re_path <- file.path("R", "functions", "random_effect_extraction.R")
+    source(re_path)
   }
-  if (!is.null(null_vc$participant_id) && "cong" %in% colnames(null_vc$participant_id.1)) {
-    null_random_slope_var <- as.numeric(attr(null_vc$participant_id, "stddev")["cong:prev_cong"])^2
-  }
+  random_int_var <- extract_varcorr_variance(vc, term = "(Intercept)")
+  null_random_int_var <- extract_varcorr_variance(null_vc, term = "(Intercept)")
+  random_cong_slope_var <- extract_varcorr_variance(vc, term = "cong")
+  null_random_cong_slope_var <- extract_varcorr_variance(null_vc, term = "cong")
+  random_prev_cong_slope_var <- extract_varcorr_variance(vc, term = "prev_cong")
+  null_random_prev_cong_slope_var <- extract_varcorr_variance(null_vc, term = "prev_cong")
+  random_cse_slope_var <- extract_varcorr_variance(vc, term = "cong:prev_cong")
+  null_random_cse_slope_var <- extract_varcorr_variance(null_vc, term = "cong:prev_cong")
+  random_slope_var <- random_cse_slope_var
+  null_random_slope_var <- null_random_cse_slope_var
 
   # Model fit metrics from lme4::VarCorr
   resid_var <- attr(vc, "sc")^2 # Residual variance (sigma)
@@ -230,6 +267,10 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     # Convergence
     full_converged = model_result$full_converged,
     null_converged = model_result$null_converged,
+    full_is_singular = full_is_singular,
+    null_is_singular = null_is_singular,
+    full_repca_min_sd = full_repca_min_sd,
+    null_repca_min_sd = null_repca_min_sd,
     AIC_diff = (performance$full_AIC - performance$null_AIC) %>% as.numeric(),
     BIC_diff = (performance$full_BIC - performance$null_BIC) %>% as.numeric(),
     LR_stat = performance$LR_stat,
@@ -259,6 +300,12 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     null_random_intercept_var = null_random_int_var,
     random_slope_var = random_slope_var,
     null_random_slope_var = null_random_slope_var,
+    random_cong_slope_var = random_cong_slope_var,
+    null_random_cong_slope_var = null_random_cong_slope_var,
+    random_prev_cong_slope_var = random_prev_cong_slope_var,
+    null_random_prev_cong_slope_var = null_random_prev_cong_slope_var,
+    random_cse_slope_var = random_cse_slope_var,
+    null_random_cse_slope_var = null_random_cse_slope_var,
     residual_var = resid_var %>% as.numeric(),
     null_residual_var = null_resid_var %>% as.numeric(),
 
@@ -267,6 +314,16 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
     loglik_null = ll_null,
     npar_full = npar_full,
     npar_null = npar_null,
+
+    # Sensitivity-only fallback inference; primary fields above remain maximal-model results.
+    fallback_level = model_result$fallback_level %||% NA_character_,
+    fallback_formula = model_result$fallback_formula %||% NA_character_,
+    fallback_p_value = model_result$fallback_p_value %||% NA_real_,
+    inference_source = dplyr::if_else(
+      is.na(model_result$fallback_level %||% NA_character_),
+      "primary_maximal",
+      "primary_maximal_invalid_fallback_sensitivity_available"
+    ),
 
     # Error tracking
     error = FALSE,
@@ -289,9 +346,13 @@ extract_lmm_results <- function(model_result, branch_spec, branch_idx) {
 extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
   full_stats <- model_result$full_stats
 
-  # For RMANOVA, extract main interaction effect
-  interaction_row <- full_stats %>%
-    dplyr::slice(3)
+  # For RMANOVA, extract the named CSE interaction instead of relying on row order.
+  if (!exists("select_rmanova_cse_row", mode = "function")) {
+    cse_path <- file.path("functions", "cse_term_extraction.R")
+    if (!file.exists(cse_path)) cse_path <- file.path("R", "functions", "cse_term_extraction.R")
+    source(cse_path)
+  }
+  interaction_row <- select_rmanova_cse_row(full_stats)
 
   # Extract statistics
   f_stat <- interaction_row$F[1] %||% NA_real_
@@ -323,9 +384,13 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     null_n_obs = model_result$n_obs %>% as.integer(),
     n_participants = model_result$n_participants %>% as.integer(),
 
-    # Convergence (RMANOVA doesn't have convergence issues)
+    # Convergence (RMANOVA doesn't have optimizer convergence/singularity)
     full_converged = TRUE,
     null_converged = TRUE,
+    full_is_singular = FALSE,
+    null_is_singular = FALSE,
+    full_repca_min_sd = NA_real_,
+    null_repca_min_sd = NA_real_,
 
     # Model comparison (RMANOVA doesn't have formal model comparison)
     AIC_diff = NA_real_,
@@ -357,6 +422,12 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     null_random_intercept_var = NA_real_,
     random_slope_var = NA_real_,
     null_random_slope_var = NA_real_,
+    random_cong_slope_var = NA_real_,
+    null_random_cong_slope_var = NA_real_,
+    random_prev_cong_slope_var = NA_real_,
+    null_random_prev_cong_slope_var = NA_real_,
+    random_cse_slope_var = NA_real_,
+    null_random_cse_slope_var = NA_real_,
     residual_var = NA_real_,
     null_residual_var = NA_real_,
 
@@ -365,6 +436,12 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
     loglik_null = NA_real_,
     npar_full = NA_integer_,
     npar_null = NA_integer_,
+
+    # Fallback inference (not applicable for RMANOVA)
+    fallback_level = NA_character_,
+    fallback_formula = NA_character_,
+    fallback_p_value = NA_real_,
+    inference_source = "primary_rmanova",
 
     # Error tracking
     error = FALSE,
@@ -400,6 +477,10 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
     n_participants = NA_integer_,
     full_converged = NA,
     null_converged = NA,
+    full_is_singular = NA,
+    null_is_singular = NA,
+    full_repca_min_sd = NA_real_,
+    null_repca_min_sd = NA_real_,
     AIC_diff = NA_real_,
     BIC_diff = NA_real_,
     LR_stat = NA_real_,
@@ -423,12 +504,22 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
     null_random_intercept_var = NA_real_,
     random_slope_var = NA_real_,
     null_random_slope_var = NA_real_,
+    random_cong_slope_var = NA_real_,
+    null_random_cong_slope_var = NA_real_,
+    random_prev_cong_slope_var = NA_real_,
+    null_random_prev_cong_slope_var = NA_real_,
+    random_cse_slope_var = NA_real_,
+    null_random_cse_slope_var = NA_real_,
     residual_var = NA_real_,
     null_residual_var = NA_real_,
     loglik_full = NA_real_,
     loglik_null = NA_real_,
     npar_full = NA_integer_,
     npar_null = NA_integer_,
+    fallback_level = NA_character_,
+    fallback_formula = NA_character_,
+    fallback_p_value = NA_real_,
+    inference_source = "error",
     error = TRUE,
     error_message = model_result$message %||% "Unknown error",
     stage_completed = "failed",

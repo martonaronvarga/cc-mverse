@@ -29,7 +29,10 @@ generate_rust_script() {
     cfg <- load_config('hpc', config_path = '${config_yaml}')
     paths <- init_project_paths('.')
     binary <- find_rust_binary(paths)
-    args <- build_rust_args(cfg, paths, file.path(paths\$data_raw, basename(cfg\$raw_csv)))
+    project_root <- paths\$root %||% paths\$project_root
+    input_csv <- if (grepl('^/', cfg\$raw_csv)) cfg\$raw_csv else file.path(project_root, cfg\$raw_csv)
+    args <- build_rust_args(cfg, paths, input_csv)
+    write_processed_cache_signature(cfg, paths, generate_all_branches(cfg), input_csv)
     cat(binary, '\n')
     cat(paste(shQuote(args), collapse = ' \\\\\n    '), '\n')
   ")

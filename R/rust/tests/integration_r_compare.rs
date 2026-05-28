@@ -28,7 +28,7 @@ p2,1,1,696
 /// R script that:
 /// - Reads original CSV
 /// - Fits lmer on rt
-/// - Reads Rust parquet for null_interaction qmap_5 and derives lrt_adj as the response column
+/// - Reads Rust parquet for null_interaction additive_qmap and derives lrt_adj as the response column
 /// - Recomputes R quantile_map_once lrt_adj on original RTs
 /// - Fits lmer on R's lrt_adj
 /// - Outputs a JSON with coefficients for: intercept, cong, cong:prev_cong for each (original, rust_qmap5, r_qmap5)
@@ -68,10 +68,10 @@ coefs_orig <- tibble(term = rownames(co_orig),
                      std_error = co_orig[, 'Std. Error']) %>% 
   filter(term %in% c('(Intercept)', 'cong', 'cong:prev_cong'))
 
-# Find Rust qmap_5 output parquet
-files <- list.files(out_dir, pattern = 'processed__.*__null_interaction__qmap_5\\.parquet$', full.names = TRUE)
+# Find Rust additive_qmap output parquet
+files <- list.files(out_dir, pattern = 'processed__.*__null_interaction__additive_qmap\\.parquet$', full.names = TRUE)
 if (length(files) < 1) {
-  stop('No Rust qmap_5 parquet found in output dir: ', out_dir)
+  stop('No Rust additive_qmap parquet found in output dir: ', out_dir)
 }
 rust_pq <- files[[1]]
 dfr <- read_parquet(rust_pq)
@@ -220,7 +220,7 @@ fn compare_rust_qmap_with_r_lmer_coeffs() {
     let tmp = TempDir::new().expect("temp dir");
     let out_dir = tmp.path().join("out");
     fs::create_dir_all(&out_dir).expect("create out dir");
-    // Run Rust process to produce qmap_5 null_interaction parquet
+    // Run Rust process to produce additive_qmap null_interaction parquet
     let mut cmd = std::process::Command::cargo_bin("process").expect("find process binary");
     cmd.arg("--input")
         .arg(&input)
@@ -235,7 +235,7 @@ fn compare_rust_qmap_with_r_lmer_coeffs() {
         .arg("--effect-conditions")
         .arg("null_interaction")
         .arg("--strip-methods")
-        .arg("qmap_5")
+        .arg("additive_qmap")
         .arg("--threads")
         .arg("2");
     let out = cmd.output().expect("run process");
@@ -324,11 +324,11 @@ fn compare_rust_qmap_with_r_lmer_coeffs() {
         orig_inter, orig_cong, orig_int_term
     );
     println!(
-        "Rust qmap_5:  Intercept={:.4}, cong={:.4}, cong:prev_cong={:.4}",
+        "Rust additive_qmap:  Intercept={:.4}, cong={:.4}, cong:prev_cong={:.4}",
         rust_inter, rust_cong, rust_int_term
     );
     println!(
-        "R qmap_5:     Intercept={:.4}, cong={:.4}, cong:prev_cong={:.4}",
+        "R additive_qmap:     Intercept={:.4}, cong={:.4}, cong:prev_cong={:.4}",
         r_inter, r_cong, r_int_term
     );
 

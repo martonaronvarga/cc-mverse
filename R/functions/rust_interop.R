@@ -69,6 +69,10 @@ write_rust_args_file <- function(config, paths, input_csv) {
 
   # Write one argument per line (easy to consume with xargs or read)
   writeLines(args, args_file)
+  if (exists("write_processed_cache_signature", mode = "function")) {
+    branch_specs <- generate_all_branches(config)
+    write_processed_cache_signature(config, paths, branch_specs, input_csv)
+  }
 
   log_pipeline(logger::INFO, "Wrote Rust arguments to {args_file}")
   args_file
@@ -168,6 +172,10 @@ call_rust_processor <- function(input_csv, paths, config) {
 
   binary <- find_rust_binary(paths)
   args <- build_rust_args(config, paths, input_csv)
+  if (exists("write_processed_cache_signature", mode = "function")) {
+    branch_specs <- generate_all_branches(config)
+    write_processed_cache_signature(config, paths, branch_specs, input_csv)
+  }
 
   log_pipeline(logger::INFO, "Calling Rust processor: {binary}")
   log_pipeline(logger::DEBUG, "Args: {paste(args, collapse = ' ')}")

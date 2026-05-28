@@ -61,9 +61,9 @@ fn processing_happy_path_produces_expected_files_and_metadata() {
         .arg("--outliers")
         .arg("none")
         .arg("--effect-conditions")
-        .arg("present,null_interaction,null_both")
+        .arg("present,null_interaction")
         .arg("--strip-methods")
-        .arg("qmap_5,shuffle")
+        .arg("additive_qmap,shuffle")
         .arg("--threads")
         .arg("2")
         .arg("--save-metadata");
@@ -85,10 +85,10 @@ fn processing_happy_path_produces_expected_files_and_metadata() {
 
     parquet_files.sort();
 
-    // total = transformations(2) * [present(1) + null_both(1) + null_interaction*strip(2)] = 2 * 4 = 8
+    // total = transformations(2) * [present(1) + null_interaction*strip(2)] = 2 * 3 = 6
     assert_eq!(
         parquet_files.len(),
-        8,
+        6,
         "unexpected parquet file count: files={:#?}",
         parquet_files
     );

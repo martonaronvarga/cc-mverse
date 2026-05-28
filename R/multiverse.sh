@@ -247,11 +247,16 @@ run_hpc() {
   # Step 2: Check Rust output
   local n_existing
   n_existing=$(find data/processed -name 'processed__*.parquet' 2>/dev/null | wc -l || echo 0)
-  log_info "Processed data: ${n_existing}/${n_expected}"
+  local signature_status="stale-or-missing"
+  if cd "$R_DIR" && ~/local/bin/Rscript --vanilla R/bin/check_processed_cache_signature.R "$MODE" "$RESOLVED_YAML" >/dev/null 2>&1; then
+    signature_status="current"
+  fi
+  cd "$PROJECT_ROOT"
+  log_info "Processed data: ${n_existing}/${n_expected} (cache signature: ${signature_status})"
 
   local rust_job_id=""
 
-  if [[ "$n_existing" -lt "$n_expected" ]] || [[ "$FORCE_RUST" == true ]]; then
+  if [[ "$n_existing" -lt "$n_expected" ]] || [[ "$signature_status" != "current" ]] || [[ "$FORCE_RUST" == true ]]; then
     source "${SCRIPT_DIR}/gen_rust_slurm.sh"
 
     local rust_script="${PROJECT_ROOT}/slurm_rust_generated.sh"

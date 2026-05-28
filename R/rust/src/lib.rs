@@ -1,6 +1,5 @@
 // src/lib.rs - Core library
 
-use ahash::AHasher;
 use anyhow::{anyhow, Result};
 use polars::prelude::*;
 use rand::rngs::StdRng;
@@ -8,9 +7,8 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::Hasher;
-use std::{collections::HashMap, hash::Hash};
 use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,30 +85,33 @@ pub struct BranchConfig {
     pub global_seed: u64,
 }
 
+fn stable_seed_mix(mut hash: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 impl BranchConfig {
     /// Deterministic seed derived from global seed + branch identity.
     /// Two branches with different subsample_id get different seeds.
     pub fn sampling_seed(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.global_seed.hash(&mut hasher);
-        self.sample_size.to_bits().hash(&mut hasher);
-        self.subsample_id.hash(&mut hasher);
-        hasher.finish()
+        let mut hash = 0xcbf29ce484222325_u64;
+        hash = stable_seed_mix(hash, self.global_seed);
+        hash = stable_seed_mix(hash, self.sample_size.to_bits());
+        stable_seed_mix(hash, self.subsample_id as u64)
     }
 
     /// Seed for effect stripping (shuffle / qmap).
     /// Depends on subsample_id so different subsamples get different null realizations.
     pub fn strip_seed(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.global_seed.hash(&mut hasher);
-        self.subsample_id.hash(&mut hasher);
-        // Include effect condition and strip method so present/null_both don't
-        // collide with null_interaction seeds
-        (self.effect_condition as u8).hash(&mut hasher);
-        (self.strip_method as u8).hash(&mut hasher);
-        hasher.finish()
+        let mut hash = 0xcbf29ce484222325_u64;
+        hash = stable_seed_mix(hash, self.global_seed);
+        hash = stable_seed_mix(hash, self.subsample_id as u64);
+        // Include effect condition and strip method so present branches don't collide with null_interaction seeds
+        hash = stable_seed_mix(hash, self.effect_condition as u64);
+        stable_seed_mix(hash, self.strip_method as u64)
     }
 }
 
@@ -385,10 +386,7 @@ impl BranchPipeline {
                 // Estimate and remove interaction effect
                 self.remove_interaction_effect(data)
             }
-            EffectCondition::NullBoth => {
-                // Remove all fixed effects, keeping only intercept and noise
-                null_all_effects(data)
-            }
+
         }
     }
 
@@ -401,7 +399,7 @@ impl BranchPipeline {
         let seed = self.config.strip_seed();
         match self.config.strip_method {
             StripMethod::Shuffle => shuffle_null(data, "rt", seed),
-            StripMethod::Qmap5 => quantile_map_once(
+            StripMethod::AdditiveQmap => quantile_map_once(
                 data,
                 QuantileMapParams {
                     scale_col: "rt".into(),
@@ -409,6 +407,18 @@ impl BranchPipeline {
                     ngrid: 200,
                 },
             ),
+            StripMethod::AdditiveQmapTrialBin => quantile_map_trial_bin(
+                data,
+                QuantileMapParams {
+                    scale_col: "rt".into(),
+                    kappa: 5.0,
+                    ngrid: 200,
+                },
+                5,
+                4,
+            ),
+            StripMethod::LocalMeanResidual => local_mean_residual_strip(data, 5, 4),
+            StripMethod::LocalMedianResidual => local_median_residual_strip(data, 5, 4),
         }
     }
 }
@@ -480,8 +490,6 @@ pub enum EffectCondition {
     Present,
     /// Nullify cong*prev_cong interaction only (for FDR investigation)
     NullInteraction,
-    /// Nullify all fixed effects (only random intercepts remain)
-    NullBoth,
 }
 
 impl FromStr for EffectCondition {
@@ -491,7 +499,6 @@ impl FromStr for EffectCondition {
         match s {
             "present" => Ok(EffectCondition::Present),
             "null_interaction" => Ok(EffectCondition::NullInteraction),
-            "null_both" => Ok(EffectCondition::NullBoth),
             _ => Err(anyhow::anyhow!("Unknown effect condition: {}", s)),
         }
     }
@@ -502,7 +509,6 @@ impl std::fmt::Display for EffectCondition {
         match self {
             EffectCondition::Present => write!(f, "present"),
             EffectCondition::NullInteraction => write!(f, "null_interaction"),
-            EffectCondition::NullBoth => write!(f, "null_both"),
         }
     }
 }
@@ -511,15 +517,24 @@ impl std::fmt::Display for EffectCondition {
 pub enum StripMethod {
     /// Shuffle condition-wise
     Shuffle,
-    /// Quantile mapping
-    Qmap5,
+    /// Stationary participant-level additive quantile mapping
+    AdditiveQmap,
+    /// Trial-bin local additive quantile mapping with stationary fallback
+    AdditiveQmapTrialBin,
+    /// Trial-bin local mean-residual stripping with participant fallback
+    LocalMeanResidual,
+    /// Trial-bin local median-residual stripping with participant fallback
+    LocalMedianResidual,
 }
 
 impl StripMethod {
     pub fn as_string(&self) -> String {
         match self {
             StripMethod::Shuffle => "shuffle".to_string(),
-            StripMethod::Qmap5 => "qmap_5".to_string(),
+            StripMethod::AdditiveQmap => "additive_qmap".to_string(),
+            StripMethod::AdditiveQmapTrialBin => "additive_qmap_trial_bin".to_string(),
+            StripMethod::LocalMeanResidual => "local_mean_residual".to_string(),
+            StripMethod::LocalMedianResidual => "local_median_residual".to_string(),
         }
     }
 }
@@ -529,7 +544,10 @@ impl FromStr for StripMethod {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "qmap_5" => Ok(StripMethod::Qmap5),
+            "additive_qmap" | "qmap_5" => Ok(StripMethod::AdditiveQmap),
+            "additive_qmap_trial_bin" | "qmap_5_trial_bin" => Ok(StripMethod::AdditiveQmapTrialBin),
+            "local_mean_residual" => Ok(StripMethod::LocalMeanResidual),
+            "local_median_residual" => Ok(StripMethod::LocalMedianResidual),
             "shuffle" => Ok(StripMethod::Shuffle),
             _ => Err(anyhow::anyhow!("Unknown strip method: {}", s)),
         }
@@ -540,7 +558,10 @@ impl std::fmt::Display for StripMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             StripMethod::Shuffle => write!(f, "shuffle"),
-            StripMethod::Qmap5 => write!(f, "qmap_5"),
+            StripMethod::AdditiveQmap => write!(f, "additive_qmap"),
+            StripMethod::AdditiveQmapTrialBin => write!(f, "additive_qmap_trial_bin"),
+            StripMethod::LocalMeanResidual => write!(f, "local_mean_residual"),
+            StripMethod::LocalMedianResidual => write!(f, "local_median_residual"),
         }
     }
 }
@@ -554,54 +575,29 @@ impl std::fmt::Display for StripMethod {
 /// - "cong"         (-1 or 1)
 /// - "prev_cong"    (-1 or 1)
 /// - "rt"           (f64)
-///
-/// Preserves:
-/// - Congruency main effect
-/// - Previous trial main effect
-/// - Full RT dynamics
-/// - Noise, autocorrelation
-/// - Participant differences
-///
-/// Removes:
-/// - ONLY the stationary CSE interaction term
-/// - Remove all fixed effects, keeping only intercept
-///
-/// Strategy: Replace each RT with grand mean + residual
-/// This preserves random structure but eliminates all fixed effects
-fn null_all_effects(data: DataFrame) -> Result<DataFrame> {
-    use tracing::debug;
-    debug!("Nullifying all fixed effects");
-
-    let result = data
-        .lazy()
-        // Compute per-participant overall mean  →  "mean_overall"
-        .with_column(
-            col("rt")
-                .mean()
-                .over([col("participant_id")])
-                .alias("__mean_overall"),
-        )
-        // Compute per-participant × cell condition mean  →  "mean_cond"
-        .with_column(
-            col("rt")
-                .mean()
-                .over([col("participant_id"), col("cong"), col("prev_cong")])
-                .alias("__mean_cond"),
-        )
-        // nullified rt = μ_i + (rt − μ_cell)
-        .with_column((col("__mean_overall") + col("rt") - col("__mean_cond")).alias("rt"))
-        // Drop the temporary columns, keep everything else
-        .drop(cols(["__mean_overall", "__mean_cond"]))
-        .collect()?;
-
-    Ok(result)
+fn stable_group_seed(seed: u64, pid: &str, cong: &str) -> u64 {
+    // FNV-1a style mixing gives stable cross-platform group seeds.
+    let mut hash = 0xcbf29ce484222325_u64 ^ seed;
+    for byte in pid.bytes().chain([0xff]).chain(cong.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 pub fn shuffle_null(df: DataFrame, scale_col: &str, seed: u64) -> Result<DataFrame> {
     info!("Applying shuffle null on column: {}", scale_col);
-    let mut rng = StdRng::seed_from_u64(seed);
 
     let shuffled = df.group_by(["participant_id", "cong"])?.apply(|mut g| {
+        let pid = g.column("participant_id")?.str()?.get(0).ok_or_else(|| {
+            PolarsError::ComputeError("empty participant_id group during shuffle".into())
+        })?;
+        let cong =
+            g.column("cong")?.str()?.get(0).ok_or_else(|| {
+                PolarsError::ComputeError("empty cong group during shuffle".into())
+            })?;
+        let mut rng = StdRng::seed_from_u64(stable_group_seed(seed, pid, cong));
+
         let col = g.column(scale_col)?.clone();
         let mut vals: Vec<f64> = col.f64()?.into_no_null_iter().collect();
         vals.shuffle(&mut rng);
@@ -611,123 +607,6 @@ pub fn shuffle_null(df: DataFrame, scale_col: &str, seed: u64) -> Result<DataFra
 
     info!("Shuffle complete: {} rows", shuffled.height());
     Ok(shuffled)
-}
-
-pub fn quantile_map_shrink(
-    df: &DataFrame,
-    scale_col: &str,
-    kappa: f64,
-    ngrid: usize,
-    _seed: u64,
-) -> Result<DataFrame> {
-    info!("Applying QMap shrinkage with kappa={}", kappa);
-    let taus: Vec<f64> = (0..ngrid).map(|i| i as f64 / (ngrid - 1) as f64).collect();
-
-    // Global quantiles
-    let scale_vals: Vec<f64> = df.column(scale_col)?.f64()?.into_no_null_iter().collect();
-
-    let global_grand_q = compute_quantiles(&scale_vals, &taus);
-
-    // Get unique participants
-    let participants: Vec<String> = df
-        .column("participant_id")?
-        .str()?
-        .unique()?
-        .into_no_null_iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    // Process each participant in sequential
-    let results: Vec<Result<DataFrame>> = participants
-        .iter()
-        .map(|pid| process_participant_qmap(df, pid, &taus, &global_grand_q, scale_col, kappa))
-        .collect();
-
-    // Check for errors
-    let mut result: Option<DataFrame> = None;
-    for res in results {
-        match res {
-            Ok(df_part) => {
-                if let Some(mut combined) = result {
-                    combined = combined.vstack(&df_part)?;
-                    result = Some(combined);
-                } else {
-                    result = Some(df_part);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    let result = result.ok_or_else(|| anyhow::anyhow!("No results produced"))?;
-
-    info!("QMap complete: {} trials", result.height());
-    Ok(result)
-}
-
-fn process_participant_qmap(
-    df: &DataFrame,
-    pid: &str,
-    taus: &[f64],
-    global_grand_q: &[f64],
-    scale_col: &str,
-    kappa: f64,
-) -> Result<DataFrame> {
-    let mask = df.column("participant_id")?.str()?.equal(pid);
-
-    let mut sub = df.filter(&mask)?;
-
-    if sub.height() < 2 {
-        sub.with_column(Series::new("rt".into(), vec![0.0; sub.height()]))?;
-        return Ok(sub);
-    }
-
-    // Local quantiles
-    let local_vals: Vec<f64> = sub.column(scale_col)?.f64()?.into_no_null_iter().collect();
-
-    let local_grand_q = compute_quantiles(&local_vals, taus);
-
-    // Shrinkage
-    let grand_q_shrunk: Vec<f64> = if kappa == 0.0 {
-        local_grand_q
-    } else {
-        local_grand_q
-            .iter()
-            .zip(global_grand_q.iter())
-            .map(|(local, global)| (local + kappa * global) / (1.0 + kappa))
-            .collect()
-    };
-
-    let grand_mean = grand_q_shrunk.iter().sum::<f64>() / grand_q_shrunk.len().max(1) as f64;
-    let rt_adj = vec![grand_mean; sub.height()];
-
-    sub.with_column(Series::new("rt".into(), rt_adj))?;
-    Ok(sub)
-}
-
-fn compute_quantiles(data: &[f64], probs: &[f64]) -> Vec<f64> {
-    if data.is_empty() {
-        return vec![0.0; probs.len()];
-    }
-
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    probs
-        .iter()
-        .map(|&p| {
-            let idx_exact = p * (sorted.len() - 1) as f64;
-            let idx_lower = idx_exact.floor() as usize;
-            let idx_upper = idx_exact.ceil() as usize;
-
-            if idx_lower == idx_upper {
-                sorted[idx_lower]
-            } else {
-                let frac = idx_exact - idx_lower as f64;
-                sorted[idx_lower] * (1.0 - frac) + sorted[idx_upper] * frac
-            }
-        })
-        .collect()
 }
 
 pub struct QuantileMapParams {
@@ -807,14 +686,7 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
         .into_no_null_iter()
         .map(|s| s.to_string())
         .collect();
-    let pid_vec: Vec<String> = df
-        .column("participant_id")?
-        .str()?
-        .into_no_null_iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    // Process each participant in parallel, producing rows with tau, q_row_tau, q_col_tau, q_grand_tau, lrt_adj
+    // Process each participant in parallel, producing replacement RTs by original row index.
     let per_pid_outputs: Vec<Vec<PerRowOut>> = pats_unique
         .par_iter()
         .map(|pid| {
@@ -840,7 +712,6 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
                     rt: rt_vec[i],
                     cong: cong_vec[i].clone(),
                     prev: prev_vec[i].clone(),
-                    pid: pid_vec[i].clone(),
                 });
             }
 
@@ -869,8 +740,6 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
                     CellLocal {
                         n: rows.len(),
                         ecdf,
-                        q_global,
-                        q_local: q_curve_local,
                         q_shrunk,
                     },
                 );
@@ -912,12 +781,6 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
                 for (cong, rows) in row_groups {
                     let xs: Vec<f64> = rows.iter().map(|r| r.rt).collect();
                     let q_local = quantiles_type8(&xs, &taus);
-                    // shrink against grand curve
-                    let _q_shrunk: Vec<f64> = q_local
-                        .iter()
-                        .zip(grand_curve.iter())
-                        .map(|(l, g)| shrink(*l, *g, kappa))
-                        .collect();
                     row_curves.insert(cong, q_local);
                 }
             }
@@ -927,17 +790,11 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
                 for (prev, rows) in col_groups {
                     let xs: Vec<f64> = rows.iter().map(|r| r.rt).collect();
                     let q_local = quantiles_type8(&xs, &taus);
-                    // shrink against grand curve
-                    let _q_shrunk: Vec<f64> = q_local
-                        .iter()
-                        .zip(grand_curve.iter())
-                        .map(|(l, g)| shrink(*l, *g, kappa))
-                        .collect();
                     col_curves.insert(prev, q_local);
                 }
             }
 
-            // Interpolate per row: q_row_tau, q_col_tau, q_grand_tau; compute lrt_adj
+            // Interpolate the additive row + column - grand quantile structure per row.
             let mut out: Vec<PerRowOut> = Vec::with_capacity(sub_rows.len());
             for (i, r) in sub_rows.iter().enumerate() {
                 let tau = tau_per_row[i];
@@ -948,10 +805,6 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
 
                 out.push(PerRowOut {
                     idx: r.idx,
-                    tau,
-                    q_row_tau,
-                    q_col_tau,
-                    q_grand_tau,
                     lrt_adj,
                 });
             }
@@ -981,6 +834,294 @@ pub fn quantile_map_once(df: DataFrame, params: QuantileMapParams) -> Result<Dat
     Ok(out_df)
 }
 
+fn parse_pm1(value: Option<&str>) -> Option<f64> {
+    match value? {
+        "1" | "1.0" => Some(1.0),
+        "-1" | "-1.0" => Some(-1.0),
+        _ => None,
+    }
+}
+
+fn local_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>], prev: &[Option<f64>], min_cell_n: usize) -> Option<f64> {
+    let mut sums: HashMap<(i8, i8), (f64, usize)> = HashMap::new();
+    for &idx in rows {
+        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else { continue };
+        let y = rt[idx];
+        if !y.is_finite() { continue }
+        let key = (c as i8, p as i8);
+        let entry = sums.entry(key).or_insert((0.0, 0));
+        entry.0 += y;
+        entry.1 += 1;
+    }
+    for c in [-1_i8, 1_i8] {
+        for p in [-1_i8, 1_i8] {
+            if sums.get(&(c, p)).map(|(_, n)| *n).unwrap_or(0) < min_cell_n {
+                return None;
+            }
+        }
+    }
+    let mean = |c: i8, p: i8| -> f64 {
+        let (sum, n) = sums.get(&(c, p)).copied().unwrap();
+        sum / n as f64
+    };
+    Some((mean(1, 1) - mean(1, -1) - mean(-1, 1) + mean(-1, -1)) / 4.0)
+}
+
+fn local_median_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>], prev: &[Option<f64>], min_cell_n: usize) -> Option<f64> {
+    let mut cells: HashMap<(i8, i8), Vec<f64>> = HashMap::new();
+    for &idx in rows {
+        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else { continue };
+        let y = rt[idx];
+        if y.is_finite() {
+            cells.entry((c as i8, p as i8)).or_default().push(y);
+        }
+    }
+    for c in [-1_i8, 1_i8] {
+        for p in [-1_i8, 1_i8] {
+            if cells.get(&(c, p)).map(|v| v.len()).unwrap_or(0) < min_cell_n {
+                return None;
+            }
+        }
+    }
+    let median = |c: i8, p: i8| -> f64 {
+        let mut xs = cells.get(&(c, p)).cloned().unwrap();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = xs.len();
+        if n % 2 == 0 { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 } else { xs[n / 2] }
+    };
+    Some((median(1, 1) - median(1, -1) - median(-1, 1) + median(-1, -1)) / 4.0)
+}
+
+pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize) -> Result<DataFrame> {
+    for c in ["rt", "cong", "prev_cong", "participant_id"] {
+        if !df.get_column_names().iter().any(|n| *n == c) {
+            return Err(anyhow!("missing required column: {}", c));
+        }
+    }
+    let rt_cast = df.column("rt")?.cast(&DataType::Float64)?;
+    let rt: Vec<f64> = rt_cast
+        .f64()?
+        .into_iter()
+        .map(|v| v.unwrap_or(f64::NAN))
+        .collect();
+    let cong_cast = df.column("cong")?.cast(&DataType::String)?;
+    let prev_cast = df.column("prev_cong")?.cast(&DataType::String)?;
+    let cong: Vec<Option<f64>> = cong_cast.str()?.into_iter().map(parse_pm1).collect();
+    let prev: Vec<Option<f64>> = prev_cast.str()?.into_iter().map(parse_pm1).collect();
+    let pid_col = df.column("participant_id")?.str()?;
+
+    let mut by_pid: HashMap<String, Vec<usize>> = HashMap::new();
+    for i in 0..df.height() {
+        if let Some(pid) = pid_col.get(i) {
+            by_pid.entry(pid.to_string()).or_default().push(i);
+        }
+    }
+    let participant_beta: HashMap<String, Option<f64>> = by_pid
+        .iter()
+        .map(|(pid, rows)| (pid.clone(), local_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .collect();
+
+    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    if df.get_column_names().iter().any(|n| *n == "trial_index") && n_bins >= 2 {
+        let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
+        let trial_col = trial_cast.f64()?;
+        for (pid, mut rows) in by_pid.clone() {
+            rows.sort_by(|a, b| {
+                let ta = trial_col.get(*a).unwrap_or(*a as f64);
+                let tb = trial_col.get(*b).unwrap_or(*b as f64);
+                ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n = rows.len().max(1);
+            for (pos, idx) in rows.into_iter().enumerate() {
+                let bin = ((pos * n_bins) / n).min(n_bins - 1);
+                groups.entry((pid.clone(), bin)).or_default().push(idx);
+            }
+        }
+    } else {
+        for (pid, rows) in by_pid.clone() {
+            groups.insert((pid, 0), rows);
+        }
+    }
+
+    let mut new_rt = rt.clone();
+    for ((pid, _bin), rows) in groups {
+        let beta = local_interaction_beta(&rows, &rt, &cong, &prev, min_cell_n)
+            .or_else(|| participant_beta.get(&pid).copied().flatten());
+        let Some(beta) = beta else { continue };
+        for idx in rows {
+            if let (Some(c), Some(p)) = (cong[idx], prev[idx]) {
+                if new_rt[idx].is_finite() {
+                    new_rt[idx] -= beta * c * p;
+                }
+            }
+        }
+    }
+
+    let mut out_df = df.clone();
+    out_df.replace("rt", Series::new("rt".into(), new_rt))?;
+    Ok(out_df)
+}
+
+pub fn local_median_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize) -> Result<DataFrame> {
+    for c in ["rt", "cong", "prev_cong", "participant_id"] {
+        if !df.get_column_names().iter().any(|n| *n == c) {
+            return Err(anyhow!("missing required column: {}", c));
+        }
+    }
+    let rt_cast = df.column("rt")?.cast(&DataType::Float64)?;
+    let rt: Vec<f64> = rt_cast
+        .f64()?
+        .into_iter()
+        .map(|v| v.unwrap_or(f64::NAN))
+        .collect();
+    let cong_cast = df.column("cong")?.cast(&DataType::String)?;
+    let prev_cast = df.column("prev_cong")?.cast(&DataType::String)?;
+    let cong: Vec<Option<f64>> = cong_cast.str()?.into_iter().map(parse_pm1).collect();
+    let prev: Vec<Option<f64>> = prev_cast.str()?.into_iter().map(parse_pm1).collect();
+    let pid_col = df.column("participant_id")?.str()?;
+
+    let mut by_pid: HashMap<String, Vec<usize>> = HashMap::new();
+    for i in 0..df.height() {
+        if let Some(pid) = pid_col.get(i) {
+            by_pid.entry(pid.to_string()).or_default().push(i);
+        }
+    }
+    let participant_beta: HashMap<String, Option<f64>> = by_pid
+        .iter()
+        .map(|(pid, rows)| (pid.clone(), local_median_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .collect();
+
+    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    if df.get_column_names().iter().any(|n| *n == "trial_index") && n_bins >= 2 {
+        let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
+        let trial_col = trial_cast.f64()?;
+        for (pid, mut rows) in by_pid.clone() {
+            rows.sort_by(|a, b| {
+                let ta = trial_col.get(*a).unwrap_or(*a as f64);
+                let tb = trial_col.get(*b).unwrap_or(*b as f64);
+                ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n = rows.len().max(1);
+            for (pos, idx) in rows.into_iter().enumerate() {
+                let bin = ((pos * n_bins) / n).min(n_bins - 1);
+                groups.entry((pid.clone(), bin)).or_default().push(idx);
+            }
+        }
+    } else {
+        for (pid, rows) in by_pid.clone() {
+            groups.insert((pid, 0), rows);
+        }
+    }
+
+    let mut new_rt = rt.clone();
+    for ((pid, _bin), rows) in groups {
+        let beta = local_median_interaction_beta(&rows, &rt, &cong, &prev, min_cell_n)
+            .or_else(|| participant_beta.get(&pid).copied().flatten());
+        let Some(beta) = beta else { continue };
+        for idx in rows {
+            if let (Some(c), Some(p)) = (cong[idx], prev[idx]) {
+                if new_rt[idx].is_finite() {
+                    new_rt[idx] -= beta * c * p;
+                }
+            }
+        }
+    }
+
+    let mut out_df = df.clone();
+    out_df.replace("rt", Series::new("rt".into(), new_rt))?;
+    Ok(out_df)
+}
+
+pub fn quantile_map_trial_bin(
+    df: DataFrame,
+    params: QuantileMapParams,
+    min_cell_n: usize,
+    n_bins: usize,
+) -> Result<DataFrame> {
+    let stationary = quantile_map_once(df.clone(), QuantileMapParams {
+        scale_col: params.scale_col.clone(),
+        kappa: params.kappa,
+        ngrid: params.ngrid,
+    })?;
+    if !df.get_column_names().iter().any(|n| *n == "trial_index") || n_bins < 2 {
+        return Ok(stationary);
+    }
+
+    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    let pid_col = df.column("participant_id")?.str()?;
+    let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
+    let trial_col = trial_cast.f64()?;
+
+    let mut by_pid: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
+    for i in 0..df.height() {
+        let Some(pid) = pid_col.get(i) else { continue };
+        let Some(trial) = trial_col.get(i) else { continue };
+        if trial.is_finite() {
+            by_pid.entry(pid.to_string()).or_default().push((i, trial));
+        }
+    }
+    for (pid, mut rows) in by_pid {
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let n = rows.len().max(1);
+        for (pos, (idx, _trial)) in rows.into_iter().enumerate() {
+            let bin = ((pos * n_bins) / n).min(n_bins - 1);
+            groups.entry((pid.clone(), bin)).or_default().push(idx);
+        }
+    }
+
+    let mut new_rt: Vec<f64> = stationary
+        .column("rt")?
+        .f64()?
+        .into_no_null_iter()
+        .collect();
+    let cong_col = df.column("cong")?.cast(&DataType::String)?;
+    let cong_col = cong_col.str()?;
+    let prev_col = df.column("prev_cong")?.cast(&DataType::String)?;
+    let prev_col = prev_col.str()?;
+
+    for rows in groups.values() {
+        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+        for &idx in rows {
+            if let (Some(c), Some(p)) = (cong_col.get(idx), prev_col.get(idx)) {
+                *counts.entry((c.to_string(), p.to_string())).or_default() += 1;
+            }
+        }
+        let adequate = ["-1", "1"].iter().all(|c| {
+            ["-1", "1"].iter().all(|p| {
+                counts
+                    .get(&(c.to_string(), p.to_string()))
+                    .copied()
+                    .unwrap_or(0)
+                    >= min_cell_n
+            })
+        });
+        if !adequate {
+            continue;
+        }
+
+        let idx_set: HashSet<usize> = rows.iter().copied().collect();
+        let mask: BooleanChunked = (0..df.height()).map(|i| idx_set.contains(&i)).collect();
+        let local_df = df.filter(&mask)?;
+        let local_mapped = quantile_map_once(local_df, QuantileMapParams {
+            scale_col: params.scale_col.clone(),
+            kappa: params.kappa,
+            ngrid: params.ngrid,
+        })?;
+        let local_rt: Vec<f64> = local_mapped
+            .column("rt")?
+            .f64()?
+            .into_no_null_iter()
+            .collect();
+        for (&idx, rt) in rows.iter().zip(local_rt.into_iter()) {
+            new_rt[idx] = rt;
+        }
+    }
+
+    let mut out_df = df.clone();
+    out_df.replace("rt", Series::new("rt".into(), new_rt))?;
+    Ok(out_df)
+}
+
 // Utilities and helpers
 
 #[derive(Clone)]
@@ -989,24 +1130,17 @@ struct RowData {
     rt: f64,
     cong: String,
     prev: String,
-    pid: String,
 }
 
 struct CellLocal {
     n: usize,
     ecdf: SimpleEcdf,
-    q_global: Vec<f64>,
-    q_local: Vec<f64>,
     q_shrunk: Vec<f64>,
 }
 
 #[derive(Clone)]
 struct PerRowOut {
     idx: usize,
-    tau: f64,
-    q_row_tau: f64,
-    q_col_tau: f64,
-    q_grand_tau: f64,
     lrt_adj: f64,
 }
 
@@ -1219,18 +1353,8 @@ fn per_pid_minimal(
             .cloned()
             .unwrap_or_else(|| taus.iter().map(|_| f64::NAN).collect());
         let tau = invert_monotone_interp(taus, &q_global, rt);
-        let q_row_tau = interp(taus, &grand_curve, tau);
-        let q_col_tau = interp(taus, &grand_curve, tau);
-        let q_grand_tau = interp(taus, &grand_curve, tau);
-        let lrt_adj = q_row_tau + q_col_tau - q_grand_tau;
-        out.push(PerRowOut {
-            idx: i,
-            tau,
-            q_row_tau,
-            q_col_tau,
-            q_grand_tau,
-            lrt_adj,
-        });
+        let lrt_adj = interp(taus, &grand_curve, tau);
+        out.push(PerRowOut { idx: i, lrt_adj });
     }
     out
 }
@@ -1259,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_label_present_and_null_both_are_none() {
+    fn test_strip_label_present_is_none() {
         let df = make_dummy_df();
 
         let cfg_present = BranchConfig {
@@ -1271,15 +1395,6 @@ mod tests {
             strip_method: StripMethod::Shuffle, // ignored
             global_seed: 42,
         };
-        let cfg_null_both = BranchConfig {
-            sample_size: 1.0,
-            subsample_id: 1,
-            transformation: Transformation::NoLogRt,
-            outlier_method: OutlierMethod::None,
-            effect_condition: EffectCondition::NullBoth,
-            strip_method: StripMethod::Qmap5, // ignored
-            global_seed: 42,
-        };
 
         let pipeline_present = BranchPipeline::new(cfg_present);
         let (_df_out_p, res_p) = pipeline_present
@@ -1288,14 +1403,6 @@ mod tests {
         assert_eq!(res_p.effect_condition, "present");
         assert_eq!(res_p.strip_method, "none");
         assert!(res_p.branch_id.ends_with("__none"));
-
-        let pipeline_nb = BranchPipeline::new(cfg_null_both);
-        let (_df_out_nb, res_nb) = pipeline_nb
-            .process(df.clone())
-            .expect("null_both branch ok");
-        assert_eq!(res_nb.effect_condition, "null_both");
-        assert_eq!(res_nb.strip_method, "none");
-        assert!(res_nb.branch_id.ends_with("__none"));
     }
 
     #[test]
@@ -1317,7 +1424,7 @@ mod tests {
             transformation: Transformation::NoLogRt,
             outlier_method: OutlierMethod::None,
             effect_condition: EffectCondition::NullInteraction,
-            strip_method: StripMethod::Qmap5,
+            strip_method: StripMethod::AdditiveQmap,
             global_seed: 42,
         };
 
@@ -1332,8 +1439,8 @@ mod tests {
         let pipeline_qmap = BranchPipeline::new(cfg_qmap);
         let (_df_q, res_q) = pipeline_qmap.process(df).expect("qmap branch ok");
         assert_eq!(res_q.effect_condition, "null_interaction");
-        assert_eq!(res_q.strip_method, "qmap_5");
-        assert!(res_q.branch_id.ends_with("__qmap_5"));
+        assert_eq!(res_q.strip_method, "additive_qmap");
+        assert!(res_q.branch_id.ends_with("__additive_qmap"));
     }
 
     fn group_rt_multiset(df: &DataFrame) -> HashMap<(String, String), Vec<f64>> {
@@ -1390,33 +1497,6 @@ mod tests {
                 .into_no_null_iter()
                 .collect::<Vec<_>>()
         );
-
-        // NullBoth should replace RTs with μ_i + residual (not equal to original in general)
-        let cfg_nb = BranchConfig {
-            sample_size: 1.0,
-            subsample_id: 1,
-            transformation: Transformation::NoLogRt,
-            outlier_method: OutlierMethod::None,
-            effect_condition: EffectCondition::NullBoth,
-            strip_method: StripMethod::Shuffle,
-            global_seed: 42,
-        };
-        let (df_nb, _res_nb) = BranchPipeline::new(cfg_nb).process(df.clone()).unwrap();
-        let rt_orig: Vec<f64> = df
-            .column("rt")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_no_null_iter()
-            .collect();
-        let rt_nb: Vec<f64> = df_nb
-            .column("rt")
-            .unwrap()
-            .f64()
-            .unwrap()
-            .into_no_null_iter()
-            .collect();
-        assert_ne!(rt_orig, rt_nb, "NullBoth should alter RTs");
 
         // NullInteraction + shuffle should permute within (participant_id, cong) groups
         let cfg_shuffle = BranchConfig {
@@ -1475,10 +1555,7 @@ mod tests {
             "null_interaction".parse::<EffectCondition>().unwrap(),
             EffectCondition::NullInteraction
         );
-        assert_eq!(
-            "null_both".parse::<EffectCondition>().unwrap(),
-            EffectCondition::NullBoth
-        );
+        assert!("null_both".parse::<EffectCondition>().is_err());
     }
 
     #[test]
@@ -1488,6 +1565,5 @@ mod tests {
             EffectCondition::NullInteraction.to_string(),
             "null_interaction"
         );
-        assert_eq!(EffectCondition::NullBoth.to_string(), "null_both");
     }
 }

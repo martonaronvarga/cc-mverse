@@ -1,0 +1,55 @@
+---
+title: "Multiverse Analysis Report"
+output: html_document
+params:
+  results: NA
+  n_branches: NA
+  timestamp: NA
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(broom)
+library(kableExtra)
+library(ggplot2)
+library(crew)
+library(rmarkdown)
+```
+
+
+# Multiverse Analysis Summary
+
+**N branches:** `r params$n_branches`  
+**Generated:** `r format(params$timestamp, '%Y-%m-%d %H:%M:%S')`
+
+## Results Table
+
+```{r}
+results <- params$results
+kable(results, format = "html") %>%
+  kable_styling("striped", full_width = FALSE)
+```
+
+## Branch Diagnostics
+
+```{r}
+if (!is.null(results)) {
+  ggplot(results, aes(x = branch_id, y = effect_size)) +
+    geom_point() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+```
+
+## Model Comparison
+
+```{r}
+if (!is.null(results)) {
+  summary_stats <- results %>%
+    group_by(model_name) %>%
+    summarize(mean_p = mean(LR_p, na.rm = TRUE), mean_AIC = mean(AIC_diff, na.rm = TRUE))
+  kable(summary_stats, format = "html")
+}
+```
+
+

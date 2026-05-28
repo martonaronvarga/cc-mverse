@@ -1,0 +1,292 @@
+---
+title: "mverse_indexed"
+output: html_document
+---
+
+# 00. Libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(magrittr)
+```
+
+# 0. Raw data
+```{r}
+raw_dir <- if (dir.exists("R/data/raw")) "R/data/raw" else "data/raw"
+
+t_zeng_data <- read_csv(file.path(raw_dir, "zeng_replication_data.csv"))
+
+t_zhang_data <- read_csv(file.path(raw_dir, "zhang_replication_data.csv"))
+
+t_yang_data <- read_csv(file.path(raw_dir, "yang_replication_data.csv"))
+
+t_primeprobe_data <- read_csv(file.path(raw_dir, "bognar_primeprobe_data.csv"))
+
+t_flanker_data <- read_csv(file.path(raw_dir, "bognar_flanker_data.csv"))
+```
+
+# ==============================================================
+# 1. Zeng
+### preprocessed
+```{r}
+zeng_raw <- t_zeng_data %>%
+  select(
+    trial_index, participant_id, rt, correct, first_trial, congruency, condition
+  ) %>%
+  rename(cong = congruency) %>%
+  mutate(
+    participant_id = paste0(participant_id, "_zeng"),
+    study = "zeng"
+  ) %>%
+  arrange(participant_id, trial_index) %>%
+  group_by(participant_id) %>%
+  mutate(
+    prev_cong = lag(cong, n = 1),
+    prev_correct = lag(correct, n = 1)
+  ) %>%
+  ungroup()
+
+zeng_processed <- zeng_raw %>%
+  mutate(
+    cong = if_else(cong == "incongruent", -1, 1),
+    prev_cong = case_when(
+      is.na(prev_cong) ~ NA_real_,
+      prev_cong == "incongruent" ~ -1,
+      TRUE ~ 1
+    )
+  )
+```
+
+### creating block index (pos, neg, neutral)
+```{r}
+zeng_block <- zeng_processed %>%
+  group_by(participant_id) %>%
+  mutate(
+    block_index = cumsum(
+      condition != lag(condition, default = first(condition))
+    ) + 1
+  ) %>%
+  ungroup() %>%
+  select(-first_trial)
+```
+
+### write csv
+```{r}
+write.csv(zeng_block, "R/data/processed/zeng_indexed.csv", row.names = FALSE)
+```
+
+
+# ===============================================================
+# 2. Zhang 
+### block index
+```{r}
+zhang_block <- t_zhang_data %>%
+  arrange(participant_id) %>%
+  group_by(participant_id) %>%
+  mutate(
+    block_index = {
+      ## flags where new block starts
+      blockstart <- case_when(
+        task %in% c("pause", "pause_practice") ~ 1,
+        TRUE ~ 0
+      )
+      cumsum(blockstart) + 1
+    }
+  ) %>%
+  ungroup()
+```
+
+### processed
+```{r}
+zhang_raw <- zhang_block %>%
+  select(
+    trial_index, participant_id, rt, response, task, block, congruency, correct, block, id, block_index
+  )
+
+zhang_processed <- zhang_raw %>%
+  mutate(
+    cong = case_when(
+      congruency == "no_conflict" ~ 1,
+      congruency %in% c("low_conflict", "high_conflict") ~ -1
+    )
+  ) %>%
+  filter(task == "response") %>%
+  mutate(
+    participant_id = paste0(participant_id, "_zhang"),
+    study = "zhang"
+  ) %>%
+  arrange(participant_id, block_index, trial_index) %>%
+  group_by(participant_id) %>%
+  mutate(
+    prev_cong = lag(cong, n = 1),
+    prev_correct = lag(correct, n = 1),
+    is_practice = case_when(
+      (block == "practice") ~ 1,
+      (is.na(block)) ~ 0
+    )
+  ) %>%
+  ungroup() %>%
+  select(-response, -task, -id) %>%
+  rename(name = block)
+```
+
+### write csv
+```{r}
+write.csv(zhang_processed, "R/data/processed/zhang_indexed.csv", row.names = FALSE)
+```
+
+
+# ===============================================================
+# 3. Yang 
+### block index
+```{r}
+yang_raw <- t_yang_data %>%
+  arrange(subj_code, trial_index) %>%
+  group_by(subj_code) %>%
+  mutate(
+    feedback = case_when(
+      grepl(">✘</div>", stimulus) ~ "visual_punishment", # flagging different feedback events in new variable
+      grepl("&#11036", stimulus) ~ "neutral",
+      grepl(">✘<br>5 garast veszítettél</div>", stimulus) ~ "monetary_loss",
+      grepl("✔", stimulus) ~ "tickmark"
+    ),
+    prev_feedback = ifelse(task == "probe", lag(feedback, n = 4), ""), # Flagging previous feedback in probe trial
+    prev_loss = ifelse(prev_feedback == "monetary_loss", 1, 0), # Flagging if monetary loss happened before this probe
+    prev_correct = lag(correct, n = 5), # flagging previous correct
+    prev_congruency = lag(congruency, n = 5), # creating previous congruency variable
+    block_feedback_type = lead(feedback_type)
+  ) %>% # moving feedback type data to probe variable
+  ungroup()
+
+yang_block <- yang_raw %>%
+  filter(
+    task == "probe"
+  ) %>%
+  group_by(subj_code) %>%
+  mutate(
+    blockstart = case_when(
+      (is.na(prev_congruency)) & (is.na(prev_correct)) ~ 1,
+      TRUE ~ 0
+    ),
+    block_index = cumsum(blockstart)
+  ) %>%
+  ungroup()
+```
+
+### processed
+```{r}
+yang_processed <- yang_block %>%
+  select(
+    rt, trial_index, subj_code, congruency, name, correct, prev_correct, prev_congruency, block_index
+  ) %>%
+  mutate(
+    is_practice = ifelse(name == "practice", 1, 0),
+    study = "yang",
+    subj_code = paste0(subj_code, "_yang"),
+    prev_congruency = case_when(
+      is.na(prev_congruency) ~ NA_real_,
+      prev_congruency == "incongruent" ~ -1,
+      TRUE ~ 1
+    ),
+    congruency = if_else(congruency == "incongruent", -1, 1)
+  ) %>%
+  rename(cong = congruency,
+         prev_cong = prev_congruency,
+         participant_id = subj_code)
+```
+
+### write csv
+```{r}
+write.csv(yang_processed, "R/data/processed/yang_indexed.csv", row.names = FALSE)
+```
+
+
+# ===============================================================
+# 4. Prime-probe
+### block index, trial index, type_code (?)
+```{r}
+primeprobe_processed <- t_primeprobe_data %>%
+  mutate(
+    source_row_within_study = row_number(),
+    study = "primeprobe",
+    participant_id = paste0(participant_id, "_primeprobe"),
+    trial_index = source_row_within_study,
+    block_index = 1L,
+    cong = ifelse(is_congruent == 1, 1, -1),
+    prev_cong = case_when(
+      is.na(prev_congruent) ~ NA_real_,
+      prev_congruent == 1 ~ 1,
+      TRUE ~ -1
+    ),
+    correct = as.logical(correct),
+    prev_correct = lag(correct, n = 1),
+    is_first_trial = row_number() == 1L
+  ) %>%
+  group_by(participant_id) %>%
+  mutate(
+    trial_index = row_number(),
+    prev_correct = if_else(row_number() == 1L, NA, lag(correct, n = 1)),
+    is_first_trial = row_number() == 1L
+  ) %>%
+  ungroup() %>%
+  select(study, participant_id, trial_index, block_index, cong, prev_cong, rt, correct, prev_correct, is_first_trial, source_row_within_study)
+```
+
+### write csv
+```{r}
+write.csv(primeprobe_processed, "R/data/processed/primeprobe_indexed.csv", row.names = FALSE)
+```
+
+
+# ===============================================================
+# 5. Flanker
+### block index, trial index, type_code (?)
+```{r}
+flanker_processed <- t_flanker_data %>%
+  mutate(
+    source_row_within_study = row_number(),
+    study = "flanker",
+    participant_id = paste0(participant_id, "_flanker"),
+    trial_index = source_row_within_study,
+    block_index = 1L,
+    cong = ifelse(is_congruent == 1, 1, -1),
+    prev_cong = case_when(
+      is.na(prev_congruent) ~ NA_real_,
+      prev_congruent == 1 ~ 1,
+      TRUE ~ -1
+    ),
+    correct = as.logical(correct),
+    prev_correct = lag(correct, n = 1),
+    is_first_trial = row_number() == 1L
+  ) %>%
+  group_by(participant_id) %>%
+  mutate(
+    trial_index = row_number(),
+    prev_correct = if_else(row_number() == 1L, NA, lag(correct, n = 1)),
+    is_first_trial = row_number() == 1L
+  ) %>%
+  ungroup() %>%
+  select(study, participant_id, trial_index, block_index, cong, prev_cong, rt, correct, prev_correct, is_first_trial, flagged, source_row_within_study)
+```
+
+### write csv
+```{r}
+write.csv(flanker_processed, "R/data/processed/flanker_indexed.csv", row.names = FALSE)
+```
+
+# ===============================================================
+# 6. bind_rows
+```{r}
+flanker_processed$rt <- as.numeric(flanker_processed$rt)
+primeprobe_processed$rt <- as.numeric(primeprobe_processed$rt)
+yang_processed$rt <- as.numeric(yang_processed$rt)
+zhang_processed$rt <- as.numeric(zhang_processed$rt)
+zeng_block$rt <- as.numeric(zeng_block$rt)
+
+all_indexed <- bind_rows(flanker_processed, primeprobe_processed, yang_processed, zhang_processed, zeng_block) %>%
+  mutate(source_row = row_number())
+
+write.csv(all_indexed, "R/all_indexed.csv", row.names = FALSE)
+```
+

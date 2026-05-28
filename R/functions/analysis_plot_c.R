@@ -10,24 +10,48 @@
 # library(plotly)
 # library(htmlwidgets)
 
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+})
+
+plotc_wrap <- function(x, width = 20) stringr::str_wrap(as.character(x), width = width)
+
+plotc_theme <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      legend.position = "bottom",
+      legend.box = "vertical",
+      panel.grid.minor = element_blank(),
+      panel.spacing = grid::unit(1.0, "lines"),
+      strip.text = element_text(face = "bold", lineheight = 0.95),
+      plot.title = element_text(face = "bold", lineheight = 0.95),
+      plot.subtitle = element_text(color = "grey40", lineheight = 0.95),
+      plot.margin = margin(10, 14, 10, 10),
+      axis.title = element_text(face = "bold")
+    )
+}
+
 plot_save_fallback <- function(filename, plot, width = 10, height = 7, dpi = 300) {
-  tryCatch(
-    {
-      ggsave(filename = paste0(filename, ".svg"), plot = plot, device = "svg", width = width, height = height, dpi = dpi)
-      message("Saved as SVG: ", filename, ".svg")
-    },
-    error = function(e) {
-      tryCatch(
-        {
-          ggsave(filename = paste0(filename, ".pdf"), plot = plot, device = "pdf", width = width, height = height, dpi = dpi)
-          message("Saved as PDF: ", filename, ".pdf")
-        },
-        error = function(e2) {
-          stop("Cannot save plot in any available graphics format.")
-        }
-      )
+  filename <- tools::file_path_sans_ext(filename)
+  devices <- list()
+  if (requireNamespace("svglite", quietly = TRUE)) {
+    devices$svg <- function(path) ggsave(path, plot = plot, device = svglite::svglite, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
+  }
+  devices$pdf <- function(path) ggsave(path, plot = plot, device = grDevices::pdf, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    devices$png <- function(path) ggsave(path, plot = plot, device = ragg::agg_png, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
+  }
+  for (ext in names(devices)) {
+    ok <- tryCatch({ devices[[ext]](paste0(filename, ".", ext)); TRUE }, error = function(e) FALSE)
+    if (ok) {
+      message("Saved as ", toupper(ext), ": ", filename, ".", ext)
+      return(invisible(filename))
     }
-  )
+  }
+  stop("Cannot save plot in any available headless-safe graphics format.")
 }
 ensure_figures2_dir <- function(output_dir) {
   if (!dir.exists(output_dir)) {
@@ -40,10 +64,8 @@ prep_alt_results <- function(results_df) {
     mutate(
       converged_both = full_converged & coalesce(null_converged, TRUE),
       is_true_effect = (effect_condition == "present" & strip_method == "none"),
-      is_null_effect = (
-        (effect_condition == "null_interaction" & strip_method %in% c("shuffle", "qmap_5")) |
-          (effect_condition == "null_both" & strip_method == "none")
-      ),
+      strip_method = dplyr::recode(strip_method, qmap_5 = "additive_qmap", qmap_5_trial_bin = "additive_qmap_trial_bin"),
+      is_null_effect = effect_condition == "null_interaction" & strip_method %in% c("shuffle", "additive_qmap", "additive_qmap_trial_bin", "local_mean_residual", "local_median_residual"),
       is_significant = main_p_value < 0.05,
       model_type = case_when(
         grepl("rmanova", model) ~ "rmANOVA",
@@ -55,15 +77,21 @@ prep_alt_results <- function(results_df) {
       strip_label = case_when(
         strip_method == "none" ~ "No stripping",
         strip_method == "shuffle" ~ "Shuffle",
-        strip_method == "qmap_5" ~ "QMap",
+        strip_method == "additive_qmap" ~ "Additive qmap",
+        strip_method == "additive_qmap_trial_bin" ~ "Additive qmap trial-bin",
+        strip_method == "local_mean_residual" ~ "Local mean residual",
+        strip_method == "local_median_residual" ~ "Local median residual",
         TRUE ~ strip_method
       ),
       outlier_label = ifelse(is.na(outlier), "None", as.character(outlier)),
       transformation_label = case_when(
         transformation == "log_rt" ~ "log(RT)",
-        transformation == "raw_rt" ~ "Raw RT",
-        TRUE ~ transformation
-      )
+        transformation %in% c("raw_rt", "no_log_rt") ~ "Raw RT",
+        TRUE ~ plotc_wrap(transformation, 16)
+      ),
+      model_type = plotc_wrap(model_type, 18),
+      strip_label = plotc_wrap(strip_label, 18),
+      outlier_label = plotc_wrap(outlier_label, 12)
     ) %>%
     filter(converged_both, !error, !is.na(main_estimate)) %>%
     filter(!(effect_condition == "present" & strip_method != "none"))
@@ -88,7 +116,8 @@ plot_effect_ridges <- function(results) {
       y = "Specification (Model:Strip:Outlier)",
       x = "Effect Estimate (Clamped 1%-99%)"
     ) +
-    theme_ridges(grid = TRUE)
+    ggridges::theme_ridges(grid = TRUE) +
+    theme(legend.position = "bottom", plot.margin = margin(10, 14, 10, 10))
 }
 plot_effect_scatter <- function(results) {
   ggplot(results, aes(
@@ -104,7 +133,7 @@ plot_effect_scatter <- function(results) {
       y = "Effect Estimate",
       color = "Significant (p<0.05)"
     ) +
-    theme_minimal()
+    plotc_theme()
 }
 plot_multiverse_scatter <- function(results) {
   results <- results %>%
@@ -122,7 +151,7 @@ plot_multiverse_scatter <- function(results) {
       y = "Main Estimate",
       color = "Significant (p<0.05)"
     ) +
-    theme_minimal()
+    plotc_theme()
 }
 plot_pvalue_density <- function(results) {
   ggplot(results, aes(x = main_p_value, fill = effect_condition)) +
@@ -133,7 +162,7 @@ plot_pvalue_density <- function(results) {
     labs(
       x = "P-value", y = "Density", fill = "Condition"
     ) +
-    theme_minimal()
+    plotc_theme()
 }
 plot_estimate_vs_sample_size <- function(results) {
   ggplot(results, aes(x = sample_size, y = main_estimate, color = strip_label, shape = outlier_label)) +
@@ -144,22 +173,22 @@ plot_estimate_vs_sample_size <- function(results) {
       x = "Sample Size Proportion", y = "Effect Estimate",
       color = "Stripping", shape = "Outlier"
     ) +
-    theme_minimal()
+    plotc_theme()
 }
 plot_roc_by_samplesize <- function(results) {
   ggplot(results, aes(x = sample_size, y = is_significant, group = model_type, color = model_type)) +
     geom_point(alpha = 0.4, size = 1.1, position = position_jitter(width = 0.01)) +
     geom_smooth(method = "loess", span = 0.8, se = FALSE, linewidth = 1.1) +
     scale_y_continuous(
-      name = "Significance Proportion (TPR/FDR)", limits = c(0, 1), labels = scales::percent
+      name = "Significance proportion (TPR/FPR by condition)", limits = c(0, 1), labels = scales::percent
     ) +
     scale_x_continuous(name = "Sample Size Proportion") +
     facet_wrap(~transformation_label) +
     labs(color = "Model") +
-    theme_minimal()
+    plotc_theme()
 }
-# FDR panels
-plot_fdr_by_outlier_transform <- function(results) {
+# Null-condition FPR panels
+plot_fpr_by_outlier_transform <- function(results) {
   plot_data <- results %>%
     filter(is_null_effect) %>%
     group_by(
@@ -167,17 +196,17 @@ plot_fdr_by_outlier_transform <- function(results) {
     ) %>%
     summarise(
       n = n(),
-      FDR = mean(is_significant, na.rm = TRUE),
-      se = sqrt(FDR * (1 - FDR) / n),
+      FPR = mean(is_significant, na.rm = TRUE),
+      se = sqrt(FPR * (1 - FPR) / n),
       .groups = "drop"
     )
   ggplot(plot_data, aes(
-    x = outlier_label, y = FDR,
+    x = outlier_label, y = FPR,
     fill = strip_label
   )) +
     geom_col(position = position_dodge(width = 0.7), color = "gray70", width = 0.6, alpha = 0.8) +
     geom_errorbar(
-      aes(ymin = FDR - se, ymax = FDR + se),
+      aes(ymin = FPR - se, ymax = FPR + se),
       position = position_dodge(width = 0.7), width = 0.15
     ) +
     geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
@@ -186,11 +215,11 @@ plot_fdr_by_outlier_transform <- function(results) {
     scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
     labs(
       x = "Outlier Strategy",
-      y = "FDR",
-      title = "FDR by Transformation, Outlier, Stripping, Model"
+      y = "FPR",
+      title = "FPR by Transformation, Outlier, Stripping, Model"
     ) +
     theme_minimal(base_size = 10) +
-    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
 }
 
 # Patchwork dashboards
@@ -212,9 +241,9 @@ dashboard_effects <- function(results) {
     )
 }
 dashboard_robustness <- function(results) {
-  plot_fdr_by_outlier_transform(results) +
+  plot_fpr_by_outlier_transform(results) +
     plot_annotation(
-      title = "False Discovery & Robustness Dashboard (Transformation-segregated)",
+      title = "False Positive Rate & Robustness Dashboard (Transformation-segregated)",
       theme = theme(plot.title = element_text(face = "bold", size = 14))
     )
 }
@@ -227,8 +256,8 @@ dashboard_significance <- function(results) {
     )
 }
 
-### Plotly 3D FDR interactive: separate panel for each transformation
-compute_fdr_table <- function(results) {
+### Plotly 3D FPR interactive: separate panel for each transformation
+compute_fpr_table <- function(results) {
   results %>%
     filter(is_null_effect) %>%
     group_by(
@@ -236,38 +265,38 @@ compute_fdr_table <- function(results) {
     ) %>%
     summarise(
       n = n(),
-      FDR = mean(is_significant, na.rm = TRUE),
+      FPR = mean(is_significant, na.rm = TRUE),
       .groups = "drop"
     )
 }
-plotly_fdr_3d <- function(tbl, transformation_value) {
+plotly_fpr_3d <- function(tbl, transformation_value) {
   subset_tbl <- tbl %>% filter(transformation_label == transformation_value)
   plot_ly(
     subset_tbl,
     x = ~sample_size,
     y = ~outlier_label,
-    z = ~FDR,
+    z = ~FPR,
     color = ~strip_label,
     symbol = ~model_type,
     symbols = levels(factor(subset_tbl$model_type)),
     type = "scatter3d", mode = "markers",
-    size = ~FDR, sizes = c(10, 42),
+    size = ~FPR, sizes = c(10, 42),
     text = ~ paste0(
       "Sample Size: ", round(sample_size, 2),
       "<br>Outlier: ", outlier_label,
       "<br>Stripping: ", strip_label,
       "<br>Model: ", model_type,
       "<br>Null Condition: ", effect_condition,
-      "<br>FDR: ", scales::percent(FDR, accuracy = 0.1)
+      "<br>FPR: ", scales::percent(FPR, accuracy = 0.1)
     ),
     hoverinfo = "text"
   ) %>%
     layout(
-      title = paste0("FDR (Null Design Only) - ", transformation_value),
+      title = paste0("FPR (Null Design Only) - ", transformation_value),
       scene = list(
         xaxis = list(title = "Sample Size Proportion", tickformat = ".0%"),
         yaxis = list(title = "Outlier"),
-        zaxis = list(title = "FDR", range = c(0, 1)),
+        zaxis = list(title = "FPR", range = c(0, 1)),
         camera = list(eye = list(x = 2, y = 1.4, z = 1.2))
       ),
       legend = list(title = list(text = "Stripping / Model"))
@@ -284,12 +313,12 @@ cont_plots <- function(results_df, output_dir) {
   plot_save_fallback(file.path(output_dir, "dashboard_robustness"), dashboard_robustness(results), width = 16, height = 13)
   plot_save_fallback(file.path(output_dir, "dashboard_significance"), dashboard_significance(results), width = 14, height = 8)
 
-  # Plotly 3D FDR: one html per transformation
-  fdr_tbl <- compute_fdr_table(results)
-  for (tr in unique(fdr_tbl$transformation_label)) {
-    fdr_plotly <- plotly_fdr_3d(fdr_tbl, tr)
-    html_path <- file.path(output_dir, paste0("fdr_3d_plotly_", gsub("[^A-Za-z0-9]", "_", tr), ".html"))
-    htmlwidgets::saveWidget(fdr_plotly, file = html_path, selfcontained = TRUE)
-    message("Interactive 3D FDR plot saved as: ", html_path)
+  # Plotly 3D FPR: one html per transformation
+  fpr_tbl <- compute_fpr_table(results)
+  for (tr in unique(fpr_tbl$transformation_label)) {
+    fpr_plotly <- plotly_fpr_3d(fpr_tbl, tr)
+    html_path <- file.path(output_dir, paste0("fpr_3d_plotly_", gsub("[^A-Za-z0-9]", "_", tr), ".html"))
+    htmlwidgets::saveWidget(fpr_plotly, file = html_path, selfcontained = TRUE)
+    message("Interactive 3D FPR plot saved as: ", html_path)
   }
 }

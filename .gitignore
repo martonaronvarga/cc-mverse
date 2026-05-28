@@ -3,3 +3,25 @@ build
 result
 perp
 cse_stripped_outputs
+
+# Generated pipeline/runtime state
+R/.pipeline.resolved.yaml
+R/_config/
+R/_targets/
+R/data/
+R/outputs/
+R/logs/
+R/R/
+R/rust/target/
+R/slurm_*_generated.sh
+
+# Large/local inputs and binaries
+R/all_indexed.csv
+R/archive.zip
+R/bin/process
+
+# Local agent/editor state
+.swival/
+.helix/
+.envrc
+test2.R

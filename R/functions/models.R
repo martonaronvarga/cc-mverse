@@ -83,6 +83,64 @@ fit_rmanova <- function(data, spec) {
   )
 }
 
+fixed_effect_part <- function(formula) {
+  trimws(strsplit(formula, "+ (", fixed = TRUE)[[1]][[1]])
+}
+
+fallback_preserves_fixed_effects <- function(primary_formula, fallback_formula) {
+  identical(fixed_effect_part(primary_formula), fixed_effect_part(fallback_formula))
+}
+
+derive_lmm_fallback_formula <- function(formula) {
+  out <- gsub(
+    "(1 + cong * prev_cong | participant_id)",
+    "(1 + cong + prev_cong | participant_id)",
+    formula,
+    fixed = TRUE
+  )
+  if (identical(out, formula)) {
+    out <- gsub(
+      "(1 + cong + prev_cong | participant_id)",
+      "(1 | participant_id)",
+      formula,
+      fixed = TRUE
+    )
+  }
+  if (identical(out, formula)) return(NA_character_)
+  if (!fallback_preserves_fixed_effects(formula, out)) return(NA_character_)
+  out
+}
+
+fit_lmm_fallback <- function(data, spec, full_model, full_converged) {
+  needs_fallback <- !isTRUE(full_converged) || isTRUE(lme4::isSingular(full_model, tol = 1e-4))
+  fallback_formula <- spec$formula_fallback %||% derive_lmm_fallback_formula(spec$formula_full)
+  if (!needs_fallback || is.na(fallback_formula) || !fallback_preserves_fixed_effects(spec$formula_full, fallback_formula)) {
+    return(list(level = NA_character_, formula = NA_character_, p_value = NA_real_))
+  }
+
+  tryCatch({
+    fallback_model <- lmerTest::lmer(
+      as.formula(fallback_formula),
+      data = data,
+      REML = TRUE,
+      control = do.call(lme4::lmerControl, spec$control %||% list())
+    )
+    coefs <- broom.mixed::tidy(fallback_model, effects = "fixed", conf.int = FALSE)
+    cse <- coefs[coefs$term == "cong:prev_cong", , drop = FALSE]
+    list(
+      level = "reduced_random_effects",
+      formula = fallback_formula,
+      p_value = cse$p.value[1] %||% NA_real_
+    )
+  }, error = function(e) {
+    list(
+      level = "fallback_error",
+      formula = fallback_formula,
+      p_value = NA_real_
+    )
+  })
+}
+
 #' Fit linear mixed model
 fit_lmm <- function(data, spec) {
   log_pipeline(logger::DEBUG, "Fitting LMM with lme4 package")
@@ -128,6 +186,7 @@ fit_lmm <- function(data, spec) {
   null_random_effects <- broom.mixed::tidy(null_model, effects = "ran_pars")
 
   assumptions <- check_model_assumptions(full_model)
+  fallback <- fit_lmm_fallback(data, spec, full_model, full_converged)
 
 
   # Performance metrics
@@ -153,6 +212,9 @@ fit_lmm <- function(data, spec) {
     null_coefficients = null_coefs,
     random_effects = random_effects,
     null_random_effects = null_random_effects,
+    fallback_level = fallback$level,
+    fallback_formula = fallback$formula,
+    fallback_p_value = fallback$p_value,
     comparison = comparison,
     performance = performance,
     assumptions = assumptions

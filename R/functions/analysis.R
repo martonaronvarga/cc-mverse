@@ -32,13 +32,12 @@ derive_model <- function(model) {
 #'
 #' Ensures that:
 #'   - "present"          only appears with strip_method == "none"
-#'   - "null_both"        only appears with strip_method == "none"
+#'   - "null_both"        is absent
 #'   - "null_interaction"  only appears with strip_method != "none"
 allowed_combinations_filter <- function(df) {
   df %>%
     dplyr::filter(
       (effect_condition == "present" & strip_method == "none") |
-        (effect_condition == "null_both" & strip_method == "none") |
         (effect_condition == "null_interaction" & strip_method != "none")
     )
 }
@@ -49,6 +48,9 @@ allowed_combinations_filter <- function(df) {
 #' derived columns used downstream. Every subsequent function receives this
 #' prepared frame and does not re-filter.
 prepare_analysis_df <- function(results_df) {
+  if (!"fallback_level" %in% names(results_df)) results_df$fallback_level <- NA_character_
+  if (!"preservation_pass" %in% names(results_df)) results_df$preservation_pass <- NA
+  if (!"nullification_verdict" %in% names(results_df)) results_df$nullification_verdict <- NA_character_
   out <- results_df %>%
     allowed_combinations_filter() %>%
     dplyr::mutate(
@@ -56,6 +58,7 @@ prepare_analysis_df <- function(results_df) {
       converged_both = full_converged & dplyr::coalesce(null_converged, TRUE),
       is_singular = dplyr::case_when(
         error ~ NA,
+        "full_is_singular" %in% names(.) & !is.na(full_is_singular) ~ full_is_singular,
         !is.na(error_message) &
           grepl("singular", error_message, ignore.case = TRUE) ~ TRUE,
         !is.na(random_intercept_var) & random_intercept_var == 0 ~ TRUE,
@@ -66,15 +69,25 @@ prepare_analysis_df <- function(results_df) {
 
       # --- effect-type flags (mutually exclusive after allowed_combinations) ---
       is_true_effect = (effect_condition == "present"),
-      is_null_effect = (effect_condition %in% c("null_interaction", "null_both")),
+      is_null_effect = (effect_condition == "null_interaction"),
 
       # --- null sub-type: encodes the null-generation mechanism ---
       null_type = dplyr::case_when(
         effect_condition == "null_interaction" ~
           paste0("null_interaction:", strip_method),
-        effect_condition == "null_both" ~ "null_both",
         TRUE ~ NA_character_
       ),
+      rate_source = dplyr::case_when(
+        effect_condition == "null_interaction" ~ "empirical_nullification",
+        effect_condition == "present" ~ "empirical_present",
+        TRUE ~ NA_character_
+      ),
+      preservation_pass = dplyr::coalesce(preservation_pass, NA),
+      nullification_verdict = dplyr::coalesce(nullification_verdict, NA_character_),
+      has_fallback_sensitivity = !is.na(fallback_level),
+      primary_inference_only = TRUE,
+      is_interpretable_nullifier = effect_condition == "null_interaction" &
+        nullification_verdict == "interpretable_nullifier",
       model_type = derive_model(model),
       is_significant = dplyr::if_else(
         numerically_usable, main_p_value < 0.05, NA
@@ -241,10 +254,18 @@ compute_power_tables <- function(prepared_df, alpha = 0.05) {
 compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
   usable_null <- prepared_df %>%
     dplyr::filter(numerically_usable, is_null_effect) %>%
-    dplyr::mutate(sig = main_p_value < alpha)
+    dplyr::mutate(
+      sig = main_p_value < alpha,
+      interpretable_fpr_source = dplyr::coalesce(is_interpretable_nullifier, FALSE),
+      rate_label = dplyr::if_else(
+        interpretable_fpr_source,
+        "nullification-based FPR",
+        "diagnostic nullification detection rate"
+      )
+    )
 
   coarse <- usable_null %>%
-    dplyr::group_by(null_type, model_type, transformation) %>%
+    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation) %>%
     dplyr::summarise(
       n = dplyr::n(), false_positives = sum(sig),
       FPR = false_positives / n,
@@ -255,7 +276,7 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
     )
 
   medium <- usable_null %>%
-    dplyr::group_by(null_type, model_type, transformation, sample_size) %>%
+    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation, sample_size) %>%
     dplyr::summarise(
       n = dplyr::n(), false_positives = sum(sig),
       FPR = false_positives / n,
@@ -265,7 +286,7 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
     )
 
   fine <- usable_null %>%
-    dplyr::group_by(null_type, model_type, transformation, sample_size, outlier) %>%
+    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation, sample_size, outlier) %>%
     dplyr::summarise(
       n = dplyr::n(), false_positives = sum(sig),
       FPR = false_positives / n,
@@ -275,12 +296,56 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
 
   per_branch <- usable_null %>%
     dplyr::transmute(
+      rate_source, rate_label, interpretable_fpr_source,
       null_type, model_type, transformation, sample_size, subsample_id, outlier,
       significant = sig, p_value = main_p_value,
       estimate = main_estimate, std_error = main_std_error
     )
 
   list(coarse = coarse, by_sample_size = medium, by_outlier = fine, per_branch = per_branch)
+}
+
+compute_failure_aware_nullification_rates <- function(prepared_df, alpha = 0.05) {
+  null_df <- prepared_df %>%
+    dplyr::filter(is_null_effect) %>%
+    dplyr::mutate(
+      sig_primary = numerically_usable & !is.na(main_p_value) & main_p_value < alpha,
+      usable_nonsignificant = numerically_usable & !sig_primary,
+      non_converged = !error & !converged_both,
+      singular = !error & converged_both & dplyr::coalesce(is_singular, FALSE),
+      extraction_or_preprocessing_error = error,
+      other_invalid = !sig_primary & !usable_nonsignificant & !non_converged & !singular & !extraction_or_preprocessing_error,
+      interpretable_fpr_source = dplyr::coalesce(is_interpretable_nullifier, FALSE),
+      rate_label = dplyr::if_else(
+        interpretable_fpr_source,
+        "nullification-based FPR",
+        "diagnostic nullification detection rate"
+      )
+    )
+
+  group_vars <- c(
+    "rate_source", "rate_label", "interpretable_fpr_source", "null_type",
+    "model_type", "transformation", "sample_size", "outlier"
+  )
+
+  null_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::summarise(
+      n_planned = dplyr::n(),
+      significant_primary = sum(sig_primary, na.rm = TRUE),
+      usable_nonsignificant = sum(usable_nonsignificant, na.rm = TRUE),
+      singular = sum(singular, na.rm = TRUE),
+      non_converged = sum(non_converged, na.rm = TRUE),
+      extraction_or_preprocessing_error = sum(extraction_or_preprocessing_error, na.rm = TRUE),
+      other_invalid = sum(other_invalid, na.rm = TRUE),
+      unconditional_rate = significant_primary / n_planned,
+      conditional_n_usable = significant_primary + usable_nonsignificant,
+      conditional_rate = dplyr::if_else(conditional_n_usable > 0, significant_primary / conditional_n_usable, NA_real_),
+      singular_rate = singular / n_planned,
+      non_converged_rate = non_converged / n_planned,
+      error_rate = extraction_or_preprocessing_error / n_planned,
+      .groups = "drop"
+    )
 }
 
 compute_roc_metrics <- function(prepared_df, alpha = 0.05) {
@@ -771,7 +836,6 @@ create_summary_table <- function(prepared_df) {
     dplyr::mutate(
       metric_type = dplyr::case_when(
         effect_condition == "present" ~ "Power (TPR)",
-        effect_condition == "null_both" ~ "FPR (null_both)",
         effect_condition == "null_interaction" ~ paste0("FPR (", null_type, ")"),
         TRUE ~ NA_character_
       )
@@ -848,6 +912,7 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
       fpr_by_sample_size = fpr_tables$by_sample_size,
       fpr_by_outlier = fpr_tables$by_outlier,
       fpr_per_branch = fpr_tables$per_branch,
+      nullification_failure_aware_rates = compute_failure_aware_nullification_rates(prepared, alpha = alpha),
       roc_metrics = compute_roc_metrics(prepared, alpha = alpha),
       roc_metrics_by_outlier = compute_roc_metrics_by_outlier(prepared, alpha = alpha),
       by_outlier = summarise_by_factor(prepared, c("outlier", "transformation")),

@@ -8,6 +8,7 @@ use multiverse_analysis::{
     BranchConfig, EffectCondition, OutlierMethod, ProcessingResult, StripMethod, Transformation,
 };
 use polars::prelude::*;
+use polars::prelude::{CsvReadOptions, NullValues};
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -53,11 +54,11 @@ struct Args {
     outliers: String,
 
     /// Effect stripping conditions
-    #[arg(long, default_value = "null_interaction,null_both,present")]
+    #[arg(long, default_value = "null_interaction,present")]
     effect_conditions: String,
 
     /// Effect stripping methods
-    #[arg(long, default_value = "qmap_5, shuffle")]
+    #[arg(long, default_value = "additive_qmap, shuffle")]
     strip_methods: String,
 
     /// Global random seed for reproducible subsampling
@@ -245,7 +246,18 @@ fn main() -> Result<()> {
     // Load data
     tracing::info!(path = ?args.input, "Loading input data");
     let file = std::fs::File::open(&args.input).context("Failed to open CSV file")?;
-    let df = CsvReader::new(file)
+    let df = CsvReadOptions::default()
+        .with_has_header(true)
+        .with_infer_schema_length(None)
+        .map_parse_options(|opts| {
+            opts.with_null_values(Some(NullValues::AllColumns(vec![
+                "NA".into(),
+                "NaN".into(),
+                "".into(),
+            ])))
+            .with_missing_is_null(true)
+        })
+        .into_reader_with_file_handle(file)
         .finish()
         .context("Failed to read CSV into DataFrame")?;
     tracing::info!(rows = df.height(), cols = df.width(), "Data loaded");
@@ -376,14 +388,52 @@ fn parse_subsamples_per_size(spec: &Option<String>, sample_sizes: &[f64]) -> Has
 
 fn validate_dataframe(df: &DataFrame) -> Result<()> {
     let required_cols = ["rt", "participant_id", "cong", "prev_cong"];
-
     for col_name in &required_cols {
         if !df.get_columns().iter().any(|c| c.name() == *col_name) {
             return Err(anyhow::anyhow!("Missing required column: {}", col_name));
         }
     }
 
-    tracing::info!("Data validation passed");
+    let rt = df.column("rt")?.cast(&DataType::Float64)?;
+    let rt = rt.f64()?;
+    let missing_rt = rt.into_iter().filter(|v| v.is_none()).count();
+    let nonpositive_rt = rt
+        .into_iter()
+        .filter(|v| v.map(|x| !x.is_finite() || x <= 0.0).unwrap_or(false))
+        .count();
+
+    for col_name in ["cong", "prev_cong"] {
+        let s = df.column(col_name)?.cast(&DataType::String)?;
+        let invalid: Vec<String> = s
+            .str()?
+            .into_iter()
+            .flatten()
+            .filter(|v| !matches!(*v, "-1" | "1" | "-1.0" | "1.0"))
+            .take(5)
+            .map(|v| v.to_string())
+            .collect();
+        if !invalid.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Invalid +/-1 coding in {}: {}",
+                col_name,
+                invalid.join(",")
+            ));
+        }
+    }
+
+    let pid_missing = df.column("participant_id")?.null_count();
+    if pid_missing > 0 {
+        return Err(anyhow::anyhow!("participant_id contains {} missing values", pid_missing));
+    }
+
+    if missing_rt > 0 || nonpositive_rt > 0 {
+        tracing::warn!(missing_rt, nonpositive_rt, "Input RT contains rows that downstream diagnostics will treat as invalid");
+    }
+    if df.column("prev_cong")?.null_count() > 0 {
+        tracing::warn!(missing_prev_cong = df.column("prev_cong")?.null_count(), "Input contains first-trial or missing previous-congruency rows");
+    }
+
+    tracing::info!(rows = df.height(), cols = df.width(), "Data validation passed");
     Ok(())
 }
 
@@ -491,14 +541,14 @@ fn generate_configs(
                                     });
                                 }
                             }
-                            EffectCondition::Present | EffectCondition::NullBoth => {
+                            EffectCondition::Present => {
                                 configs.push(BranchConfig {
                                     sample_size,
                                     subsample_id: sub_id,
                                     transformation,
                                     outlier_method,
                                     effect_condition,
-                                    // placeholder; ignored because strip is not applied for these conditions
+                                    // placeholder; ignored because strip is not applied for present data
                                     strip_method: StripMethod::Shuffle,
                                     global_seed,
                                 });
@@ -530,12 +580,8 @@ mod cli_tests {
         let sample_sizes = vec![1.0];
         let transformations = vec![Transformation::NoLogRt];
         let outliers = vec![OutlierMethod::None];
-        let effect_conditions = vec![
-            EffectCondition::Present,
-            EffectCondition::NullInteraction,
-            EffectCondition::NullBoth,
-        ];
-        let strip_methods = vec![StripMethod::Shuffle, StripMethod::Qmap5];
+        let effect_conditions = vec![EffectCondition::Present, EffectCondition::NullInteraction];
+        let strip_methods = vec![StripMethod::Shuffle, StripMethod::AdditiveQmap];
         let subsample_map = parse_subsamples_per_size(&Some("0.1:5,1.0:1".into()), &sample_sizes);
         let seed = 42;
 
@@ -549,18 +595,37 @@ mod cli_tests {
             seed,
         );
 
-        // Expect: Present -> 1 config, NullBoth -> 1 config, NullInteraction -> 2 configs (one per strip)
-        assert_eq!(configs.len(), 1 + 1 + 2);
+        // Expect: Present -> 1 config, NullInteraction -> 2 configs (one per strip)
+        assert_eq!(configs.len(), 1 + 2);
 
-        let mut counts = (0, 0, 0); // present, null_interaction, null_both
+        let mut counts = (0, 0); // present, null_interaction
         for c in configs {
             match c.effect_condition {
                 EffectCondition::Present => counts.0 += 1,
                 EffectCondition::NullInteraction => counts.1 += 1,
-                EffectCondition::NullBoth => counts.2 += 1,
             }
         }
-        assert_eq!(counts, (1, 2, 1));
+        assert_eq!(counts, (1, 2));
+    }
+
+    #[test]
+    fn test_validate_dataframe_rejects_bad_congruency_code() {
+        let mut df = make_dummy_df();
+        df.replace("cong", Series::new("cong".into(), &["0", "1", "-1", "1"]))
+            .unwrap();
+        assert!(validate_dataframe(&df).is_err());
+    }
+
+    #[test]
+    fn test_validate_dataframe_allows_missing_prev_cong_for_first_trials() {
+        let df = df!(
+            "participant_id" => &["p1", "p1"],
+            "cong" => &["-1", "1"],
+            "prev_cong" => &[None, Some("-1")],
+            "rt" => &[500.0, 510.0]
+        )
+        .unwrap();
+        assert!(validate_dataframe(&df).is_ok());
     }
 
     #[test]

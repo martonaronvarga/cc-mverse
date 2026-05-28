@@ -41,16 +41,19 @@ fn sample_data_identity_at_1_0() {
     let df = make_df(5, 10);
     let cfg = BranchConfig {
         sample_size: 1.0,
+        subsample_id: 1,
         transformation: Transformation::NoLogRt,
         outlier_method: OutlierMethod::None,
         effect_condition: EffectCondition::Present,
         strip_method: StripMethod::Shuffle,
+        global_seed: 42,
     };
     let pipeline = BranchPipeline::new(cfg);
-    let (out_df, _res) = pipeline.process(&df).unwrap();
+    let input_n = df.height();
+    let (out_df, _res) = pipeline.process(df).unwrap();
     assert_eq!(
         out_df.height(),
-        df.height(),
+        input_n,
         "sample_size=1.0 should keep all rows"
     );
 }
@@ -60,13 +63,15 @@ fn sample_data_zero_yields_empty() {
     let df = make_df(4, 5);
     let cfg = BranchConfig {
         sample_size: 0.0,
+        subsample_id: 1,
         transformation: Transformation::NoLogRt,
         outlier_method: OutlierMethod::None,
         effect_condition: EffectCondition::Present,
         strip_method: StripMethod::Shuffle,
+        global_seed: 42,
     };
     let pipeline = BranchPipeline::new(cfg);
-    let (out_df, res) = pipeline.process(&df).unwrap();
+    let (out_df, res) = pipeline.process(df).unwrap();
     assert_eq!(
         out_df.height(),
         0,
@@ -81,13 +86,15 @@ fn sample_data_fraction_keeps_expected_participants() {
     let df = make_df(10, 10);
     let cfg = BranchConfig {
         sample_size: 0.5,
+        subsample_id: 1,
         transformation: Transformation::NoLogRt,
         outlier_method: OutlierMethod::None,
         effect_condition: EffectCondition::Present,
         strip_method: StripMethod::Shuffle,
+        global_seed: 42,
     };
     let pipeline = BranchPipeline::new(cfg);
-    let (out_df, _res) = pipeline.process(&df).unwrap();
+    let (out_df, _res) = pipeline.process(df.clone()).unwrap();
 
     // Expect approximately half the participants kept; sampling truncates after ceil(p * frac)
     let orig_pids: Vec<String> = df
