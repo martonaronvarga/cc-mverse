@@ -24,10 +24,10 @@ bid <- compose_branch_id(
   effect_condition = "null_interaction",
   strip_method = "qmap_5"
 )
-expected_bid <- "0.05__12__log_rt__sd_2.5__lmm-maximal:model__null_interaction__qmap_5"
-check("compose_branch_id formats sample and preserves model-safe separators", bid == expected_bid)
+expected_bid <- "0.05__12__log_rt__sd_2.5__lmm-maximal:model__null_interaction__additive_qmap"
+check("compose_branch_id formats sample and normalizes legacy strip names", bid == expected_bid)
 
-expected_data_id <- "0.05__12__log_rt__sd_2.5__null_interaction__qmap_5"
+expected_data_id <- "0.05__12__log_rt__sd_2.5__null_interaction__additive_qmap"
 check("data_id_from_branch_id drops model segment only", data_id_from_branch_id(bid) == expected_data_id)
 
 unsafe_model_error <- inherits(try(compose_branch_id(

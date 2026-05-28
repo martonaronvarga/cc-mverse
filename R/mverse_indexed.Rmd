@@ -276,7 +276,7 @@ write.csv(flanker_processed, "data/processed/flanker_indexed.csv", row.names = F
 ```
 
 # ===============================================================
-# 6. bind_rows
+# 6. bind_rows and primary CSE eligibility filter
 ```{r}
 flanker_processed$rt <- as.numeric(flanker_processed$rt)
 primeprobe_processed$rt <- as.numeric(primeprobe_processed$rt)
@@ -284,9 +284,167 @@ yang_processed$rt <- as.numeric(yang_processed$rt)
 zhang_processed$rt <- as.numeric(zhang_processed$rt)
 zeng_block$rt <- as.numeric(zeng_block$rt)
 
-all_indexed <- bind_rows(flanker_processed, primeprobe_processed, yang_processed, zhang_processed, zeng_block) %>%
-  mutate(source_row = row_number())
+accuracy_min_overall <- 0.70
+accuracy_min_block <- 0.70
+condition_cell_min_ratio_threshold <- 0.50
 
+as_boolish <- function(x) {
+  x_chr <- tolower(as.character(x))
+  case_when(
+    x_chr %in% c("true", "1") ~ TRUE,
+    x_chr %in% c("false", "0") ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+all_indexed_unfiltered <- bind_rows(flanker_processed, primeprobe_processed, yang_processed, zhang_processed, zeng_block) %>%
+  mutate(
+    source_row = row_number(),
+    rt = as.numeric(rt),
+    cong = as.numeric(cong),
+    prev_cong = as.numeric(prev_cong),
+    block_index = as.integer(block_index),
+    trial_index = as.numeric(trial_index),
+    correct_bool = as_boolish(correct),
+    prev_correct_bool = as_boolish(prev_correct),
+    is_practice_bool = coalesce(as_boolish(is_practice), FALSE) |
+      coalesce(tolower(as.character(name)) == "practice", FALSE)
+  )
+
+block_first_rows <- all_indexed_unfiltered %>%
+  arrange(study, participant_id, coalesce(block_index, 0L), coalesce(trial_index, source_row), source_row) %>%
+  group_by(study, participant_id, block_index) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(study, participant_id, block_index, source_row, is_first_trial_block = TRUE)
+
+all_indexed_unfiltered <- all_indexed_unfiltered %>%
+  left_join(block_first_rows, by = c("study", "participant_id", "block_index", "source_row")) %>%
+  mutate(is_first_trial_block = coalesce(is_first_trial_block, FALSE))
+
+accuracy_base <- all_indexed_unfiltered %>%
+  filter(!is_practice_bool, !is.na(correct_bool))
+
+participant_accuracy <- accuracy_base %>%
+  group_by(study, participant_id) %>%
+  summarise(
+    overall_accuracy = mean(correct_bool),
+    n_accuracy_trials = n(),
+    .groups = "drop"
+  )
+
+block_accuracy <- accuracy_base %>%
+  group_by(study, participant_id, block_index) %>%
+  summarise(
+    block_accuracy = mean(correct_bool),
+    n_block_accuracy_trials = n(),
+    .groups = "drop"
+  )
+
+block_instability <- block_accuracy %>%
+  group_by(study, participant_id) %>%
+  summarise(
+    min_block_accuracy = min(block_accuracy, na.rm = TRUE),
+    any_block_below_accuracy_threshold = any(block_accuracy < accuracy_min_block, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+participant_filters_pre_cell <- participant_accuracy %>%
+  left_join(block_instability, by = c("study", "participant_id")) %>%
+  mutate(
+    exclude_low_overall_accuracy = overall_accuracy < accuracy_min_overall,
+    exclude_unstable_block_accuracy = coalesce(any_block_below_accuracy_threshold, TRUE),
+    exclude_pre_cell = exclude_low_overall_accuracy | exclude_unstable_block_accuracy,
+    pre_cell_exclusion_reason = case_when(
+      exclude_low_overall_accuracy & exclude_unstable_block_accuracy ~ "low_overall_accuracy;unstable_block_accuracy",
+      exclude_low_overall_accuracy ~ "low_overall_accuracy",
+      exclude_unstable_block_accuracy ~ "unstable_block_accuracy",
+      TRUE ~ ""
+    )
+  )
+
+trial_filtered_pre_cell <- all_indexed_unfiltered %>%
+  left_join(
+    participant_filters_pre_cell %>% select(study, participant_id, exclude_pre_cell),
+    by = c("study", "participant_id")
+  ) %>%
+  mutate(exclude_pre_cell = coalesce(exclude_pre_cell, TRUE)) %>%
+  filter(
+    !exclude_pre_cell,
+    !is_practice_bool,
+    correct_bool,
+    prev_correct_bool,
+    !is_first_trial_block,
+    is.finite(rt),
+    rt > 0,
+    !is.na(cong),
+    !is.na(prev_cong)
+  )
+
+condition_cell_grid <- tidyr::expand_grid(
+  trial_filtered_pre_cell %>% distinct(study, participant_id),
+  cong = c(-1, 1),
+  prev_cong = c(-1, 1)
+)
+
+condition_cell_counts <- trial_filtered_pre_cell %>%
+  count(study, participant_id, cong, prev_cong, name = "cell_n") %>%
+  right_join(
+    condition_cell_grid,
+    by = c("study", "participant_id", "cong", "prev_cong")
+  ) %>%
+  mutate(cell_n = coalesce(cell_n, 0L))
+
+condition_cell_balance <- condition_cell_counts %>%
+  group_by(study, participant_id) %>%
+  summarise(
+    min_condition_cell_n = min(cell_n),
+    max_condition_cell_n = max(cell_n),
+    condition_cell_min_ratio = if_else(max_condition_cell_n > 0, min_condition_cell_n / max_condition_cell_n, 0),
+    has_complete_condition_matrix = min_condition_cell_n > 0,
+    condition_cells_balanced = has_complete_condition_matrix & condition_cell_min_ratio >= condition_cell_min_ratio_threshold,
+    .groups = "drop"
+  )
+
+participant_filter_summary <- participant_filters_pre_cell %>%
+  left_join(condition_cell_balance, by = c("study", "participant_id")) %>%
+  mutate(
+    exclude_imbalanced_condition_cells = !exclude_pre_cell & !coalesce(condition_cells_balanced, FALSE),
+    excluded = exclude_pre_cell | exclude_imbalanced_condition_cells,
+    exclusion_reason = case_when(
+      pre_cell_exclusion_reason != "" & exclude_imbalanced_condition_cells ~ paste(pre_cell_exclusion_reason, "imbalanced_condition_cells", sep = ";"),
+      pre_cell_exclusion_reason != "" ~ pre_cell_exclusion_reason,
+      exclude_imbalanced_condition_cells ~ "imbalanced_condition_cells",
+      TRUE ~ ""
+    )
+  )
+
+all_indexed <- trial_filtered_pre_cell %>%
+  left_join(
+    participant_filter_summary %>% select(study, participant_id, exclude_imbalanced_condition_cells),
+    by = c("study", "participant_id")
+  ) %>%
+  filter(!coalesce(exclude_imbalanced_condition_cells, TRUE)) %>%
+  select(-exclude_pre_cell, -exclude_imbalanced_condition_cells)
+
+trial_filter_summary <- bind_rows(
+  all_indexed_unfiltered %>% mutate(filter_stage = "unfiltered_indexed"),
+  all_indexed_unfiltered %>% filter(!is_practice_bool) %>% mutate(filter_stage = "non_practice"),
+  trial_filtered_pre_cell %>% mutate(filter_stage = "trial_filtered_pre_cell"),
+  all_indexed %>% mutate(filter_stage = "final_cse_eligible")
+) %>%
+  group_by(filter_stage, study) %>%
+  summarise(
+    n_rows = n(),
+    n_participants = n_distinct(participant_id),
+    .groups = "drop"
+  )
+
+write.csv(all_indexed_unfiltered, "data/processed/all_indexed_unfiltered.csv", row.names = FALSE)
+write.csv(block_accuracy, "data/processed/block_accuracy.csv", row.names = FALSE)
+write.csv(condition_cell_counts, "data/processed/condition_cell_counts.csv", row.names = FALSE)
+write.csv(participant_filter_summary, "data/processed/participant_filter_summary.csv", row.names = FALSE)
+write.csv(trial_filter_summary, "data/processed/trial_filter_summary.csv", row.names = FALSE)
 write.csv(all_indexed, "all_indexed.csv", row.names = FALSE)
 ```
 

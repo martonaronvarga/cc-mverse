@@ -1,12 +1,16 @@
 # R/functions/resampling_design.R - requested empirical resampling schedule
 
-build_resampling_design <- function(fractions = c(0.05, 0.10, 0.20), n_resamples = 50L) {
-  expand.grid(
-    sample_size = fractions,
-    subsample_id = seq_len(n_resamples),
-    KEEP.OUT.ATTRS = FALSE,
-    stringsAsFactors = FALSE
-  ) |>
+build_resampling_design <- function(
+    fractions = c(0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.45, 0.50, 0.65, 0.75, 0.90, 1.00),
+    n_resamples = 100L) {
+  do.call(rbind, lapply(fractions, function(fraction) {
+    n_for_fraction <- if (abs(fraction - 1.0) < 1e-6) 1L else n_resamples
+    data.frame(
+      sample_size = fraction,
+      subsample_id = seq_len(n_for_fraction),
+      stringsAsFactors = FALSE
+    )
+  })) |>
     transform(
       resampling_interpretation = "dependent_empirical_multiverse_path",
       rate_label = "empirical multiverse detection proportion",

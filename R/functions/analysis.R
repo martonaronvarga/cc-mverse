@@ -7,12 +7,13 @@
 #   3. Scales (log_rt vs no_log_rt) are never mixed.
 #   4. Null types are never pooled.
 #   5. Power and FPR are modeled separately.
-#   6. subsample_id provides genuine within-cell replication.
+#   6. subsample_id provides dependent empirical resampling paths, not
+#      independent Monte Carlo replications.
 #
-# Cell sizes with expanded design (9 sample_sizes × 5 subsamples + 1×1):
-#   Per (model, transformation, effect_condition, null_type): ~230 branches
-#   Per (model, transformation, sample_size): ~50 branches
-#   Per (model, transformation, sample_size, outlier): 5 branches
+# Cell sizes with maximal design (11 fractional sample sizes x 100 subsamples + 1x1):
+#   Per (model, transformation, effect_condition, null_type): up to 11,010 branches before usability filters
+#   Per (model, transformation, sample_size): usually 1,000 branches across outliers, 10 at full sample
+#   Per (model, transformation, sample_size, outlier): usually 100 branches, 1 at full sample
 #   Per full spec (model, transform, sample_size, outlier, subsample): 1 branch
 
 
@@ -208,7 +209,7 @@ compute_power_tables <- function(prepared_df, alpha = 0.05) {
     dplyr::filter(numerically_usable, is_true_effect) %>%
     dplyr::mutate(sig = main_p_value < alpha)
 
-  coarse <- usable_present %>% # ~ 230 branches per cell
+  coarse <- usable_present %>% # maximal design: high-count cells across sample sizes/outliers
     dplyr::group_by(model_type, transformation) %>%
     dplyr::summarise(
       n = dplyr::n(), detected = sum(sig),
@@ -220,7 +221,7 @@ compute_power_tables <- function(prepared_df, alpha = 0.05) {
       .groups = "drop"
     )
 
-  # ~50 per cell (5 subsamples × 10 outliers)
+  # Usually 100 subsamples x 10 outliers per fractional sample-size cell; full sample is deterministic.
   medium <- usable_present %>%
     dplyr::group_by(model_type, transformation, sample_size) %>%
     dplyr::summarise(

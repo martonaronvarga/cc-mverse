@@ -225,7 +225,6 @@ For **n=10,000** participants × 100 trials = 1M observations:
 
 ```bash
 # Install dependencies
-renv::restore()  # R packages
 cd rust && cargo build --release
 
 # Create test data
