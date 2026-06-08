@@ -33,14 +33,14 @@ generate_rust_script() {
     project_root <- paths\$root %||% paths\$project_root
     input_csv <- if (grepl('^/', cfg\$raw_csv)) cfg\$raw_csv else file.path(project_root, cfg\$raw_csv)
     args <- build_rust_args(cfg, paths, input_csv)
-    cat(binary, '\n')
-    cat(paste(shQuote(args), collapse = ' \\\\\\\n    '), '\n')
+    cat(shQuote(binary), '\n')
+    cat(paste(shQuote(args), collapse = '\n'), '\n')
   ")
 
   local binary
   binary=$(echo "$rust_info" | head -1)
-  local rust_args
-  rust_args=$(echo "$rust_info" | tail -n +2)
+  local rust_args_array
+  rust_args_array=$(echo "$rust_info" | tail -n +2 | sed 's/^/  /')
 
   local time_fmt
   if declare -F format_slurm_time >/dev/null 2>&1; then
@@ -83,9 +83,12 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
+rust_args=(
+${rust_args_array}
+)
+
 set +e
-/usr/bin/time -v ${binary} \\
-    ${rust_args} 2>&1 | tee ${log_dir}/rust_debug_output_\${SLURM_JOB_ID}.log
+/usr/bin/time -v ${binary} "\${rust_args[@]}" 2>&1 | tee ${log_dir}/rust_debug_output_\${SLURM_JOB_ID}.log
 status=\${PIPESTATUS[0]}
 set -e
 
