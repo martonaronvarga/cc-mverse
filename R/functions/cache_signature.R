@@ -47,9 +47,11 @@ list_processed_cache_dependency_files <- function(paths) {
     character()
   }
 
+  # Only include implementation files. Runtime resource changes in pipeline.yaml
+  # or .pipeline.resolved.yaml (worker counts, memory, time limits, logging) must
+  # not invalidate already materialized processed parquet data. Semantic analysis
+  # axes are captured separately in build_processed_cache_signature().
   normalize_existing_files(c(
-    file.path(root, "pipeline.yaml"),
-    file.path(root, ".pipeline.resolved.yaml"),
     file.path(root, "functions", "config.R"),
     file.path(root, "functions", "paths.R"),
     file.path(root, "functions", "rust_interop.R"),
@@ -71,7 +73,7 @@ build_processed_cache_signature <- function(config, paths, branch_specs, input_c
   expected_data_ids <- sort(unique(as.character(branch_specs$data_id)))
 
   payload <- list(
-    schema_version = 1L,
+    schema_version = 2L,
     processing_config = list(
       raw_csv = config$raw_csv,
       random_seed = config$random_seed,
@@ -80,13 +82,8 @@ build_processed_cache_signature <- function(config, paths, branch_specs, input_c
       transformations = as.character(config$transformations),
       outlier_methods = as.character(config$outlier_methods),
       effect_conditions = as.character(config$effect_conditions),
-      strip_methods = as.character(config$strip_methods),
-      rust_release = isTRUE(config$rust_release),
-      rust_threads = as.integer(config$rust_threads),
-      writer_threads = as.integer(config$writer_threads),
-      save_metadata = isTRUE(config$save_metadata)
+      strip_methods = as.character(config$strip_methods)
     ),
-    rust_args = build_rust_args(config, paths, input_csv),
     expected_data_ids = expected_data_ids,
     raw_input = file_manifest(input_csv, paths$root),
     dependency_files = file_manifest(list_processed_cache_dependency_files(paths), paths$root)

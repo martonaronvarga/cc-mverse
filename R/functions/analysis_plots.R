@@ -2,13 +2,12 @@
 # Multiverse Visualization
 #
 # Consumed tables (from analyze_multiverse_results):
-#   roc_metrics, power_coarse, power_by_sample_size, power_by_outlier,
 #   fpr_coarse, fpr_by_sample_size, fpr_by_outlier, branch_health,
-#   estimate_summary, spec_curve, spec_inconsistencies, summary_table,
 #   model_diagnostics, results_with_diag,
 #   by_outlier, by_sample_size, by_model,
 #   or_*  (odds-ratio tables from model_multiverse),
-#   coef_* (coefficient tables)
+#   coef_* (coefficient tables).
+# ROC/TPR helpers remain available but are omitted from the generated dashboard.
 
 # library(ggplot2)
 # library(dplyr)
@@ -32,26 +31,30 @@ suppressPackageStartupMessages({
 #' @param width Width in inches
 #' @param height Height in inches
 #' @param dpi Resolution for raster fallback
-plot_save_fallback <- function(filepath, plot, width = 10, height = 7, dpi = 300) {
+plot_save_fallback <- function(filepath, plot, width = 10, height = 7, dpi = 180) {
   filepath <- tools::file_path_sans_ext(filepath)
 
   devices <- list()
-  if (requireNamespace("svglite", quietly = TRUE)) {
-    devices$svg <- function(filename) ggplot2::ggsave(filename, plot = plot, device = svglite::svglite, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
-  }
-  devices$pdf <- function(filename) ggplot2::ggsave(filename, plot = plot, device = grDevices::pdf, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
   if (requireNamespace("ragg", quietly = TRUE)) {
     devices$png <- function(filename) ggplot2::ggsave(filename, plot = plot, device = ragg::agg_png, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
   }
+  devices$pdf <- function(filename) ggplot2::ggsave(filename, plot = plot, device = grDevices::pdf, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
+  if (requireNamespace("svglite", quietly = TRUE)) {
+    devices$svg <- function(filename) ggplot2::ggsave(filename, plot = plot, device = svglite::svglite, width = width, height = height, dpi = dpi, limitsize = FALSE, bg = "white")
+  }
 
+  saved <- character()
   for (ext in names(devices)) {
     ok <- tryCatch({ devices[[ext]](paste0(filepath, ".", ext)); TRUE }, error = function(e) FALSE)
     if (ok) {
-      if (exists("log_pipeline", mode = "function")) log_pipeline(logger::INFO, "Saved plot: {filepath}.{ext}")
-      return(invisible(filepath))
+      saved <- c(saved, paste0(filepath, ".", ext))
+      plot_log(logger::INFO, "Saved plot: {filepath}.{ext}")
+      if (ext == "png") next
+      return(invisible(saved))
     }
   }
-  if (exists("log_pipeline", mode = "function")) log_pipeline(logger::WARN, "Could not save plot in any headless-safe format: {filepath}")
+  if (length(saved) > 0) return(invisible(saved))
+  plot_log(logger::WARN, "Could not save plot in any headless-safe format: {filepath}")
   invisible(filepath)
 }
 
@@ -101,6 +104,60 @@ wrap_discrete_labels <- function(width = 22) {
   function(x) wrap_label(x, width = width)
 }
 
+plot_log <- function(level, message) {
+  if (exists("log_pipeline", mode = "function")) {
+    log_pipeline(level, message)
+  }
+  invisible(NULL)
+}
+
+primary_null_type <- function() "null_interaction:local_mean_residual"
+
+pretty_model <- function(x) {
+  dplyr::case_when(
+    x == "rmANOVA" ~ "ANOVA",
+    x == "LMM (random intercept)" ~ "RI LMM",
+    x == "LMM (random congruency slope)" ~ "Cong-slope LMM",
+    x == "LMM (full)" ~ "Full LMM",
+    TRUE ~ wrap_label(x, 20)
+  )
+}
+
+pretty_null_type <- function(x) {
+  dplyr::case_when(
+    x == "null_interaction:local_mean_residual" ~ "Mean residual",
+    x == "null_interaction:local_median_residual" ~ "Median residual",
+    x == "null_interaction:additive_qmap" ~ "Additive qmap",
+    x == "null_interaction:additive_qmap_trial_bin" ~ "Trial-bin qmap",
+    x == "null_interaction:shuffle" ~ "Shuffle",
+    is.na(x) | x == "present" ~ "Present",
+    TRUE ~ wrap_label(x, 24)
+  )
+}
+
+pretty_strip_method <- function(x) {
+  dplyr::case_when(
+    x == "local_mean_residual" ~ "Mean residual",
+    x == "local_median_residual" ~ "Median residual",
+    x == "additive_qmap" ~ "Additive qmap",
+    x == "additive_qmap_trial_bin" ~ "Trial-bin qmap",
+    x == "shuffle" ~ "Shuffle",
+    is.na(x) ~ "Present",
+    TRUE ~ wrap_label(x, 24)
+  )
+}
+
+pretty_outlier <- function(x) {
+  dplyr::case_when(
+    x == "none" ~ "None",
+    grepl("^sd_", x) ~ paste0("SD ", sub("^sd_", "", x)),
+    grepl("^mad_", x) ~ paste0("MAD ", sub("^mad_", "", x)),
+    grepl("^range_", x) ~ paste0("Range ", sub("^range_", "", x)),
+    is.na(x) ~ "None",
+    TRUE ~ wrap_label(x, 16)
+  )
+}
+
 prepare_plot_labels <- function(df) {
   if (is.null(df) || !is.data.frame(df)) return(df)
   df %>%
@@ -109,16 +166,16 @@ prepare_plot_labels <- function(df) {
         dplyr::any_of(c("model_type", "null_type", "outlier", "transformation", "strip_method")),
         as.character
       ),
-      null_type_label = if ("null_type" %in% names(.)) wrap_label(dplyr::coalesce(.data$null_type, "effect present"), 28) else NA_character_,
-      model_type_label = if ("model_type" %in% names(.)) wrap_label(.data$model_type, 22) else NA_character_,
+      null_type_label = if ("null_type" %in% names(.)) pretty_null_type(.data$null_type) else NA_character_,
+      model_type_label = if ("model_type" %in% names(.)) pretty_model(.data$model_type) else NA_character_,
       transformation_label = dplyr::case_when(
         "transformation" %in% names(.) & .data$transformation == "log_rt" ~ "log(RT)",
         "transformation" %in% names(.) & .data$transformation %in% c("no_log_rt", "raw_rt") ~ "Raw RT",
         "transformation" %in% names(.) ~ wrap_label(.data$transformation, 18),
         TRUE ~ NA_character_
       ),
-      outlier_label = if ("outlier" %in% names(.)) wrap_label(dplyr::coalesce(.data$outlier, "none"), 14) else NA_character_,
-      strip_method_label = if ("strip_method" %in% names(.)) wrap_label(.data$strip_method, 20) else NA_character_
+      outlier_label = if ("outlier" %in% names(.)) pretty_outlier(dplyr::coalesce(.data$outlier, "none")) else NA_character_,
+      strip_method_label = if ("strip_method" %in% names(.)) pretty_strip_method(.data$strip_method) else NA_character_
     )
 }
 
@@ -257,28 +314,24 @@ plot_roc_by_outlier <- function(roc_metrics) {
 #' Columns: null_type, model_type, transformation, n, false_positives, FPR
 plot_fpr_by_null_type <- function(fpr_coarse, palette = get_null_type_palette()) {
   df <- prepare_plot_labels(fpr_coarse)
-  ggplot(df, aes(x = model_type_label, y = FPR, fill = null_type)) +
-    geom_col(position = position_dodge(0.8), width = 0.7, alpha = 0.85) +
-    geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
-    geom_text(
-      aes(label = scales::percent(FPR, accuracy = 0.1)),
-      position = position_dodge(0.8), vjust = -0.5, size = 2.5
-    ) +
-    scale_fill_manual(values = palette, name = "Null Type", labels = wrap_discrete_labels(26)) +
-    scale_y_continuous(
-      limits = c(0, NA), labels = scales::percent,
-      expand = expansion(mult = c(0, 0.15))
-    ) +
-    facet_wrap(vars(transformation_label)) +
+  ggplot(df, aes(x = FPR, y = model_type_label, color = null_type_label)) +
+    geom_vline(xintercept = 0.05, linetype = "dashed", color = "#C62828", alpha = 0.7) +
+    geom_point(size = 2.8, alpha = 0.9) +
+    geom_text(aes(label = scales::percent(FPR, accuracy = 0.1)), hjust = -0.15, size = 2.4, color = "grey20") +
+    scale_color_brewer(palette = "Set2", name = "Nullifier") +
+    scale_x_continuous(labels = scales::percent, limits = c(0, NA), expand = expansion(mult = c(0.02, 0.22))) +
+    facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free_y", space = "free_y") +
     labs(
-      title = "False Positive Rate by Null Generation Method",
-      subtitle = "Red dashed line = nominal α = 0.05; bars grouped by null type",
-      x = "Model",
-      y = "False Positive Rate"
+      title = "FPR by Model and Nullifier",
+      subtitle = "Dashed line = nominal 5%; primary claim uses diagnostics-passing mean residual rows",
+      x = "False positive rate",
+      y = NULL
     ) +
-    theme_multiverse() +
-    legend_bottom_rows(2) +
-    theme(axis.text.x = element_text(angle = 20, hjust = 1, vjust = 1))
+    theme_multiverse(base_size = 10) +
+    theme(
+      legend.position = "none",
+      panel.spacing = grid::unit(1.8, "lines")
+    )
 }
 
 # ==============================================================================
@@ -287,29 +340,35 @@ plot_fpr_by_null_type <- function(fpr_coarse, palette = get_null_type_palette())
 
 #' FPR × sample size curves per model, faceted by null_type and transformation
 #' Consumes: fpr_by_sample_size
-plot_fpr_by_sample_size <- function(fpr_by_ss, palette = get_model_palette()) {
-  df <- prepare_plot_labels(fpr_by_ss)
+plot_fpr_by_sample_size <- function(
+    fpr_by_ss,
+    palette = get_model_palette(),
+    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+  df <- fpr_by_ss %>%
+    dplyr::filter(.data$null_type %in% null_types) %>%
+    prepare_plot_labels()
   ggplot(df, aes(
     x = sample_size, y = FPR, color = model_type, group = model_type
   )) +
-    geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", alpha = 0.5) +
-    geom_line(linewidth = 0.8) +
-    geom_point(size = 2.5) +
-    scale_color_manual(values = palette, name = "Model", drop = FALSE) +
-    scale_x_continuous(labels = scales::percent, breaks = seq(0.1, 1, 0.1)) +
-    scale_y_continuous(labels = scales::percent) +
-    facet_grid(
-      rows = vars(null_type_label),
-      cols = vars(transformation_label)
-    ) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828", alpha = 0.7) +
+    geom_line(linewidth = 0.75, alpha = 0.9) +
+    geom_point(size = 2.1) +
+    scale_color_manual(values = palette, name = "Model", drop = FALSE, labels = pretty_model) +
+    scale_x_continuous(labels = scales::percent, breaks = sort(unique(df$sample_size))) +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.02, 0.15))) +
+    facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free_y") +
     labs(
-      title = "False Positive Rate by Sample Size",
-      subtitle = "Red dashed line = nominal α; does FPR inflate at small N?",
-      x = "Sample Fraction",
+      title = "FPR Across Sample Sizes",
+      subtitle = "Primary no-location-CSE null plus shuffle sensitivity; dashed line = 5%",
+      x = "Sample fraction",
       y = "FPR"
     ) +
-    theme_multiverse() +
-    legend_bottom_rows(2)
+    theme_multiverse(base_size = 10) +
+    legend_bottom_rows(2) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+      panel.spacing = grid::unit(1.8, "lines")
+    )
 }
 
 # ==============================================================================
@@ -451,9 +510,7 @@ plot_effect_distributions <- function(prepared_df, palette = get_effect_palette(
 plot_pvalue_distributions <- function(prepared_df, palette = get_effect_palette()) {
   df <- prepared_df %>%
     dplyr::filter(numerically_usable) %>%
-    dplyr::mutate(
-      null_type_label = dplyr::coalesce(null_type, "effect present")
-    )
+    dplyr::mutate(null_type_label = pretty_null_type(null_type))
 
   ggplot(df, aes(x = main_p_value, fill = effect_condition)) +
     geom_histogram(bins = 20, alpha = 0.7, position = "identity", color = "white", linewidth = 0.1) +
@@ -485,7 +542,13 @@ plot_stripping_robustness <- function(fpr_by_ss) {
   df <- fpr_by_ss %>%
     dplyr::filter(grepl("^null_interaction:", null_type)) %>%
     dplyr::mutate(
-      strip_method = sub("^null_interaction:", "", null_type)
+      strip_method = sub("^null_interaction:", "", null_type),
+      strip_method_label = pretty_strip_method(strip_method),
+      transformation_label = dplyr::case_when(
+        transformation == "log_rt" ~ "log(RT)",
+        transformation %in% c("no_log_rt", "raw_rt") ~ "Raw RT",
+        TRUE ~ wrap_label(transformation, 18)
+      )
     )
 
   # Pivot to get shuffle vs additive_qmap side by side
@@ -513,25 +576,181 @@ plot_stripping_robustness <- function(fpr_by_ss) {
         labeller = labeller(transformation = get_transformation_labels())
       ) +
       labs(
-        title = "Stripping Method Robustness",
-        subtitle = "Points on diagonal → stripping method does not influence FPR",
-        x = "FPR (Additive qmap)",
-        y = "FPR (Shuffle)"
+        title = "Nullifier Pair Check",
+        subtitle = "Points on diagonal mean the two nullifiers have similar FPR",
+        x = "FPR (Additive quantile map)",
+        y = "FPR (Within-cell shuffle)"
       ) +
       theme_multiverse()
   } else {
-    # Fallback: bar chart
-    p <- ggplot(df, aes(x = strip_method, y = FPR, fill = model_type)) +
-      geom_col(position = "dodge") +
-      geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+    # Fallback: compact bar chart for any available nullifiers.
+    p <- ggplot(df, aes(x = strip_method_label, y = FPR, fill = model_type)) +
+      geom_col(position = "dodge", width = 0.72) +
+      geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828") +
       scale_fill_manual(values = get_model_palette(), name = "Model", drop = FALSE) +
       scale_y_continuous(labels = scales::percent) +
-      facet_wrap(vars(transformation)) +
-      labs(title = "FPR by Stripping Method", x = "Method", y = "FPR") +
-      theme_multiverse()
+      facet_wrap(vars(transformation_label), scales = "free_y") +
+      labs(title = "FPR by Nullifier", x = "Nullifier", y = "FPR") +
+      theme_multiverse(base_size = 10) +
+      theme(axis.text.x = element_text(angle = 25, hjust = 1, vjust = 1))
   }
 
   p
+}
+
+# ==============================================================================
+# FPR DIAGNOSTICS: OUTLIER, TRANSFORM, AND COMBINATION VIEWS
+# ==============================================================================
+
+plot_fpr_outlier_heatmap <- function(
+    fpr_by_outlier,
+    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+  df <- fpr_by_outlier %>%
+    dplyr::filter(.data$null_type %in% null_types) %>%
+    prepare_plot_labels()
+  df <- df %>%
+    dplyr::group_by(null_type_label, model_type_label, transformation_label, outlier_label) %>%
+    dplyr::summarise(
+      n = sum(n, na.rm = TRUE),
+      false_positives = sum(false_positives, na.rm = TRUE),
+      FPR = dplyr::if_else(n > 0, false_positives / n, NA_real_),
+      .groups = "drop"
+    )
+
+  ggplot(df, aes(x = model_type_label, y = outlier_label, fill = FPR)) +
+    geom_tile(color = "white", linewidth = 0.45) +
+    geom_text(aes(label = scales::percent(FPR, accuracy = 1)), size = 2.3, color = "grey12") +
+    scale_fill_gradient2(
+      low = "#2E7D32", mid = "#FFF8E1", high = "#C62828",
+      midpoint = 0.05, labels = scales::percent, name = "FPR"
+    ) +
+    facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free_y", space = "free_y") +
+    labs(
+      title = "FPR by Outlier Rule, Model, and Nullifier",
+      subtitle = "Cells pool across sample sizes; green is below nominal alpha, red is inflated",
+      x = "Model",
+      y = "Outlier rule"
+    ) +
+    theme_multiverse(base_size = 9) +
+    theme(
+      legend.position = "right",
+      axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+      panel.spacing = grid::unit(1.0, "lines")
+    )
+}
+
+plot_fpr_transform_delta <- function(
+    fpr_by_ss,
+    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+  df <- fpr_by_ss %>%
+    dplyr::filter(.data$null_type %in% null_types) %>%
+    dplyr::select(null_type, model_type, sample_size, transformation, n, false_positives, FPR) %>%
+    tidyr::pivot_wider(names_from = transformation, values_from = c(n, false_positives, FPR)) %>%
+    dplyr::filter(!is.na(FPR_log_rt), !is.na(FPR_no_log_rt)) %>%
+    dplyr::mutate(
+      delta_raw_minus_log = FPR_no_log_rt - FPR_log_rt,
+      null_type_label = pretty_null_type(null_type),
+      model_type_label = pretty_model(model_type)
+    )
+
+  ggplot(df, aes(x = sample_size, y = delta_raw_minus_log, color = model_type)) +
+    geom_hline(yintercept = 0, linewidth = 0.35, color = "grey35") +
+    geom_line(aes(group = model_type), linewidth = 0.75) +
+    geom_point(size = 2.1) +
+    scale_color_manual(values = get_model_palette(), name = "Model", drop = FALSE) +
+    scale_x_continuous(labels = scales::percent, breaks = sort(unique(df$sample_size))) +
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(vars(null_type_label), scales = "free_y") +
+    labs(
+      title = "Transformation Sensitivity of FPR",
+      subtitle = "Positive values mean Raw RT has higher FPR than log(RT)",
+      x = "Sample fraction",
+      y = "Raw RT FPR - log(RT) FPR"
+    ) +
+    theme_multiverse(base_size = 10) +
+    legend_bottom_rows(2) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1))
+}
+
+plot_fpr_extreme_combinations <- function(
+    fpr_by_outlier,
+    top_n = 18,
+    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+  df <- fpr_by_outlier %>%
+    dplyr::filter(.data$null_type %in% null_types) %>%
+    prepare_plot_labels() %>%
+    dplyr::filter(is.finite(FPR), n > 0) %>%
+    dplyr::mutate(
+      excess = FPR - 0.05,
+      combo = paste(model_type_label, transformation_label, outlier_label, scales::percent(sample_size, accuracy = 1), sep = " | ")
+    ) %>%
+    dplyr::arrange(dplyr::desc(excess), dplyr::desc(n)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(combo = forcats::fct_reorder(combo, FPR))
+
+  ggplot(df, aes(x = FPR, y = combo, color = null_type_label, size = n)) +
+    geom_vline(xintercept = 0.05, linetype = "dashed", color = "#C62828") +
+    geom_point(alpha = 0.82) +
+    scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0.02, 0.12))) +
+    scale_size_continuous(range = c(1.8, 5.0), name = "Null branches") +
+    labs(
+      title = "Most Inflated FPR Combinations",
+      subtitle = "Top combinations by FPR above nominal alpha; label = model | transform | outlier | sample",
+      x = "FPR",
+      y = NULL,
+      color = "Nullifier"
+    ) +
+    theme_multiverse(base_size = 9) +
+    legend_bottom_rows(2)
+}
+
+plot_fpr_exceedance_summary <- function(
+    fpr_by_outlier,
+    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+  base <- fpr_by_outlier %>%
+    dplyr::filter(.data$null_type %in% null_types) %>%
+    prepare_plot_labels()
+  factor_tables <- list(
+    Nullifier = base %>% dplyr::transmute(factor = null_type_label, n, false_positives),
+    Model = base %>% dplyr::transmute(factor = model_type_label, n, false_positives),
+    Transform = base %>% dplyr::transmute(factor = transformation_label, n, false_positives),
+    Outlier = base %>% dplyr::transmute(factor = outlier_label, n, false_positives),
+    Sample = base %>% dplyr::transmute(factor = scales::percent(sample_size, accuracy = 1), n, false_positives)
+  )
+
+  df <- purrr::imap_dfr(factor_tables, function(tbl, axis) {
+    tbl %>%
+      dplyr::group_by(factor) %>%
+      dplyr::summarise(
+        n = sum(n, na.rm = TRUE),
+        false_positives = sum(false_positives, na.rm = TRUE),
+        FPR = dplyr::if_else(n > 0, false_positives / n, NA_real_),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(axis = axis)
+  }) %>%
+    dplyr::filter(is.finite(FPR)) %>%
+    dplyr::group_by(axis) %>%
+    dplyr::mutate(factor = forcats::fct_reorder(factor, FPR)) %>%
+    dplyr::ungroup()
+
+  ggplot(df, aes(x = FPR, y = factor, fill = FPR)) +
+    geom_vline(xintercept = 0.05, linetype = "dashed", color = "#C62828") +
+    geom_col(width = 0.72) +
+    geom_text(aes(label = scales::percent(FPR, accuracy = 0.1)), hjust = -0.12, size = 2.7) +
+    scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.22))) +
+    scale_fill_gradient2(
+      low = "#2E7D32", mid = "#FFF8E1", high = "#C62828",
+      midpoint = 0.05, labels = scales::percent, guide = "none"
+    ) +
+    facet_wrap(vars(axis), scales = "free_y", ncol = 2) +
+    labs(
+      title = "Where FPR Inflation Comes From",
+      subtitle = "Each panel marginalizes over all other axes; red dashed line = nominal alpha = 0.05",
+      x = "Marginal FPR",
+      y = NULL
+    ) +
+    theme_multiverse(base_size = 10)
 }
 
 # ==============================================================================
@@ -612,7 +831,7 @@ plot_branch_health <- function(branch_health_df) {
         levels = c("n_usable", "n_singular", "n_nonconv_only", "n_error"),
         labels = c("Usable", "Singular", "Non-converged", "Error")
       ),
-      null_type_label = wrap_label(dplyr::coalesce(null_type, effect_condition), 28)
+      null_type_label = dplyr::if_else(is.na(null_type), effect_condition, pretty_null_type(null_type))
     )
 
   ggplot(df, aes(x = label, y = count, fill = status)) +
@@ -703,7 +922,7 @@ plot_odds_ratios <- function(analysis_list) {
   # Collect all or_* tables
   or_names <- grep("^or_", names(analysis_list), value = TRUE)
   if (length(or_names) == 0) {
-    log_pipeline(logger::WARN, "No odds ratio tables found for plotting")
+    plot_log(logger::WARN, "No odds ratio tables found for plotting")
     return(ggplot() +
       theme_void() +
       labs(title = "No OR tables available"))
@@ -876,14 +1095,7 @@ plot_nullifier_verdict_matrix <- function(prepared_df) {
   df <- prepared_df %>%
     dplyr::filter(.data$effect_condition == "null_interaction") %>%
     dplyr::mutate(
-      nullification_verdict = dplyr::coalesce(.data$nullification_verdict, "diagnostics_missing"),
-      strip_method = dplyr::recode(.data$strip_method,
-        additive_qmap_trial_bin = "qmap trial-bin",
-        local_mean_residual = "local mean",
-        local_median_residual = "local median",
-        additive_qmap = "qmap",
-        .default = .data$strip_method
-      )
+      nullification_verdict = dplyr::coalesce(.data$nullification_verdict, "diagnostics_missing")
     ) %>%
     prepare_plot_labels() %>%
     dplyr::group_by(.data$strip_method_label, .data$transformation_label, .data$outlier_label, .data$sample_size, .data$nullification_verdict) %>%
@@ -923,36 +1135,44 @@ plot_failure_composition_lollipop <- function(analysis_list) {
   if (is.null(rates) || !is.data.frame(rates) || nrow(rates) == 0L) {
     stop("nullification_failure_aware_rates is missing or empty")
   }
-  metric_cols <- intersect(
-    c("significant_prop", "usable_nonsignificant_prop", "singular_prop", "nonconverged_prop", "error_prop"),
-    names(rates)
+  count_cols <- c(
+    significant_primary = "Significant",
+    usable_nonsignificant = "Usable non-significant",
+    singular = "Singular",
+    non_converged = "Non-converged",
+    extraction_or_preprocessing_error = "Extraction/preprocessing error",
+    other_invalid = "Other invalid"
   )
-  if (length(metric_cols) == 0L) stop("No failure composition proportion columns found")
+  count_cols <- count_cols[names(count_cols) %in% names(rates)]
+  if (length(count_cols) == 0L) stop("No failure composition count columns found")
 
   rates %>%
     prepare_plot_labels() %>%
-    tidyr::pivot_longer(dplyr::all_of(metric_cols), names_to = "component", values_to = "proportion") %>%
+    tidyr::pivot_longer(dplyr::all_of(names(count_cols)), names_to = "component", values_to = "count") %>%
     dplyr::mutate(
-      component = dplyr::recode(.data$component,
-        significant_prop = "Significant",
-        usable_nonsignificant_prop = "Usable non-significant",
-        singular_prop = "Singular",
-        nonconverged_prop = "Non-converged",
-        error_prop = "Error"
-      ),
-      component = factor(.data$component, levels = c("Significant", "Usable non-significant", "Singular", "Non-converged", "Error"))
+      component = dplyr::recode(.data$component, !!!as.list(count_cols)),
+      component = factor(.data$component, levels = unname(count_cols))
+    ) %>%
+    dplyr::group_by(.data$model_type_label, .data$transformation_label, .data$component) %>%
+    dplyr::summarise(
+      count = sum(.data$count, na.rm = TRUE),
+      n_planned = sum(.data$n_planned, na.rm = TRUE),
+      proportion = dplyr::if_else(.data$n_planned > 0, .data$count / .data$n_planned, NA_real_),
+      .groups = "drop"
     ) %>%
     ggplot(aes(x = proportion, y = component, color = component)) +
-    geom_segment(aes(x = 0, xend = proportion, yend = component), linewidth = 0.8, alpha = 0.8) +
-    geom_point(size = 2.7) +
+    geom_segment(aes(x = 0, xend = proportion, yend = component), linewidth = 0.9, alpha = 0.8) +
+    geom_point(size = 2.8) +
+    geom_text(aes(label = scales::percent(proportion, accuracy = 1)), hjust = -0.15, size = 2.6, color = "grey20") +
     facet_grid(rows = vars(model_type_label), cols = vars(transformation_label)) +
-    scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+    scale_x_continuous(labels = scales::percent, limits = c(0, 1), expand = expansion(mult = c(0, 0.10))) +
     scale_color_manual(values = c(
       "Significant" = "#C62828",
       "Usable non-significant" = "#2E7D32",
       "Singular" = "#F9A825",
       "Non-converged" = "#EF6C00",
-      "Error" = "#6A1B9A"
+      "Extraction/preprocessing error" = "#6A1B9A",
+      "Other invalid" = "#78909C"
     ), guide = "none") +
     labs(
       title = "Failure-Aware Nullification Composition",
@@ -961,6 +1181,30 @@ plot_failure_composition_lollipop <- function(analysis_list) {
       y = NULL
     ) +
     theme_multiverse(base_size = 10)
+}
+
+plot_tpr_saturation_summary <- function(power_by_ss) {
+  df <- power_by_ss %>%
+    prepare_plot_labels() %>%
+    dplyr::mutate(tpr_gap = pmax(0, 1 - .data$power))
+
+  ggplot(df, aes(x = sample_size, y = power, color = model_type, group = model_type)) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "#2E7D32", alpha = 0.7) +
+    geom_line(linewidth = 0.75, alpha = 0.85) +
+    geom_point(size = 2.4, alpha = 0.9) +
+    scale_color_manual(values = get_model_palette(), name = "Model", drop = FALSE) +
+    scale_x_continuous(labels = scales::percent, breaks = sort(unique(df$sample_size))) +
+    scale_y_continuous(labels = scales::percent, limits = c(0.9, 1), breaks = seq(0.9, 1, 0.025)) +
+    facet_wrap(vars(transformation_label)) +
+    labs(
+      title = "TPR Is Saturated",
+      subtitle = "Present-branch detection is essentially 100%; interpretation should focus on FPR and failures",
+      x = "Sample fraction",
+      y = "TPR"
+    ) +
+    theme_multiverse(base_size = 10) +
+    legend_bottom_rows(2) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
 }
 
 # ==============================================================================
@@ -977,20 +1221,15 @@ generate_multiverse_dashboard <- function(
     analysis_list,
     output_dir = "outputs/figures",
     save_individual = TRUE) {
-  log_pipeline(logger::INFO, "Generating multiverse dashboard...")
+  plot_log(logger::INFO, "Generating multiverse dashboard...")
 
   if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-  # Extract tables
-  roc_metrics <- analysis_list$roc_metrics
-  roc_by_outlier <- analysis_list$roc_metrics_by_outlier
+  # Extract tables used by the FPR-focused reporting layer.
   fpr_coarse <- analysis_list$fpr_coarse
   fpr_by_ss <- analysis_list$fpr_by_sample_size
-  power_by_ss <- analysis_list$power_by_sample_size
-  power_by_out <- analysis_list$power_by_outlier
+  fpr_by_outlier <- analysis_list$fpr_by_outlier
   branch_health <- analysis_list$branch_health
-  spec_curve <- analysis_list$spec_curve
-  spec_incon <- analysis_list$spec_inconsistencies
   prepared_df <- analysis_list$results_with_diag
 
   # Build all plots, catching errors so one failure doesn't kill the dashboard
@@ -998,7 +1237,7 @@ generate_multiverse_dashboard <- function(
     tryCatch(
       expr,
       error = function(e) {
-        log_pipeline(logger::WARN, "Plot '{name}' failed: {e$message}")
+        plot_log(logger::WARN, "Plot '{name}' failed: {e$message}")
         ggplot() +
           theme_void() +
           labs(title = paste("Error:", name), subtitle = e$message)
@@ -1007,45 +1246,46 @@ generate_multiverse_dashboard <- function(
   }
 
   plots <- list(
-    roc_by_model       = safe_plot(plot_roc_by_model(roc_metrics), "roc_by_model"),
-    roc_by_outlier     = safe_plot(plot_roc_by_outlier(roc_by_outlier), "roc_by_outlier"),
     fpr_by_null_type   = safe_plot(plot_fpr_by_null_type(fpr_coarse), "fpr_by_null_type"),
     fpr_by_sample_size = safe_plot(plot_fpr_by_sample_size(fpr_by_ss), "fpr_by_sample_size"),
-    power_by_sample    = safe_plot(plot_power_by_sample_size(power_by_ss), "power_by_sample"),
-    spec_curve         = safe_plot(plot_specification_curve(spec_curve), "spec_curve"),
-    effect_dist        = safe_plot(plot_effect_distributions(prepared_df), "effect_dist"),
-    pvalue_dist        = safe_plot(plot_pvalue_distributions(prepared_df), "pvalue_dist"),
+    fpr_by_outlier     = safe_plot(plot_fpr_outlier_heatmap(fpr_by_outlier), "fpr_by_outlier"),
+    fpr_exceedance     = safe_plot(plot_fpr_exceedance_summary(fpr_by_outlier), "fpr_exceedance"),
+    fpr_transform_delta = safe_plot(plot_fpr_transform_delta(fpr_by_ss), "fpr_transform_delta"),
+    fpr_extreme_combos = safe_plot(plot_fpr_extreme_combinations(fpr_by_outlier), "fpr_extreme_combos"),
     strip_robust       = safe_plot(plot_stripping_robustness(fpr_by_ss), "strip_robust"),
-    sensitivity        = safe_plot(plot_sensitivity_heatmap(power_by_out), "sensitivity"),
+    nullifier_matrix   = safe_plot(plot_nullifier_verdict_matrix(prepared_df), "nullifier_matrix"),
+    failure_lollipop   = safe_plot(plot_failure_composition_lollipop(analysis_list), "failure_lollipop"),
     branch_health      = safe_plot(plot_branch_health(branch_health), "branch_health"),
-    signal_detection   = safe_plot(plot_signal_detection(roc_metrics), "signal_detection"),
-    odds_ratios        = safe_plot(plot_odds_ratios(analysis_list), "odds_ratios"),
-    spec_inconsistency = safe_plot(plot_spec_inconsistencies(spec_incon), "spec_inconsistency"),
-    nullifier_matrix  = safe_plot(plot_nullifier_verdict_matrix(prepared_df), "nullifier_matrix"),
-    failure_lollipop  = safe_plot(plot_failure_composition_lollipop(analysis_list), "failure_lollipop"),
-    oc_frontier       = safe_plot(plot_power_fpr_frontier(analysis_list), "oc_frontier"),
-    attenuation       = safe_plot(plot_empirical_attenuation(prepared_df), "attenuation")
+    tpr_saturated      = safe_plot(plot_tpr_saturation_summary(analysis_list$power_by_sample_size), "tpr_saturated")
   )
 
   # Save individual plots
   if (save_individual) {
     for (name in names(plots)) {
       filepath <- file.path(output_dir, name)
-      width <- if (name %in% c("spec_curve", "pvalue_dist", "signal_detection", "nullifier_matrix", "failure_lollipop", "oc_frontier", "attenuation")) 14 else 10
-      height <- if (name %in% c("spec_curve", "sensitivity", "signal_detection", "odds_ratios", "nullifier_matrix", "oc_frontier", "attenuation")) 10 else 7
+      width <- dplyr::case_when(
+        name %in% c("fpr_by_outlier", "fpr_extreme_combos", "nullifier_matrix") ~ 16,
+        name %in% c("fpr_by_sample_size", "fpr_by_null_type", "failure_lollipop", "fpr_exceedance", "tpr_saturated") ~ 14,
+        TRUE ~ 11
+      )
+      height <- dplyr::case_when(
+        name %in% c("fpr_by_outlier") ~ 10,
+        name %in% c("fpr_extreme_combos", "nullifier_matrix") ~ 9,
+        name %in% c("fpr_by_sample_size", "fpr_by_null_type", "fpr_exceedance") ~ 8,
+        TRUE ~ 7
+      )
       plot_save_fallback(filepath, plots[[name]], width = width, height = height)
     }
   }
 
   # Summary dashboard (key plots)
-  dashboard <- (plots$oc_frontier + plots$attenuation) /
-    (plots$fpr_by_null_type + plots$nullifier_matrix) /
-    (plots$branch_health + plots$effect_dist) +
+  dashboard <- (plots$fpr_by_sample_size + plots$fpr_by_null_type) /
+    (plots$fpr_exceedance + plots$fpr_extreme_combos) /
+    (plots$failure_lollipop + plots$tpr_saturated) +
     plot_annotation(
-      title = "Multiverse Analysis Summary",
+      title = "False-Positive-Rate Summary",
       subtitle = sprintf(
-        "%d ROC groupings | %d usable branches",
-        nrow(roc_metrics),
+        "%d usable branches; one compact TPR panel included only to show saturation",
         sum(prepared_df$numerically_usable, na.rm = TRUE)
       ),
       theme = theme(
@@ -1057,43 +1297,41 @@ generate_multiverse_dashboard <- function(
   plot_save_fallback(
     file.path(output_dir, "dashboard_summary"),
     dashboard,
-    width = 18, height = 16
+    width = 20, height = 22
   )
 
   # Robustness dashboard
-  robustness <- (plots$oc_frontier + plots$strip_robust) /
-    (plots$attenuation + plots$signal_detection) /
-    (plots$spec_inconsistency + plots$failure_lollipop) +
+  robustness <- (plots$fpr_by_outlier + plots$fpr_transform_delta) /
+    (plots$nullifier_matrix + plots$branch_health) +
     plot_annotation(
-      title = "Robustness & Sensitivity Analysis",
-      subtitle = "Does the conclusion depend on arbitrary analytic choices?"
+      title = "FPR Robustness and Nullifier Health",
+      subtitle = "Outlier, transform, preservation, and convergence context for FPR"
     )
 
   plot_save_fallback(
     file.path(output_dir, "dashboard_robustness"),
     robustness,
-    width = 18, height = 18
+    width = 18, height = 14
   )
 
   # Diagnostics dashboard
-  diagnostics <- (plots$branch_health + plots$pvalue_dist) /
-    (plots$failure_lollipop + plots$odds_ratios) +
+  diagnostics <- (plots$branch_health + plots$failure_lollipop) +
     plot_annotation(
       title = "Pipeline Diagnostics",
-      subtitle = "Convergence, p-value calibration, and multiverse model coefficients"
+      subtitle = "Convergence and failure composition across planned branches"
     )
 
   plot_save_fallback(
     file.path(output_dir, "dashboard_diagnostics"),
     diagnostics,
-    width = 16, height = 14
+    width = 16, height = 8
   )
 
   plots$dashboard_summary <- dashboard
   plots$dashboard_robustness <- robustness
   plots$dashboard_diagnostics <- diagnostics
 
-  log_pipeline(
+  plot_log(
     logger::INFO,
     "Dashboard generation complete: {length(plots)} plots created"
   )

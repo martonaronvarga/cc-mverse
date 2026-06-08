@@ -110,6 +110,17 @@ modes:
   hpc:
     n_workers: 300
     log_level: info
+    model_chunk_size: 50
+
+
+# ==========================================================================
+# Execution/cache policy
+# ==========================================================================
+execution:
+  # Number of model branches per dynamic targets worker task. This keeps the
+  # targets graph coarse while preserving embarrassingly parallel execution.
+  model_chunk_size: 50
+  overwrite_results: false
 
 # ==========================================================================
 # HPC / SLURM resources
@@ -119,18 +130,18 @@ slurm:
 
   rust:
     cpus: 17
-    mem_gb: 32
-    time_min: 360
+    mem_gb: 80
+    time_min: 7200
 
   controller:
     cpus: 4
-    mem_gb: 8
-    time_min: 480
+    mem_gb: 32
+    time_min: 7200
 
   worker:
     cpus: 1
-    mem_gb: 2.5
-    time_min: 120
+    mem_gb: 4
+    time_min: 7200
 
   bashrc_source: "/mnt/st04pool/users/usumusu/.bashrc"
 

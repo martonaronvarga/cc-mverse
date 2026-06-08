@@ -347,24 +347,24 @@ extract_rmanova_results <- function(model_result, branch_spec, branch_idx) {
   full_stats <- model_result$full_stats
 
   # For RMANOVA, extract the named CSE interaction instead of relying on row order.
-  if (!exists("select_rmanova_cse_row", mode = "function")) {
+  if (!exists("extract_rmanova_cse_stats", mode = "function")) {
     cse_path <- file.path("functions", "cse_term_extraction.R")
     if (!file.exists(cse_path)) cse_path <- file.path("R", "functions", "cse_term_extraction.R")
     source(cse_path)
   }
-  interaction_row <- select_rmanova_cse_row(full_stats)
+  cse_stats <- extract_rmanova_cse_stats(full_stats)
+  interaction_row <- cse_stats$row
 
-  # Extract statistics
-  f_stat <- interaction_row$F[1] %||% NA_real_
-  p_value <- interaction_row$`Pr(>F)`[1] %||% NA_real_
-  num_df <- interaction_row$`num Df`[1] %||% NA_integer_
+  # Extract statistics robustly across afex versions/correction settings.
+  f_stat <- cse_stats$f_stat
+  p_value <- cse_stats$p_value
+  num_df <- cse_stats$num_df
 
-  # Convert F-statistic to approximate LR statistic
-  # F = LR / df_full, so LR ≈ F * df
-  lr_stat <- ifelse(!is.na(f_stat), f_stat * (num_df %||% 1), NA_real_)
+  # Convert F-statistic to approximate LR statistic.
+  lr_stat <- ifelse(!is.na(f_stat), f_stat * (num_df %||% 1L), NA_real_)
 
-  # Effect size
-  eta_sq <- interaction_row$ges[1] %||% NA_real_
+  # Effect size.
+  eta_sq <- cse_stats$effect_size
 
   # Build result tibble
   tibble::tibble(
@@ -536,18 +536,34 @@ create_error_result <- function(model_result, branch_spec, branch_idx) {
 #'
 #' @return Invisibly returns results_tbl
 
-append_results <- function(results_tbl, paths, branch_id) {
-  results_dir <- get_results_path(paths)
-  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+result_path_for_branch <- function(paths, branch_id) {
+  file.path(get_results_path(paths), glue::glue("results_{branch_id}.parquet"))
+}
 
-  # Branch-specific file
-  branch_file <- file.path(results_dir, glue::glue("results_{branch_id}.parquet"))
+result_path_for_chunk <- function(paths, chunk_id) {
+  file.path(get_results_path(paths), sprintf("results_chunk_%05d.parquet", as.integer(chunk_id)))
+}
+
+write_results_parquet_atomic <- function(results_tbl, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  tmp <- tempfile(pattern = paste0(basename(path), ".tmp_"), tmpdir = dirname(path), fileext = ".parquet")
+  on.exit(unlink(tmp), add = TRUE)
+  arrow::write_parquet(results_tbl, tmp)
+  if (!file.rename(tmp, path)) {
+    file.copy(tmp, path, overwrite = TRUE)
+    unlink(tmp)
+  }
+  normalizePath(path, winslash = "/", mustWork = TRUE)
+}
+
+append_results <- function(results_tbl, paths, branch_id) {
+  branch_file <- result_path_for_branch(paths, branch_id)
 
   tryCatch(
     {
-      arrow::write_parquet(results_tbl, branch_file)
-      log_branch(logger::INFO, "Saved {length(results_tbl)} results to {branch_file}", branch_id)
-      return(normalizePath(branch_file))
+      out <- write_results_parquet_atomic(results_tbl, branch_file)
+      log_branch(logger::INFO, "Saved {nrow(results_tbl)} result row(s) to {branch_file}", branch_id)
+      return(out)
     },
     error = function(e) {
       log_branch(logger::ERROR, "Failed to save branch {branch_id}: {e$message}", branch_id)
@@ -606,20 +622,36 @@ load_results <- function(paths, validate = TRUE) {
     return(tibble::tibble())
   }
 
-  # Count branch files
-  branch_files <- list.files(results_dir, pattern = "^results_.*\\.parquet$")
+  # Count result files explicitly. Do not open the directory wholesale because
+  # hidden schema anchors and stale branch-level files can otherwise be mixed in.
+  chunk_files <- list.files(
+    results_dir,
+    pattern = "^results_chunk_[0-9]+\\.parquet$",
+    full.names = TRUE
+  )
+  branch_files <- list.files(
+    results_dir,
+    pattern = "^results_[^/]+\\.parquet$",
+    full.names = TRUE
+  )
+  branch_files <- branch_files[!grepl("^results_chunk_", basename(branch_files))]
 
-  if (length(branch_files) == 0) {
+  # Prefer chunk files if present. This prevents duplicate aggregation when a
+  # repository contains stale branch-level outputs from the old tar_map design.
+  result_files <- if (length(chunk_files) > 0L) chunk_files else branch_files
+  result_files <- result_files[basename(result_files) != ".schema.parquet"]
+
+  if (length(result_files) == 0) {
     log_pipeline(logger::WARN, "No result files found in {results_dir}")
     return(tibble::tibble())
   }
 
   tryCatch(
     {
-      ds <- arrow::open_dataset(results_dir, format = "parquet")
+      ds <- arrow::open_dataset(result_files, format = "parquet")
       results <- ds %>% dplyr::collect()
 
-      log_pipeline(logger::INFO, "Aggregated {nrow(results)} rows from {length(list.files(results_dir))} branch files")
+      log_pipeline(logger::INFO, "Aggregated {nrow(results)} rows from {length(result_files)} result file(s)")
 
       if (validate) {
         missing <- setdiff(RESULTS_COLUMNS, names(results))
@@ -718,18 +750,59 @@ empty_tibble_from_schema <- function(schema) {
 #'
 #' @return Result tibble (1 row)
 #'
-fit_and_save_branch <- function(
+branch_spec_from_row <- function(b) {
+  list(
+    idx = b$idx[[1]],
+    branch_id = b$branch_id[[1]],
+    sample_size = b$sample_size[[1]],
+    subsample_id = b$subsample_id[[1]],
+    transformation = b$transformation[[1]],
+    outlier = b$outlier[[1]],
+    model = b$model[[1]],
+    effect_condition = b$effect_condition[[1]],
+    strip_method = b$strip_method[[1]]
+  )
+}
+
+fit_branch_result_from_data <- function(data, branch_spec, config) {
+  idx <- branch_spec$idx
+  branch_id <- branch_spec$branch_id
+
+  tryCatch(
+    {
+      model_spec <- get_model_spec(config, branch_spec$model)
+      model_result <- fit_model(
+        data = data,
+        model_spec = model_spec,
+        model_name = branch_spec$model,
+        branch_id = branch_id
+      )
+
+      results_tbl <- extract_results(model_result, branch_spec, idx)
+
+      log_branch(
+        logger::INFO,
+        "DONE branch {idx}: p={results_tbl$main_p_value}, converged={results_tbl$full_converged}",
+        branch_id
+      )
+
+      results_tbl
+    },
+    error = function(e) {
+      log_branch(logger::ERROR, "FAILED branch {idx}: {e$message}", branch_id)
+      create_error_result(list(error = TRUE, message = e$message), branch_spec, idx)
+    }
+  )
+}
+
+fit_branch_result <- function(
     idx,
     branch_id, sample_size, subsample_id,
     transformation, outlier, model, effect_condition,
     strip_method, paths, config) {
-  # Ensure logging is active on this worker (idempotent — no-ops if already set up)
   setup_logging(log_level = config$log_level, log_dir = paths$logs)
   log_branch(logger::INFO, "START branch {idx}: {branch_id}", branch_id)
 
-  model_result <- NULL
-  results_tbl <- NULL
-  # Reconstruct branch_spec as a list for backwards compatibility
   branch_spec <- list(
     idx = idx,
     branch_id = branch_id,
@@ -741,9 +814,9 @@ fit_and_save_branch <- function(
     effect_condition = effect_condition,
     strip_method = strip_method
   )
+
   tryCatch(
     {
-      # Load processed data
       data_id <- data_id_from_branch_id(branch_id)
       data_file <- get_processed_data_path(paths, data_id)
 
@@ -754,42 +827,104 @@ fit_and_save_branch <- function(
 
       data <- safe_read_parquet(data_file)
       log_branch(logger::DEBUG, "Loaded {nrow(data)} observations", branch_id)
-
-      # Get model specification
-      model_spec <- get_model_spec(config, model)
-
-      # Fit model
-      model_result <- fit_model(
-        data = data,
-        model_spec = model_spec,
-        model_name = model,
-        branch_id = branch_id
-      )
-
-      # Extract results
-      results_tbl <- extract_results(model_result, branch_spec, idx)
-
-      # Save atomically to parquet
-      output_path <- append_results(
-        results_tbl,
-        paths,
-        branch_id
-      )
-
-      log_branch(
-        logger::INFO,
-        "DONE branch {idx}: p={results_tbl$main_p_value}, converged={results_tbl$full_converged}",
-        branch_id
-      )
-
-      return(output_path)
+      fit_branch_result_from_data(data, branch_spec, config)
     },
     error = function(e) {
       log_branch(logger::ERROR, "FAILED branch {idx}: {e$message}", branch_id)
-      error_result <- list(error = TRUE, message = e$message)
-      error_tbl <- create_error_result(error_result, branch_spec, idx)
-      output_path <- append_results(error_tbl, paths, branch_id)
-      return(output_path)
+      create_error_result(list(error = TRUE, message = e$message), branch_spec, idx)
     }
   )
+}
+
+fit_and_save_branch <- function(
+    idx,
+    branch_id, sample_size, subsample_id,
+    transformation, outlier, model, effect_condition,
+    strip_method, paths, config) {
+  output_path <- result_path_for_branch(paths, branch_id)
+  if (file.exists(output_path) && !isTRUE(config$overwrite_results)) {
+    log_branch(logger::INFO, "SKIP existing branch result: {output_path}", branch_id)
+    return(normalizePath(output_path, winslash = "/", mustWork = TRUE))
+  }
+
+  results_tbl <- fit_branch_result(
+    idx = idx,
+    branch_id = branch_id,
+    sample_size = sample_size,
+    subsample_id = subsample_id,
+    transformation = transformation,
+    outlier = outlier,
+    model = model,
+    effect_condition = effect_condition,
+    strip_method = strip_method,
+    paths = paths,
+    config = config
+  )
+
+  append_results(results_tbl, paths, branch_id)
+}
+
+fit_and_save_branch_chunk <- function(branch_chunk, paths, config) {
+  if (!is.data.frame(branch_chunk) || nrow(branch_chunk) == 0L) {
+    stop("branch_chunk must be a non-empty data frame")
+  }
+
+  chunk_id <- unique(branch_chunk$chunk_id)
+  if (length(chunk_id) != 1L || is.na(chunk_id)) {
+    stop("branch_chunk must contain exactly one non-missing chunk_id")
+  }
+  chunk_id <- as.integer(chunk_id)
+  output_path <- result_path_for_chunk(paths, chunk_id)
+
+  if (file.exists(output_path) && !isTRUE(config$overwrite_results)) {
+    log_pipeline(logger::INFO, "Skipping existing model chunk {chunk_id}: {output_path}")
+    return(normalizePath(output_path, winslash = "/", mustWork = TRUE))
+  }
+
+  setup_logging(log_level = config$log_level, log_dir = paths$logs)
+  log_pipeline(logger::INFO, "START model chunk {chunk_id}: {nrow(branch_chunk)} branches")
+
+  # Minimize filesystem pressure: a chunk commonly contains multiple model
+  # branches for the same processed data_id. Read each parquet once, then fit
+  # all branch/model variants that share it.
+  if (!"data_id" %in% names(branch_chunk)) {
+    branch_chunk$data_id <- vapply(branch_chunk$branch_id, data_id_from_branch_id, character(1))
+  }
+
+  rows <- list()
+  data_groups <- split(branch_chunk, branch_chunk$data_id)
+  for (data_id in names(data_groups)) {
+    data_file <- get_processed_data_path(paths, data_id)
+    if (!file.exists(data_file)) {
+      log_pipeline(logger::ERROR, "Processed data not found for chunk {chunk_id}: {data_file}")
+      missing_rows <- lapply(seq_len(nrow(data_groups[[data_id]])), function(i) {
+        b <- data_groups[[data_id]][i, , drop = FALSE]
+        spec <- branch_spec_from_row(b)
+        create_error_result(list(error = TRUE, message = "Missing processed data"), spec, spec$idx)
+      })
+      rows <- c(rows, missing_rows)
+      next
+    }
+
+    data <- safe_read_parquet(data_file)
+    log_pipeline(
+      logger::DEBUG,
+      "Chunk {chunk_id}: loaded {nrow(data)} observations for data_id={data_id} ({nrow(data_groups[[data_id]])} model branch(es))"
+    )
+
+    group_rows <- lapply(seq_len(nrow(data_groups[[data_id]])), function(i) {
+      b <- data_groups[[data_id]][i, , drop = FALSE]
+      spec <- branch_spec_from_row(b)
+      log_branch(logger::INFO, "START branch {spec$idx}: {spec$branch_id}", spec$branch_id)
+      fit_branch_result_from_data(data, spec, config)
+    })
+    rows <- c(rows, group_rows)
+  }
+
+  results_tbl <- dplyr::bind_rows(rows) %>%
+    dplyr::select(dplyr::all_of(RESULTS_COLUMNS))
+
+  out <- write_results_parquet_atomic(results_tbl, output_path)
+  log_pipeline(logger::INFO, "DONE model chunk {chunk_id}: wrote {nrow(results_tbl)} rows to {out}")
+  out
 }

@@ -5,6 +5,7 @@ scripts <- c(
   "R/bin/test_random_effect_extraction.R",
   "R/bin/test_lmm_diagnostics.R",
   "R/bin/test_branch_validation.R",
+  "R/bin/test_branch_chunk_order.R",
   "R/bin/test_cse_definition_comparison.R",
   "R/bin/test_data_validation.R",
   "R/bin/test_id_path_helpers.R",

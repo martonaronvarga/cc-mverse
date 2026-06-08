@@ -854,12 +854,20 @@ create_summary_table <- function(prepared_df) {
 #'
 #' @return List containing multiple analysis tables
 #'
-analyze_multiverse_results <- function(results_df, alpha = 0.05) {
+analyze_multiverse_results <- function(results_df, diagnostics_df = NULL, alpha = 0.05) {
   log_pipeline(
     logger::INFO,
     "Performing multiverse analysis on {nrow(results_df)} branches"
   )
 
+  if (!is.null(diagnostics_df)) {
+    if (!exists("join_nullification_diagnostics", mode = "function")) {
+      oc_path <- file.path("functions", "nullification_operating_characteristics.R")
+      if (!file.exists(oc_path)) oc_path <- file.path("R", "functions", "nullification_operating_characteristics.R")
+      source(oc_path)
+    }
+    results_df <- join_nullification_diagnostics(results_df, diagnostics_df)
+  }
   prepared <- prepare_analysis_df(results_df)
   power_tables <- compute_power_tables(prepared, alpha = alpha)
   fpr_tables <- compute_fpr_tables(prepared, alpha = alpha)
@@ -943,14 +951,18 @@ analyze_multiverse_results <- function(results_df, alpha = 0.05) {
 #'
 #' @return List of written file paths
 #'
-analyze_and_save <- function(results_df, paths, alpha = 0.05) {
+analyze_and_save <- function(results_df, paths, diagnostics_csv = NULL, alpha = 0.05) {
   log_pipeline(logger::INFO, "Saving multiverse analysis results...")
 
   if (!dir.exists(paths$outputs_analysis)) {
     dir.create(paths$outputs_analysis, recursive = TRUE, showWarnings = FALSE)
   }
 
-  analyses <- analyze_multiverse_results(results_df, alpha = alpha)
+  diagnostics_df <- NULL
+  if (!is.null(diagnostics_csv)) {
+    diagnostics_df <- readr::read_csv(diagnostics_csv, show_col_types = FALSE)
+  }
+  analyses <- analyze_multiverse_results(results_df, diagnostics_df = diagnostics_df, alpha = alpha)
   output_files <- list()
 
   for (name in names(analyses)) {

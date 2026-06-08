@@ -47,6 +47,10 @@ load_config <- function(mode = "local",
     # Logging
     log_level = raw$logging$level %||% "info",
 
+    # Execution/cache policy
+    model_chunk_size = raw$execution$model_chunk_size %||% 50L,
+    overwrite_results = isTRUE(raw$execution$overwrite_results %||% FALSE),
+
     # Workers (will be overridden by mode)
     n_workers = 4L
   )
@@ -70,6 +74,7 @@ load_config <- function(mode = "local",
   config$sample_sizes <- as.numeric(config$sample_sizes)
   config$n_subsamples <- as.integer(config$n_subsamples)
   config$n_workers <- as.integer(config$n_workers)
+  config$model_chunk_size <- as.integer(config$model_chunk_size %||% 50L)
   config$n_participants <- as.integer(config$n_participants)
   config$n_trials <- as.integer(config$n_trials)
 
@@ -129,6 +134,7 @@ validate_config <- function(config) {
     "n_participants >= 1" = config$n_participants >= 1,
     "n_trials >= 1" = config$n_trials >= 1,
     "n_workers >= 1" = config$n_workers >= 1,
+    "model_chunk_size >= 1" = config$model_chunk_size >= 1,
     "sample_sizes non-empty" = length(config$sample_sizes) > 0,
     "models non-empty" = length(config$models) > 0
   )
@@ -389,9 +395,10 @@ create_crew_controller <- function(config, paths) {
       name = "multiverse_slurm",
       workers = config$n_workers,
 
-      # Timeout and lifecycle
-      seconds_idle = 300,
-      seconds_timeout = 3600,
+      # Retire idle workers quickly after targets finishes dispatching chunks.
+      # Long model chunks are protected by seconds_timeout, not idle time.
+      seconds_idle = 120,
+      seconds_timeout = as.integer(worker$time_min * 60),
 
       # SLURM resource allocation
       options_cluster = crew.cluster::crew_options_slurm(
@@ -415,8 +422,8 @@ create_crew_controller <- function(config, paths) {
     crew::crew_controller_local(
       name = "multiverse_local",
       workers = config$n_workers,
-      seconds_idle = 60,
-      seconds_timeout = 3600,
+      seconds_idle = 300,
+      seconds_timeout = 5 * 24 * 60 * 60,
       options_local = crew::crew_options_local(
         log_directory = paths$logs,
         log_join = FALSE

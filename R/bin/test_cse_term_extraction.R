@@ -26,11 +26,13 @@ coefs_reversed <- data.frame(
 check("accepts reversed interaction order", select_cse_coefficient_row(coefs_reversed)$estimate == 4)
 
 coefs_factor <- data.frame(
-  term = c("cong1:prev_cong1", "congruency:prev_cong", "cong:previous_cong"),
-  estimate = c(5, 200, 300),
+  term = c("cong1:prev_cong1", "congpositive:prev_congpositive", "congruency:prev_cong", "cong:previous_cong"),
+  estimate = c(5, 6, 200, 300),
   stringsAsFactors = FALSE
 )
-check("accepts factor-expanded CSE term names only", select_cse_coefficient_row(coefs_factor)$estimate == 5)
+check("accepts numeric factor-expanded CSE term names only", select_cse_coefficient_row(coefs_factor[1, ])$estimate == 5)
+check("accepts level factor-expanded CSE term names only", select_cse_coefficient_row(coefs_factor[2, ])$estimate == 6)
+check("rejects unrelated prefix matches", nrow(select_cse_coefficient_row(coefs_factor[3:4, ])) == 0L)
 
 coefs_absent <- data.frame(term = c("cong", "prev_cong", "cong:trial_index"), estimate = 1:3)
 check("returns zero rows when CSE interaction absent", nrow(select_cse_coefficient_row(coefs_absent)) == 0L)

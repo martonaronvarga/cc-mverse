@@ -1,27 +1,34 @@
-// src/bin/process.rs - CLI for batch processing
-// R config is the single source of truth; this CLI accepts R-generated arguments.
+// src/bin/process.rs - high-throughput CLI for Rust preprocessing.
+//
+// The important unit of work is a base sample: (sample_size, subsample_id).
+// A base sample is processed once, then branch variants are derived from it in
+// the order: sample -> effect/nullification -> outlier filter -> transformation.
+// This avoids recomputing expensive nullification for every final branch and
+// bounds live memory to one base sample plus a bounded number of outlier tasks.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use crossbeam_channel::{bounded};
 use multiverse_analysis::{
-    BranchConfig, EffectCondition, OutlierMethod, ProcessingResult, StripMethod, Transformation,
+    BranchConfig, BranchPipeline, EffectCondition, OutlierMethod, ProcessingResult, StripMethod,
+    Transformation,
 };
-use polars::prelude::*;
 use polars::prelude::{CsvReadOptions, NullValues};
+use polars::prelude::*;
 use rayon::prelude::*;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing_subscriber::EnvFilter;
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 #[command(
     name = "process",
-    about = "Batch process RT data across all analysis branches",
-    long_about = "Processes reaction time data applying all combinations of transformations,\
-                outlier methods, effect conditions and sample sizes in parallel."
+    about = "Batch process RT data across analysis branches",
+    long_about = "Processes reaction-time data by sharding over base samples. Within each base sample,\
+                  the pipeline is sample -> effect/nullification -> outlier -> transformation."
 )]
 struct Args {
     /// Input CSV file path
@@ -37,8 +44,7 @@ struct Args {
     sample_sizes: String,
 
     /// Subsamples per size: "fraction:count" pairs (comma-separated).
-    /// E.g. "0.1:5,0.2:5,...,1.0:1"
-    /// If not provided, defaults to 1 subsample per size.
+    /// E.g. "0.1:5,0.2:5,...,1.0:1". If absent, defaults to 1 per size.
     #[arg(long)]
     subsamples_per_size: Option<String>,
 
@@ -53,12 +59,12 @@ struct Args {
     )]
     outliers: String,
 
-    /// Effect stripping conditions
+    /// Effect conditions (comma-separated)
     #[arg(long, default_value = "null_interaction,present")]
     effect_conditions: String,
 
-    /// Effect stripping methods
-    #[arg(long, default_value = "additive_qmap, shuffle")]
+    /// Effect stripping methods for null_interaction (comma-separated)
+    #[arg(long, default_value = "additive_qmap,shuffle")]
     strip_methods: String,
 
     /// Global random seed for reproducible subsampling
@@ -69,120 +75,61 @@ struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Number of threads (0 = auto)
+    /// Number of Rayon worker threads (0 = auto)
     #[arg(long, default_value = "0")]
     threads: usize,
 
+    /// Backward-compatible option. DataFrames are no longer queued to writer threads.
+    /// Writes happen inline in the task that owns the output DataFrame.
     #[arg(long, default_value = "0")]
-    writer_threads:usize,
+    writer_threads: usize,
 
-    /// Save processing metadata
+    /// Process this zero-based shard id. Use with SLURM_ARRAY_TASK_ID.
+    #[arg(long)]
+    task_id: Option<usize>,
+
+    /// Number of array shards. With --task-id and --task-count, this process runs
+    /// base tasks whose task_id % task_count == task_id. Without --task-count,
+    /// --task-id selects exactly one base task.
+    #[arg(long)]
+    task_count: Option<usize>,
+
+    /// Optional output path for the internally generated base-task manifest.
+    #[arg(long)]
+    write_task_manifest: Option<PathBuf>,
+
+    /// Rewrite existing processed__*.parquet files instead of skipping them.
+    #[arg(long)]
+    overwrite: bool,
+
+    /// Save processing metadata. Array tasks write metadata__task_<id>.json.
     #[arg(long)]
     save_metadata: bool,
 }
 
-struct WriteTask {
-    path: PathBuf,
-    df: DataFrame,
-    result: ProcessingResult,
+#[derive(Debug, Clone, Copy)]
+struct BaseTask {
+    task_id: usize,
+    sample_size: f64,
+    subsample_id: u32,
 }
 
-/// Spawn a pool of writer threads that drain the channel in parallel.
-/// Each thread independently receives tasks and writes parquet files.
-/// Returns join handles for all writer threads.
-fn spawn_writer_pool(
-    n_writers: usize,
-    rx: crossbeam_channel::Receiver<WriteTask>,
-    metadata: Option<Arc<Mutex<Vec<ProcessingResult>>>>,
-) -> Vec<thread::JoinHandle<()>> {
-    (0..n_writers)
-        .map(|id| {
-            let rx = rx.clone();
-            let metadata = metadata.clone();
+#[derive(Debug, Clone, Copy)]
+struct EffectVariant {
+    condition: EffectCondition,
+    strip_method: StripMethod,
+}
 
-            thread::Builder::new()
-                .name(format!("writer-{}", id))
-                .spawn(move || {
-                    // Each writer loops, pulling tasks from the shared channel.
-                    // crossbeam Receiver is multi-consumer safe — tasks are
-                    // distributed across writers automatically.
-                    while let Ok(task) = rx.recv() {
-                        let WriteTask {
-                            path,
-                            mut df,
-                            result,
-                        } = task;
-
-                        let tmp_path = path.with_extension("parquet.tmp");
-
-                        let write_res: Result<()> = (|| {
-                            let tmp_file =
-                                std::fs::File::create(&tmp_path).with_context(|| {
-                                    format!(
-                                        "Failed to create temp file: {}",
-                                        tmp_path.display()
-                                    )
-                                })?;
-
-                            ParquetWriter::new(tmp_file)
-                                .with_compression(ParquetCompression::Snappy)
-                                .with_row_group_size(Some(64 * 1024))
-                                .finish(&mut df)
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to write parquet: {}",
-                                        path.display()
-                                    )
-                                })?;
-
-                            std::fs::rename(&tmp_path, &path).with_context(|| {
-                                format!(
-                                    "Failed to rename {} -> {}",
-                                    tmp_path.display(),
-                                    path.display()
-                                )
-                            })?;
-
-                            Ok(())
-                        })();
-
-                        match write_res {
-                            Ok(()) => {
-                                tracing::info!(
-                                    writer = id,
-                                    path = ?path,
-                                    data_id = result.data_id,
-                                    rows = result.n_rows_output,
-                                    "Saved branch result"
-                                );
-
-                                if let Some(ref meta) = metadata {
-                                    meta.lock().unwrap().push(result);
-                                }
-                            }
-                            Err(e) => {
-                                let _ = std::fs::remove_file(&tmp_path);
-                                tracing::warn!(
-                                    writer = id,
-                                    data_id = result.data_id,
-                                    error = ?e,
-                                    "Failed to write parquet"
-                                );
-                            }
-                        }
-                    }
-
-                    tracing::debug!(writer = id, "Writer thread exiting");
-                })
-                .expect("Failed to spawn writer thread")
-        })
-        .collect()
+struct Axes {
+    transformations: Vec<Transformation>,
+    outlier_methods: Vec<OutlierMethod>,
+    effect_variants: Vec<EffectVariant>,
+    seed: u64,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
@@ -190,9 +137,6 @@ fn main() -> Result<()> {
         .with_target(true)
         .with_thread_ids(true)
         .init();
-
-    tracing::info!("Multiverse analysis processor starting");
-    tracing::info!(input = ?args.input, output_dir = ?args.output_dir, "Configuration");
 
     let num_threads = if args.threads > 0 {
         args.threads
@@ -202,48 +146,83 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| num_cpus::get())
     };
 
-    // Writer threads: default to num_threads/4 (clamped to 2..=8).
-    // Writing is I/O bound; a few threads saturate disk bandwidth.
-    let num_writers = if args.writer_threads > 0 {
-        args.writer_threads
-    } else {
-        (num_threads / 4).clamp(2, 8)
-    };
-
-    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB per thread
+    if args.writer_threads > 0 {
+        tracing::warn!(
+            writer_threads = args.writer_threads,
+            "writer_threads is ignored; queued DataFrame writing was removed to bound memory"
+        );
+    }
 
     let branch_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
-        .stack_size(STACK_SIZE)
-        .thread_name(|idx| format!("mv-branch-{}", idx))
+        .thread_name(|idx| format!("mv-task-{}", idx))
         .build()
-        .context("Failed to build branch thread pool")?;
+        .context("Failed to build Rayon thread pool")?;
 
     tracing::info!(
+        input = ?args.input,
+        output_dir = ?args.output_dir,
         threads = num_threads,
-        stack_mb = STACK_SIZE / (1024 * 1024),
-        "Branch thread pool initialized (dedicated, not global)"
+        "Multiverse Rust processor starting"
     );
 
-    // Parse arguments
-    let sample_sizes: Vec<f64> = parse_csv_floats(&args.sample_sizes)?;
-    let transformations: Vec<Transformation> = parse_csv_enums(&args.transformations)?;
-    let outlier_methods: Vec<OutlierMethod> = parse_outlier_methods(&args.outliers)?;
-    let effect_conditions: Vec<EffectCondition> = parse_effect_conditions(&args.effect_conditions)?;
-    let strip_methods: Vec<StripMethod> = parse_strip_methods(&args.strip_methods)?;
+    let sample_sizes = parse_csv_floats(&args.sample_sizes)?;
+    let transformations = parse_csv_enums(&args.transformations)?;
+    let outlier_methods = parse_outlier_methods(&args.outliers)?;
+    let effect_conditions = parse_effect_conditions(&args.effect_conditions)?;
+    let strip_methods = parse_strip_methods(&args.strip_methods)?;
     let subsample_map = parse_subsamples_per_size(&args.subsamples_per_size, &sample_sizes);
 
+    let base_tasks = generate_base_tasks(&sample_sizes, &subsample_map);
+    if let Some(path) = &args.write_task_manifest {
+        write_task_manifest(path, &base_tasks)?;
+    }
+
+    let tasks_to_run: Vec<BaseTask> = match (args.task_id, args.task_count) {
+        (Some(task_id), Some(task_count)) => {
+            if task_count == 0 {
+                return Err(anyhow!("--task-count must be positive"));
+            }
+            if task_id >= task_count {
+                return Err(anyhow!(
+                    "task_id {} must be smaller than task_count {}",
+                    task_id,
+                    task_count
+                ));
+            }
+            base_tasks
+                .iter()
+                .copied()
+                .filter(|task| task.task_id % task_count == task_id)
+                .collect()
+        }
+        (Some(task_id), None) => vec![*base_tasks
+            .get(task_id)
+            .ok_or_else(|| anyhow!("task_id {} out of range 0..{}", task_id, base_tasks.len()))?],
+        (None, Some(_)) => {
+            return Err(anyhow!("--task-count requires --task-id"));
+        }
+        (None, None) => base_tasks.clone(),
+    };
+
+    let axes = Axes {
+        transformations,
+        outlier_methods,
+        effect_variants: generate_effect_variants(&effect_conditions, &strip_methods),
+        seed: args.seed,
+    };
+
     tracing::info!(
-        sample_sizes = ?sample_sizes,
-        subsample_map = ?subsample_map,
-        transformations = ?transformations,
-        outlier_methods = ?outlier_methods,
-        effect_conditions = ?effect_conditions,
-        strip_methods = ?strip_methods,
-        "Parsed configurations"
+        total_base_tasks = base_tasks.len(),
+        running_base_tasks = tasks_to_run.len(),
+        task_id = ?args.task_id,
+        task_count = ?args.task_count,
+        transformations = axes.transformations.len(),
+        outlier_methods = axes.outlier_methods.len(),
+        effect_variants = axes.effect_variants.len(),
+        "Generated task grid"
     );
 
-    // Load data
     tracing::info!(path = ?args.input, "Loading input data");
     let file = std::fs::File::open(&args.input).context("Failed to open CSV file")?;
     let df = CsvReadOptions::default()
@@ -260,125 +239,354 @@ fn main() -> Result<()> {
         .into_reader_with_file_handle(file)
         .finish()
         .context("Failed to read CSV into DataFrame")?;
-    tracing::info!(rows = df.height(), cols = df.width(), "Data loaded");
 
     validate_dataframe(&df)?;
+    let df = normalize_all(&df)?;
+    tracing::info!(rows = df.height(), cols = df.width(), "Data loaded and normalized");
+
     std::fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
 
-    // Generate all branch configurations
-    let configs = generate_configs(
-        sample_sizes,
-        &subsample_map,
-        transformations,
-        outlier_methods,
-        effect_conditions,
-        strip_methods,
-        args.seed,
-    );
-    tracing::info!(
-        n_branches = configs.len(),
-        "Generated branch configurations"
-    );
-
-    // Optional metadata collector
-    let metadata: Option<Arc<Mutex<Vec<ProcessingResult>>>> = if args.save_metadata {
-        Some(Arc::new(Mutex::new(Vec::with_capacity(configs.len()))))
-    } else {
-        None
-    };
-
-    // Bounded channel: backpressure kicks in when writers fall behind.
-    // Buffer = 2× writer count so producers don't stall immediately but
-    // also don't queue unbounded memory.
-    let (tx, rx) = bounded::<WriteTask>(num_writers * 2);
-    let output_dir = args.output_dir.clone();
-
-     // Spawn the writer pool BEFORE processing starts
-    let writer_handles = spawn_writer_pool(num_writers, rx, metadata.clone());
-    tracing::info!(
-        writers = writer_handles.len(),
-        buffer = num_writers * 2,
-        "Writer pool started"
-    );
-   
-    let df = normalize_all(&df)?;
-    let output_dir = output_dir.clone();
-
-    branch_pool.install(|| {
-        configs.par_iter().for_each(|cfg| {
-            let df_ref = df.clone();
-            let pipeline = multiverse_analysis::BranchPipeline::new(*cfg);
-
-            match pipeline.process(df_ref) {
-                Ok((processed_df, result)) => {
-                    if result.n_rows_output == 0 {
-                        tracing::warn!(
-                            data_id = result.data_id,
-                            "Skipping write: branch produced zero rows"
-                        );
-                    } else if result.success {
-                        let filename = format!(
-                            "processed__{}.parquet", result.data_id
-                        );
-                        let path = output_dir.join(&filename);
-                        let task = WriteTask {path, df: processed_df, result};
-
-                        if let Err(send_err) = tx.send(task) {
-                            tracing::warn!(error = ?send_err, "Writer channel closed while sending");
-                        } else {
-                            tracing::debug!("Sent branch to writer thread");
-                        }
-                    } else {
-                        tracing::warn!(
-                            data_id = result.data_id,
-                            error = result.error_message,
-                            "Branch processing failed"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(config = ?cfg, error = ?e, "Branch processing failed");
-                }
-            }
-        });
-    });
-
-    drop(tx);
-    for handle in writer_handles {
-        handle.join().expect("Writer thread panicked");
+    let mut all_results = Vec::new();
+    for task in tasks_to_run {
+        let results = process_base_task(
+            &branch_pool,
+            &df,
+            task,
+            &axes,
+            &args.output_dir,
+            !args.overwrite,
+        )?;
+        all_results.extend(results);
     }
-    tracing::info!("All writers finished");
 
-    if let Some(meta_arc) = metadata {
-        let guard = meta_arc.lock().unwrap();
-        let metadata_path = args.output_dir.join("metadata.json");
-        let json = serde_json::to_string_pretty(&*guard).context("Failed to serialize metadata")?;
+    if args.save_metadata {
+        let metadata_path = match args.task_id {
+            Some(task_id) => args.output_dir.join(format!("metadata__task_{}.json", task_id)),
+            None => args.output_dir.join("metadata.json"),
+        };
+        let json = serde_json::to_string_pretty(&all_results).context("Failed to serialize metadata")?;
         std::fs::write(&metadata_path, json).context("Failed to write metadata")?;
-
-        tracing::info!(path = ?metadata_path, entries = guard.len(), "Saved metadata");
+        tracing::info!(path = ?metadata_path, entries = all_results.len(), "Saved metadata");
     }
 
-    tracing::info!("Processing complete");
+    tracing::info!(processed_outputs = all_results.len(), "Processing complete");
     Ok(())
 }
 
-use std::collections::HashMap;
+fn process_base_task(
+    pool: &rayon::ThreadPool,
+    full_df: &DataFrame,
+    task: BaseTask,
+    axes: &Axes,
+    output_dir: &Path,
+    skip_existing: bool,
+) -> Result<Vec<ProcessingResult>> {
+    let base_start = std::time::Instant::now();
+    tracing::info!(
+        task_id = task.task_id,
+        sample_size = task.sample_size,
+        subsample_id = task.subsample_id,
+        "Starting base task"
+    );
 
-/// Parse "0.1:5,0.2:5,...,1.0:1" into a map of sample_size -> n_subsamples
+    let sample_cfg = BranchConfig {
+        sample_size: task.sample_size,
+        subsample_id: task.subsample_id,
+        transformation: Transformation::NoLogRt,
+        outlier_method: OutlierMethod::None,
+        effect_condition: EffectCondition::Present,
+        strip_method: StripMethod::Shuffle,
+        global_seed: axes.seed,
+    };
+    let sampled_df = BranchPipeline::new(sample_cfg)
+        .sample_data(full_df)
+        .with_context(|| format!("Failed to sample base task {}", task.task_id))?;
+
+    tracing::info!(
+        task_id = task.task_id,
+        rows = sampled_df.height(),
+        full_rows = full_df.height(),
+        "Sampled base task"
+    );
+
+    let mut task_results = Vec::new();
+    for effect in &axes.effect_variants {
+        let effect_start = std::time::Instant::now();
+        let effect_cfg = BranchConfig {
+            sample_size: task.sample_size,
+            subsample_id: task.subsample_id,
+            transformation: Transformation::NoLogRt,
+            outlier_method: OutlierMethod::None,
+            effect_condition: effect.condition,
+            strip_method: effect.strip_method,
+            global_seed: axes.seed,
+        };
+
+        let effect_df = BranchPipeline::new(effect_cfg)
+            .apply_effect_condition(sampled_df.clone())
+            .with_context(|| {
+                format!(
+                    "Failed to apply effect {:?}/{:?} for base task {}",
+                    effect.condition, effect.strip_method, task.task_id
+                )
+            })?;
+
+        tracing::info!(
+            task_id = task.task_id,
+            effect_condition = %effect.condition,
+            strip_method = %effect.strip_method,
+            rows = effect_df.height(),
+            ms = effect_start.elapsed().as_millis(),
+            "Prepared effect variant"
+        );
+
+        let per_outlier: Vec<Result<Vec<ProcessingResult>>> = pool.install(|| {
+            axes.outlier_methods
+                .par_iter()
+                .map(|outlier| {
+                    process_outlier_variant(
+                        effect_df.clone(),
+                        full_df.height(),
+                        task,
+                        *effect,
+                        *outlier,
+                        &axes.transformations,
+                        axes.seed,
+                        output_dir,
+                        skip_existing,
+                    )
+                })
+                .collect()
+        });
+
+        for result in per_outlier {
+            task_results.extend(result?);
+        }
+    }
+
+    tracing::info!(
+        task_id = task.task_id,
+        outputs = task_results.len(),
+        ms = base_start.elapsed().as_millis(),
+        "Finished base task"
+    );
+
+    Ok(task_results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_outlier_variant(
+    effect_df: DataFrame,
+    full_n_rows: usize,
+    task: BaseTask,
+    effect: EffectVariant,
+    outlier_method: OutlierMethod,
+    transformations: &[Transformation],
+    seed: u64,
+    output_dir: &Path,
+    skip_existing: bool,
+) -> Result<Vec<ProcessingResult>> {
+    let outlier_start = std::time::Instant::now();
+    let outlier_cfg = BranchConfig {
+        sample_size: task.sample_size,
+        subsample_id: task.subsample_id,
+        transformation: Transformation::NoLogRt,
+        outlier_method,
+        effect_condition: effect.condition,
+        strip_method: effect.strip_method,
+        global_seed: seed,
+    };
+
+    let filtered_df = BranchPipeline::new(outlier_cfg)
+        .filter_outliers(effect_df)
+        .with_context(|| {
+            format!(
+                "Failed outlier filter {} for task {}",
+                outlier_method.as_string(),
+                task.task_id
+            )
+        })?;
+
+    let mut results = Vec::with_capacity(transformations.len());
+    for &transformation in transformations {
+        let branch_start = std::time::Instant::now();
+        let cfg = BranchConfig {
+            sample_size: task.sample_size,
+            subsample_id: task.subsample_id,
+            transformation,
+            outlier_method,
+            effect_condition: effect.condition,
+            strip_method: effect.strip_method,
+            global_seed: seed,
+        };
+        let pipeline = BranchPipeline::new(cfg);
+        let data_id = pipeline.data_id();
+        let filename = format!("processed__{}.parquet", data_id);
+        let path = output_dir.join(filename);
+
+        if skip_existing && path.exists() {
+            tracing::debug!(path = ?path, data_id = %data_id, "Skipping existing output");
+            continue;
+        }
+
+        let transformed_df = pipeline
+            .apply_transformation(filtered_df.clone())
+            .with_context(|| format!("Failed transformation {} for {}", transformation, data_id))?;
+
+        let n_rows_output = transformed_df.height();
+        if n_rows_output == 0 {
+            tracing::warn!(data_id = %data_id, "Skipping empty output");
+            continue;
+        }
+
+        write_parquet_atomic(transformed_df, &path)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+
+        let strip_label = match effect.condition {
+            EffectCondition::NullInteraction => effect.strip_method.to_string(),
+            EffectCondition::Present => "none".to_string(),
+        };
+
+        let result = ProcessingResult {
+            branch_id: data_id.clone(),
+            data_id: data_id.clone(),
+            sample_size: task.sample_size,
+            subsample_id: task.subsample_id,
+            transformation: transformation.to_string(),
+            outlier_method: outlier_method.as_string(),
+            effect_condition: effect.condition.to_string(),
+            strip_method: strip_label,
+            n_rows_input: full_n_rows,
+            n_rows_output,
+            n_rows_removed: full_n_rows.saturating_sub(n_rows_output),
+            processing_time_ms: branch_start.elapsed().as_millis(),
+            success: true,
+            error_message: None,
+        };
+
+        tracing::info!(
+            data_id = %data_id,
+            rows = n_rows_output,
+            ms = branch_start.elapsed().as_millis(),
+            "Wrote branch output"
+        );
+        results.push(result);
+    }
+
+    tracing::debug!(
+        task_id = task.task_id,
+        outlier_method = %outlier_method.as_string(),
+        outputs = results.len(),
+        ms = outlier_start.elapsed().as_millis(),
+        "Finished outlier variant"
+    );
+    Ok(results)
+}
+
+fn write_parquet_atomic(mut df: DataFrame, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output dir {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("Invalid output path: {}", path.display()))?;
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{}.{}.{}.tmp", file_name, std::process::id(), counter);
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let tmp_file = std::fs::File::create(&tmp_path)
+        .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
+
+    let write_result = ParquetWriter::new(tmp_file)
+        .with_compression(ParquetCompression::Snappy)
+        .with_row_group_size(Some(64 * 1024))
+        .finish(&mut df)
+        .with_context(|| format!("Failed to write parquet: {}", tmp_path.display()));
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("Failed to rename {} -> {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+fn generate_base_tasks(sample_sizes: &[f64], subsample_map: &HashMap<u64, u32>) -> Vec<BaseTask> {
+    let mut tasks = Vec::new();
+    for &sample_size in sample_sizes {
+        let n_sub = *subsample_map.get(&sample_size.to_bits()).unwrap_or(&1);
+        for subsample_id in 1..=n_sub {
+            let task_id = tasks.len();
+            tasks.push(BaseTask {
+                task_id,
+                sample_size,
+                subsample_id,
+            });
+        }
+    }
+    tasks
+}
+
+fn generate_effect_variants(
+    effect_conditions: &[EffectCondition],
+    strip_methods: &[StripMethod],
+) -> Vec<EffectVariant> {
+    let mut out = Vec::new();
+    for &condition in effect_conditions {
+        match condition {
+            EffectCondition::Present => out.push(EffectVariant {
+                condition,
+                strip_method: StripMethod::Shuffle,
+            }),
+            EffectCondition::NullInteraction => {
+                for &strip_method in strip_methods {
+                    out.push(EffectVariant {
+                        condition,
+                        strip_method,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn write_task_manifest(path: &Path, tasks: &[BaseTask]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create manifest dir {}", parent.display()))?;
+    }
+    let mut body = String::from("task_id\tsample_size\tsubsample_id\n");
+    for task in tasks {
+        body.push_str(&format!(
+            "{}\t{}\t{}\n",
+            task.task_id, task.sample_size, task.subsample_id
+        ));
+    }
+    std::fs::write(path, body).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Parse "0.1:5,0.2:5,...,1.0:1" into sample_size -> n_subsamples.
 fn parse_subsamples_per_size(spec: &Option<String>, sample_sizes: &[f64]) -> HashMap<u64, u32> {
     let mut map = HashMap::new();
 
     if let Some(s) = spec {
         for pair in s.split(',') {
             let parts: Vec<&str> = pair.trim().split(':').collect();
-            if parts.len() == 2
-                && let (Ok(frac), Ok(n)) = (parts[0].parse::<f64>(), parts[1].parse::<u32>()) {
+            if parts.len() == 2 {
+                if let (Ok(frac), Ok(n)) = (parts[0].parse::<f64>(), parts[1].parse::<u32>()) {
                     map.insert(frac.to_bits(), n);
                 }
+            }
         }
     }
 
-    // Default: 1 subsample for any size not specified
     for &ss in sample_sizes {
         map.entry(ss.to_bits()).or_insert(1);
     }
@@ -390,7 +598,7 @@ fn validate_dataframe(df: &DataFrame) -> Result<()> {
     let required_cols = ["rt", "participant_id", "cong", "prev_cong"];
     for col_name in &required_cols {
         if !df.get_columns().iter().any(|c| c.name() == *col_name) {
-            return Err(anyhow::anyhow!("Missing required column: {}", col_name));
+            return Err(anyhow!("Missing required column: {}", col_name));
         }
     }
 
@@ -413,7 +621,7 @@ fn validate_dataframe(df: &DataFrame) -> Result<()> {
             .map(|v| v.to_string())
             .collect();
         if !invalid.is_empty() {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "Invalid +/-1 coding in {}: {}",
                 col_name,
                 invalid.join(",")
@@ -423,14 +631,17 @@ fn validate_dataframe(df: &DataFrame) -> Result<()> {
 
     let pid_missing = df.column("participant_id")?.null_count();
     if pid_missing > 0 {
-        return Err(anyhow::anyhow!("participant_id contains {} missing values", pid_missing));
+        return Err(anyhow!("participant_id contains {} missing values", pid_missing));
     }
 
     if missing_rt > 0 || nonpositive_rt > 0 {
-        tracing::warn!(missing_rt, nonpositive_rt, "Input RT contains rows that downstream diagnostics will treat as invalid");
+        tracing::warn!(missing_rt, nonpositive_rt, "Input RT contains invalid rows");
     }
     if df.column("prev_cong")?.null_count() > 0 {
-        tracing::warn!(missing_prev_cong = df.column("prev_cong")?.null_count(), "Input contains first-trial or missing previous-congruency rows");
+        tracing::warn!(
+            missing_prev_cong = df.column("prev_cong")?.null_count(),
+            "Input contains first-trial or missing previous-congruency rows"
+        );
     }
 
     tracing::info!(rows = df.height(), cols = df.width(), "Data validation passed");
@@ -442,31 +653,35 @@ fn parse_csv_floats(s: &str) -> Result<Vec<f64>> {
         .map(|x| {
             x.trim()
                 .parse()
-                .context(format!("Failed to parse float: {}", x))
+                .with_context(|| format!("Failed to parse float: {}", x))
         })
         .collect()
 }
 
 fn parse_csv_enums(s: &str) -> Result<Vec<Transformation>> {
     s.split(',')
+        .filter(|x| !x.trim().is_empty())
         .map(|x| Transformation::from_str(x.trim()))
         .collect()
 }
 
 fn parse_effect_conditions(s: &str) -> Result<Vec<EffectCondition>> {
     s.split(',')
+        .filter(|x| !x.trim().is_empty())
         .map(|x| EffectCondition::from_str(x.trim()))
         .collect()
 }
 
 fn parse_strip_methods(s: &str) -> Result<Vec<StripMethod>> {
     s.split(',')
+        .filter(|x| !x.trim().is_empty())
         .map(|x| StripMethod::from_str(x.trim()))
         .collect()
 }
 
 fn parse_outlier_methods(s: &str) -> Result<Vec<OutlierMethod>> {
     s.split(',')
+        .filter(|x| !x.trim().is_empty())
         .map(|x| match x.trim() {
             "sd_2" => Ok(OutlierMethod::Sd(2.0)),
             "sd_2.5" => Ok(OutlierMethod::Sd(2.5)),
@@ -487,163 +702,54 @@ fn parse_outlier_methods(s: &str) -> Result<Vec<OutlierMethod>> {
                 max: 1500.0,
             }),
             "none" => Ok(OutlierMethod::None),
-            _ => Err(anyhow::anyhow!("Unknown outlier method: {}", x)),
+            _ => Err(anyhow!("Unknown outlier method: {}", x)),
         })
         .collect()
 }
 
 fn normalize_all(df: &DataFrame) -> Result<DataFrame> {
-        let mut out = df.clone(); // Single clone at entry point
-        for (name, target_type) in [
-            ("participant_id", DataType::String),
-            ("rt", DataType::Float64),
-            ("cong", DataType::String),
-            ("prev_cong", DataType::String),
-        ] {
-            let col = out.column(name)?;
-            if col.dtype() != &target_type {
-                let casted = col.cast(&target_type)?;
-                out.with_column(casted)?;
-            }
-        }
-        Ok(out)
-    }
-
-fn generate_configs(
-    sample_sizes: Vec<f64>,
-    subsample_map: &HashMap<u64, u32>,
-    transformations: Vec<Transformation>,
-    outliers: Vec<OutlierMethod>,
-    effect_conditions: Vec<EffectCondition>,
-    strip_methods: Vec<StripMethod>,
-    global_seed: u64,
-) -> Vec<BranchConfig> {
-    let mut configs = vec![];
-
-    for &sample_size in &sample_sizes {
-        let n_sub = *subsample_map.get(&sample_size.to_bits()).unwrap_or(&1);
-
-        for sub_id in 1..=n_sub {
-            for &transformation in &transformations {
-                for &outlier_method in &outliers {
-                    for &effect_condition in &effect_conditions {
-                        match effect_condition {
-                            EffectCondition::NullInteraction => {
-                                for &strip_method in &strip_methods {
-                                    configs.push(BranchConfig {
-                                        sample_size,
-                                        subsample_id: sub_id,
-                                        transformation,
-                                        outlier_method,
-                                        effect_condition,
-                                        strip_method,
-                                        global_seed,
-                                    });
-                                }
-                            }
-                            EffectCondition::Present => {
-                                configs.push(BranchConfig {
-                                    sample_size,
-                                    subsample_id: sub_id,
-                                    transformation,
-                                    outlier_method,
-                                    effect_condition,
-                                    // placeholder; ignored because strip is not applied for present data
-                                    strip_method: StripMethod::Shuffle,
-                                    global_seed,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+    let mut out = df.clone();
+    for (name, target_type) in [
+        ("participant_id", DataType::String),
+        ("rt", DataType::Float64),
+        ("cong", DataType::String),
+        ("prev_cong", DataType::String),
+    ] {
+        let col = out.column(name)?;
+        if col.dtype() != &target_type {
+            let casted = col.cast(&target_type)?;
+            out.with_column(casted)?;
         }
     }
-
-    configs
+    Ok(out)
 }
 
 #[cfg(test)]
 mod cli_tests {
     use super::*;
 
-    fn make_dummy_df() -> DataFrame {
-        let pid = Series::new("participant_id".into(), &["p1", "p1", "p2", "p2"]);
-        let cong = Series::new("cong".into(), &["-1", "1", "-1", "1"]);
-        let prev = Series::new("prev_cong".into(), &["-1", "1", "-1", "1"]);
-        let rt = Series::new("rt".into(), &[500.0, 520.0, 530.0, 545.0]);
-        DataFrame::new(vec![pid.into(), cong.into(), prev.into(), rt.into()]).unwrap()
-    }
-
     #[test]
-    fn test_generate_configs_strip_only_for_null_interaction() {
-        let sample_sizes = vec![1.0];
-        let transformations = vec![Transformation::NoLogRt];
-        let outliers = vec![OutlierMethod::None];
-        let effect_conditions = vec![EffectCondition::Present, EffectCondition::NullInteraction];
-        let strip_methods = vec![StripMethod::Shuffle, StripMethod::AdditiveQmap];
+    fn test_base_task_count() {
+        let sample_sizes = vec![0.1, 1.0];
         let subsample_map = parse_subsamples_per_size(&Some("0.1:5,1.0:1".into()), &sample_sizes);
-        let seed = 42;
+        let tasks = generate_base_tasks(&sample_sizes, &subsample_map);
+        assert_eq!(tasks.len(), 6);
+        assert_eq!(tasks[0].task_id, 0);
+        assert_eq!(tasks[5].subsample_id, 1);
+    }
 
-        let configs = generate_configs(
-            sample_sizes.clone(),
-            &subsample_map.clone(),
-            transformations.clone(),
-            outliers.clone(),
-            effect_conditions.clone(),
-            strip_methods.clone(),
-            seed,
+    #[test]
+    fn test_effect_variants_present_only_once() {
+        let effects = vec![EffectCondition::Present, EffectCondition::NullInteraction];
+        let strips = vec![StripMethod::Shuffle, StripMethod::AdditiveQmap];
+        let variants = generate_effect_variants(&effects, &strips);
+        assert_eq!(variants.len(), 3);
+        assert_eq!(
+            variants
+                .iter()
+                .filter(|v| v.condition == EffectCondition::Present)
+                .count(),
+            1
         );
-
-        // Expect: Present -> 1 config, NullInteraction -> 2 configs (one per strip)
-        assert_eq!(configs.len(), 1 + 2);
-
-        let mut counts = (0, 0); // present, null_interaction
-        for c in configs {
-            match c.effect_condition {
-                EffectCondition::Present => counts.0 += 1,
-                EffectCondition::NullInteraction => counts.1 += 1,
-            }
-        }
-        assert_eq!(counts, (1, 2));
-    }
-
-    #[test]
-    fn test_validate_dataframe_rejects_bad_congruency_code() {
-        let mut df = make_dummy_df();
-        df.replace("cong", Series::new("cong".into(), &["0", "1", "-1", "1"]))
-            .unwrap();
-        assert!(validate_dataframe(&df).is_err());
-    }
-
-    #[test]
-    fn test_validate_dataframe_allows_missing_prev_cong_for_first_trials() {
-        let df = df!(
-            "participant_id" => &["p1", "p1"],
-            "cong" => &["-1", "1"],
-            "prev_cong" => &[None, Some("-1")],
-            "rt" => &[500.0, 510.0]
-        )
-        .unwrap();
-        assert!(validate_dataframe(&df).is_ok());
-    }
-
-    #[test]
-    fn test_filename_contains_none_for_non_interaction() {
-        let df = make_dummy_df();
-        let cfg_present = BranchConfig {
-            sample_size: 1.0,
-            subsample_id: 2,
-            transformation: Transformation::NoLogRt,
-            outlier_method: OutlierMethod::None,
-            effect_condition: EffectCondition::Present,
-            strip_method: StripMethod::Shuffle,
-            global_seed: 42,
-        };
-        let pipeline = multiverse_analysis::BranchPipeline::new(cfg_present);
-        let (_out, _res) = pipeline.process(df).unwrap();
-        let filename = format!("processed__{}.parquet", pipeline.data_id());
-        assert!(filename.ends_with("__none.parquet"));
     }
 }
-

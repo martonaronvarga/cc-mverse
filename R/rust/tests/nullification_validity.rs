@@ -444,7 +444,7 @@ fn shuffle_removes_prev_cong_association_conditional_on_participant_by_cong() {
 }
 
 #[test]
-fn shuffle_strip_seed_changes_with_subsample_id() {
+fn shuffle_nullification_is_shared_across_full_sample_subsample_ids() {
     let df = synthetic_location_cse_df(4, 30, 35.0);
     let cfg = |subsample_id| BranchConfig {
         sample_size: 1.0,
@@ -459,10 +459,10 @@ fn shuffle_strip_seed_changes_with_subsample_id() {
     let (out_a, _) = BranchPipeline::new(cfg(1)).process(df.clone()).unwrap();
     let (out_b, _) = BranchPipeline::new(cfg(2)).process(df).unwrap();
 
-    assert_ne!(
+    assert_eq!(
         rt_by_trial(&out_a),
         rt_by_trial(&out_b),
-        "different subsample_id values should produce independent shuffle realizations"
+        "subsample_id must not create a different null population at sample_size=1"
     );
 }
 

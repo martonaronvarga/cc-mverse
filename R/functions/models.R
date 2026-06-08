@@ -18,14 +18,7 @@ fit_model <- function(data, model_spec, model_name, branch_id) {
     data <- as.data.frame(data)
   }
 
-  # Avoid anomalies
-  data <- data %>%
-    dplyr::filter(rt > 0) %>%
-    dplyr::filter(is.finite(rt) & !is.na(rt)) %>%
-    dplyr::mutate(
-      cong = dplyr::if_else(cong == 1, 0.5, -0.5),
-      prev_cong = dplyr::if_else(prev_cong == 1, 0.5, -0.5)
-    )
+  data <- prepare_model_data(data, model_spec$type)
 
   tryCatch(
     {
@@ -62,6 +55,44 @@ fit_model <- function(data, model_spec, model_name, branch_id) {
   )
 }
 
+#' Prepare branch data for the requested model family
+#'
+#' LMMs use centered numeric contrasts (-0.5, +0.5). Repeated-measures
+#' ANOVA uses true within-subject factors, because afex::aov_car() extracts
+#' within-subject effects by factor terms and should not be fed numeric
+#' covariates for cong/prev_cong.
+prepare_model_data <- function(data, model_type) {
+  encode_centered <- function(x) {
+    xn <- suppressWarnings(as.numeric(as.character(x)))
+    dplyr::if_else(!is.na(xn) & xn > 0, 0.5, -0.5)
+  }
+
+  encode_within_factor <- function(x) {
+    xn <- suppressWarnings(as.numeric(as.character(x)))
+    out <- dplyr::if_else(!is.na(xn) & xn > 0, "positive", "negative")
+    factor(out, levels = c("negative", "positive"))
+  }
+
+  data <- data %>%
+    dplyr::filter(rt > 0) %>%
+    dplyr::filter(is.finite(rt) & !is.na(rt)) %>%
+    dplyr::mutate(participant_id = factor(as.character(participant_id)))
+
+  if (identical(model_type, "rmanova")) {
+    data %>%
+      dplyr::mutate(
+        cong = encode_within_factor(cong),
+        prev_cong = encode_within_factor(prev_cong)
+      )
+  } else {
+    data %>%
+      dplyr::mutate(
+        cong = encode_centered(cong),
+        prev_cong = encode_centered(prev_cong)
+      )
+  }
+}
+
 #' Fit repeated measures ANOVA
 fit_rmanova <- function(data, spec) {
   log_pipeline(logger::DEBUG, "Fitting RMANOVA with afex::aov_car()")
@@ -74,7 +105,12 @@ fit_rmanova <- function(data, spec) {
     fun_aggregate = mean
   )
 
-  full_stats <- as_tibble(anova(full_model))
+  if (!exists("as_rmanova_stats_table", mode = "function")) {
+    cse_path <- file.path("functions", "cse_term_extraction.R")
+    if (!file.exists(cse_path)) cse_path <- file.path("R", "functions", "cse_term_extraction.R")
+    source(cse_path)
+  }
+  full_stats <- as_rmanova_stats_table(anova(full_model))
 
   list(
     type = "rmanova",
@@ -126,7 +162,12 @@ fit_lmm_fallback <- function(data, spec, full_model, full_converged) {
       control = do.call(lme4::lmerControl, spec$control %||% list())
     )
     coefs <- broom.mixed::tidy(fallback_model, effects = "fixed", conf.int = FALSE)
-    cse <- coefs[coefs$term == "cong:prev_cong", , drop = FALSE]
+    if (!exists("select_cse_coefficient_row", mode = "function")) {
+      cse_path <- file.path("functions", "cse_term_extraction.R")
+      if (!file.exists(cse_path)) cse_path <- file.path("R", "functions", "cse_term_extraction.R")
+      source(cse_path)
+    }
+    cse <- select_cse_coefficient_row(coefs)
     list(
       level = "reduced_random_effects",
       formula = fallback_formula,

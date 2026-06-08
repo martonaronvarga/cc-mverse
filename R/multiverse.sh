@@ -43,6 +43,7 @@ Data:
 
 Execution:
   --workers N              modes.<mode>.n_workers
+  --model-chunk-size N     modes.<mode>.model_chunk_size
   --log-level LEVEL        logging.level
 
 SLURM (hpc mode):
@@ -53,9 +54,11 @@ SLURM (hpc mode):
   --worker-time-min N      slurm.worker.time_min
   --rust-cpus N            slurm.rust.cpus
   --rust-mem-gb N          slurm.rust.mem_gb
+  --rust-time-min N        slurm.rust.time_min
 
 Control:
   --force-rust             Re-run Rust even if output exists
+  --skip-rust              Trust existing processed files and submit only controller/R stage
   --email ADDRESS          SLURM notifications
   --dry-run                Show scripts without submitting
   --help                   This message
@@ -74,6 +77,7 @@ shift || true
 # Collect overrides as YAML path=value pairs
 declare -A OVERRIDES
 FORCE_RUST=false
+SKIP_RUST=false
 EMAIL=""
 DRY_RUN=false
 
@@ -82,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --participants)        OVERRIDES[data.n_participants]="$2";         shift 2 ;;
     --trials)              OVERRIDES[data.n_trials]="$2";              shift 2 ;;
     --workers)             OVERRIDES[modes.${MODE}.n_workers]="$2";    shift 2 ;;
+    --model-chunk-size)    OVERRIDES[modes.${MODE}.model_chunk_size]="$2"; shift 2 ;;
     --log-level)           OVERRIDES[logging.level]="$2";              shift 2 ;;
     --partition)           OVERRIDES[slurm.partition]="$2";            shift 2 ;;
     --controller-mem-gb)   OVERRIDES[slurm.controller.mem_gb]="$2";   shift 2 ;;
@@ -90,7 +95,9 @@ while [[ $# -gt 0 ]]; do
     --worker-time-min)     OVERRIDES[slurm.worker.time_min]="$2";     shift 2 ;;
     --rust-cpus)           OVERRIDES[slurm.rust.cpus]="$2";           shift 2 ;;
     --rust-mem-gb)         OVERRIDES[slurm.rust.mem_gb]="$2";         shift 2 ;;
+    --rust-time-min)        OVERRIDES[slurm.rust.time_min]="$2";        shift 2 ;;
     --force-rust)          FORCE_RUST=true;                             shift   ;;
+    --skip-rust)           SKIP_RUST=true;                              shift   ;;
     --email)               EMAIL="$2";                                 shift 2 ;;
     --dry-run)             DRY_RUN=true;                                shift   ;;
     --help)                print_usage                                         ;;
@@ -193,8 +200,10 @@ CONTROLLER_MEM_GB=$(cfg slurm.controller.mem_gb)
 CONTROLLER_TIME_MIN=$(cfg slurm.controller.time_min)
 WORKER_MEM_GB=$(cfg slurm.worker.mem_gb)
 WORKER_TIME_MIN=$(cfg slurm.worker.time_min)
+MODEL_CHUNK_SIZE=$(cfg "modes.${MODE}.model_chunk_size" 2>/dev/null || cfg execution.model_chunk_size)
 RUST_CPUS=$(cfg slurm.rust.cpus)
 RUST_MEM_GB=$(cfg slurm.rust.mem_gb)
+RUST_TIME_MIN=$(cfg slurm.rust.time_min)
 
 # ============================================================================
 # BANNER
@@ -204,9 +213,10 @@ log_info "========================================="
 log_info "Multiverse Pipeline | mode=$MODE"
 log_info "  Participants: $N_PARTICIPANTS  Trials: $N_TRIALS  Workers: $N_WORKERS"
 [[ "$MODE" == "hpc" ]] && {
-  log_info "  Rust: ${RUST_CPUS} CPUs, ${RUST_MEM_GB}G"
+  log_info "  Rust: ${RUST_CPUS} CPUs, ${RUST_MEM_GB}G, ${RUST_TIME_MIN} min"
   log_info "  Controller: 4 CPUs, ${CONTROLLER_MEM_GB}G"
-  log_info "  Workers: ${N_WORKERS} x ${WORKER_MEM_GB}G"
+  log_info "  Workers: ${N_WORKERS} x ${WORKER_MEM_GB}G, ${WORKER_TIME_MIN} min"
+  log_info "  Model chunk size: ${MODEL_CHUNK_SIZE}"
 }
 log_info "========================================="
 
@@ -224,6 +234,19 @@ run_local() {
 # ============================================================================
 # HPC
 # ============================================================================
+
+format_slurm_time() {
+  local minutes="$1"
+  local days=$(( minutes / 1440 ))
+  local rem=$(( minutes % 1440 ))
+  local hours=$(( rem / 60 ))
+  local mins=$(( rem % 60 ))
+  if (( days > 0 )); then
+    printf "%d-%02d:%02d:00" "$days" "$hours" "$mins"
+  else
+    printf "%02d:%02d:00" "$hours" "$mins"
+  fi
+}
 
 run_hpc() {
 
@@ -256,7 +279,17 @@ run_hpc() {
 
   local rust_job_id=""
 
-  if [[ "$n_existing" -lt "$n_expected" ]] || [[ "$signature_status" != "current" ]] || [[ "$FORCE_RUST" == true ]]; then
+  if [[ "$SKIP_RUST" == true ]]; then
+    if [[ "$n_existing" -lt "$n_expected" ]]; then
+      log_error "--skip-rust supplied but processed data is incomplete: ${n_existing}/${n_expected}"
+      exit 1
+    fi
+    if [[ "$signature_status" != "current" ]]; then
+      log_info "Skipping Rust despite stale signature because --skip-rust was supplied"
+    else
+      log_info "Skipping Rust because --skip-rust was supplied"
+    fi
+  elif [[ "$FORCE_RUST" == true ]] || [[ "$n_existing" -lt "$n_expected" ]] || [[ "$signature_status" != "current" ]]; then
     source "${SCRIPT_DIR}/gen_rust_slurm.sh"
 
     local rust_script="${PROJECT_ROOT}/slurm_rust_generated.sh"
@@ -267,7 +300,8 @@ run_hpc() {
       "$SLURM_PARTITION" \
       "$LOG_DIR" \
       "$R_DIR" \
-      "$RESOLVED_YAML"
+      "$RESOLVED_YAML" \
+      "$RUST_TIME_MIN"
 
     if [[ "$DRY_RUN" == true ]]; then
       log_info "[DRY RUN] Rust script:"
@@ -285,7 +319,7 @@ run_hpc() {
 
   # Step 3: Generate controller script
   local time_fmt
-  time_fmt=$(printf "%02d:%02d:00" $(( CONTROLLER_TIME_MIN / 60 )) $(( CONTROLLER_TIME_MIN % 60 )))
+  time_fmt=$(format_slurm_time "$CONTROLLER_TIME_MIN")
 
   local dep=""
   [[ -n "$rust_job_id" ]] && dep="#SBATCH --dependency=afterok:${rust_job_id}"
@@ -316,6 +350,19 @@ log_msg() { echo "[\$(date +'%Y-%m-%d %H:%M:%S')] \$*"; }
 trap 'rc=\$?; log_msg "Exit \${rc}"; scancel --name=crew -u "\$USER" 2>/dev/null || true' EXIT
 
 log_msg "Controller starting"
+
+export USE_HPC="TRUE"
+export N_WORKERS="${N_WORKERS}"
+export SLURM_MEM_GB="${WORKER_MEM_GB}"
+export SLURM_CPUS_PER_TASK_WORKER="$(cfg slurm.worker.cpus)"
+export SLURM_TIME_MIN="${WORKER_TIME_MIN}"
+export SLURM_PARTITION="${SLURM_PARTITION}"
+export MODEL_CHUNK_SIZE="${MODEL_CHUNK_SIZE}"
+export SKIP_RUST="${SKIP_RUST}"
+export LOG_LEVEL="${LOG_LEVEL}"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 
 cd "${R_DIR}"
 ~/local/bin/Rscript run.R \\

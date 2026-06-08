@@ -23,8 +23,10 @@ logger::log_info("Mode: {config$mode} | Workers: {config$n_workers} | Run: {run_
 
 # ---- Generate branches & save state for _targets.R ----
 branches <- generate_all_branches(config)
-configure_targets(config, paths)
 
+# Do not configure crew/targets here. targets::tar_make() evaluates _targets.R
+# in its own callr process, and _targets.R configures the controller there.
+# Configuring here creates a second unused controller and noisy duplicate logs.
 save_pipeline_state(
   config   = config,
   paths    = paths,

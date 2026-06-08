@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use tracing::{debug, info};
 
@@ -104,11 +104,10 @@ impl BranchConfig {
     }
 
     /// Seed for effect stripping (shuffle / qmap).
-    /// Depends on subsample_id so different subsamples get different null realizations.
+    /// Independent of subsample_id so all sample fractions draw from one nullified population.
     pub fn strip_seed(&self) -> u64 {
         let mut hash = 0xcbf29ce484222325_u64;
         hash = stable_seed_mix(hash, self.global_seed);
-        hash = stable_seed_mix(hash, self.subsample_id as u64);
         // Include effect condition and strip method so present branches don't collide with null_interaction seeds
         hash = stable_seed_mix(hash, self.effect_condition as u64);
         stable_seed_mix(hash, self.strip_method as u64)
@@ -165,7 +164,7 @@ impl BranchPipeline {
         )
     }
 
-    /// Process a single branch: sampling -> transformation -> outlier filtering
+    /// Process a single branch: effect conditioning -> sampling -> outlier filtering -> transformation.
     pub fn process(&self, mut data: DataFrame) -> Result<(DataFrame, ProcessingResult)> {
         let start_time = std::time::Instant::now();
         let n_rows_input = data.height();
@@ -176,19 +175,18 @@ impl BranchPipeline {
             "Starting branch processing"
         );
 
-        // Step 0: Condition data
+        // Nullify on the full empirical population before analytical branch choices.
         data = self.apply_effect_condition(data)?;
         debug!(n_rows = data.height(), "After conditioning");
 
-        // Step 1: Sample data
+        // Sampling happens after nullification so sample size is an analysis axis.
         data = self.sample_data(&data)?;
         debug!(n_rows = data.height(), "After sampling");
 
-        // Step 2: Filter outliers
+        // Then apply downstream analytical choices.
         data = self.filter_outliers(data)?;
         debug!(n_rows = data.height(), "After outlier filtering");
 
-        // Step 3: Transform
         data = self.apply_transformation(data)?;
         debug!(n_rows = data.height(), "After transformation");
 
@@ -240,7 +238,7 @@ impl BranchPipeline {
     //     )
     // }
 
-    fn sample_data(&self, data: &DataFrame) -> Result<DataFrame> {
+    pub fn sample_data(&self, data: &DataFrame) -> Result<DataFrame> {
         if (self.config.sample_size - 1.0).abs() < 1e-6 {
             return Ok(data.clone());
         }
@@ -272,7 +270,7 @@ impl BranchPipeline {
         data.filter(&mask).map_err(Into::into)
     }
 
-    fn apply_transformation(&self, mut data: DataFrame) -> Result<DataFrame> {
+    pub fn apply_transformation(&self, mut data: DataFrame) -> Result<DataFrame> {
         match self.config.transformation {
             Transformation::LogRt => {
                 let rt = data.column("rt")?.f64()?;
@@ -285,9 +283,9 @@ impl BranchPipeline {
         }
     }
 
-    fn filter_outliers(&self, data: DataFrame) -> Result<DataFrame> {
+    pub fn filter_outliers(&self, data: DataFrame) -> Result<DataFrame> {
         match self.config.outlier_method {
-            OutlierMethod::None => Ok(data.clone()),
+            OutlierMethod::None => Ok(data),
             OutlierMethod::Sd(threshold) => self.filter_sd(data, threshold),
             OutlierMethod::Mad(threshold) => self.filter_mad(data, threshold),
             OutlierMethod::Range { min, max } => self.filter_range(data, min, max),
@@ -910,22 +908,24 @@ pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize
     let prev: Vec<Option<f64>> = prev_cast.str()?.into_iter().map(parse_pm1).collect();
     let pid_col = df.column("participant_id")?.str()?;
 
-    let mut by_pid: HashMap<String, Vec<usize>> = HashMap::new();
+    // Borrow participant ids instead of cloning one String per row/group.
+    let mut by_pid: HashMap<&str, Vec<usize>> = HashMap::new();
     for i in 0..df.height() {
         if let Some(pid) = pid_col.get(i) {
-            by_pid.entry(pid.to_string()).or_default().push(i);
+            by_pid.entry(pid).or_default().push(i);
         }
     }
-    let participant_beta: HashMap<String, Option<f64>> = by_pid
+    let participant_beta: HashMap<&str, Option<f64>> = by_pid
         .iter()
-        .map(|(pid, rows)| (pid.clone(), local_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .map(|(&pid, rows)| (pid, local_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
         .collect();
 
-    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
     if df.get_column_names().iter().any(|n| *n == "trial_index") && n_bins >= 2 {
         let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
         let trial_col = trial_cast.f64()?;
-        for (pid, mut rows) in by_pid.clone() {
+        for (&pid, rows_ref) in &by_pid {
+            let mut rows = rows_ref.clone();
             rows.sort_by(|a, b| {
                 let ta = trial_col.get(*a).unwrap_or(*a as f64);
                 let tb = trial_col.get(*b).unwrap_or(*b as f64);
@@ -934,19 +934,19 @@ pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize
             let n = rows.len().max(1);
             for (pos, idx) in rows.into_iter().enumerate() {
                 let bin = ((pos * n_bins) / n).min(n_bins - 1);
-                groups.entry((pid.clone(), bin)).or_default().push(idx);
+                groups.entry((pid, bin)).or_default().push(idx);
             }
         }
     } else {
-        for (pid, rows) in by_pid.clone() {
-            groups.insert((pid, 0), rows);
+        for (&pid, rows) in &by_pid {
+            groups.insert((pid, 0), rows.clone());
         }
     }
 
     let mut new_rt = rt.clone();
     for ((pid, _bin), rows) in groups {
         let beta = local_interaction_beta(&rows, &rt, &cong, &prev, min_cell_n)
-            .or_else(|| participant_beta.get(&pid).copied().flatten());
+            .or_else(|| participant_beta.get(pid).copied().flatten());
         let Some(beta) = beta else { continue };
         for idx in rows {
             if let (Some(c), Some(p)) = (cong[idx], prev[idx]) {
@@ -980,22 +980,24 @@ pub fn local_median_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usi
     let prev: Vec<Option<f64>> = prev_cast.str()?.into_iter().map(parse_pm1).collect();
     let pid_col = df.column("participant_id")?.str()?;
 
-    let mut by_pid: HashMap<String, Vec<usize>> = HashMap::new();
+    // Borrow participant ids instead of cloning one String per row/group.
+    let mut by_pid: HashMap<&str, Vec<usize>> = HashMap::new();
     for i in 0..df.height() {
         if let Some(pid) = pid_col.get(i) {
-            by_pid.entry(pid.to_string()).or_default().push(i);
+            by_pid.entry(pid).or_default().push(i);
         }
     }
-    let participant_beta: HashMap<String, Option<f64>> = by_pid
+    let participant_beta: HashMap<&str, Option<f64>> = by_pid
         .iter()
-        .map(|(pid, rows)| (pid.clone(), local_median_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .map(|(&pid, rows)| (pid, local_median_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
         .collect();
 
-    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
     if df.get_column_names().iter().any(|n| *n == "trial_index") && n_bins >= 2 {
         let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
         let trial_col = trial_cast.f64()?;
-        for (pid, mut rows) in by_pid.clone() {
+        for (&pid, rows_ref) in &by_pid {
+            let mut rows = rows_ref.clone();
             rows.sort_by(|a, b| {
                 let ta = trial_col.get(*a).unwrap_or(*a as f64);
                 let tb = trial_col.get(*b).unwrap_or(*b as f64);
@@ -1004,19 +1006,19 @@ pub fn local_median_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usi
             let n = rows.len().max(1);
             for (pos, idx) in rows.into_iter().enumerate() {
                 let bin = ((pos * n_bins) / n).min(n_bins - 1);
-                groups.entry((pid.clone(), bin)).or_default().push(idx);
+                groups.entry((pid, bin)).or_default().push(idx);
             }
         }
     } else {
-        for (pid, rows) in by_pid.clone() {
-            groups.insert((pid, 0), rows);
+        for (&pid, rows) in &by_pid {
+            groups.insert((pid, 0), rows.clone());
         }
     }
 
     let mut new_rt = rt.clone();
     for ((pid, _bin), rows) in groups {
         let beta = local_median_interaction_beta(&rows, &rt, &cong, &prev, min_cell_n)
-            .or_else(|| participant_beta.get(&pid).copied().flatten());
+            .or_else(|| participant_beta.get(pid).copied().flatten());
         let Some(beta) = beta else { continue };
         for idx in rows {
             if let (Some(c), Some(p)) = (cong[idx], prev[idx]) {
@@ -1047,26 +1049,31 @@ pub fn quantile_map_trial_bin(
         return Ok(stationary);
     }
 
-    let mut groups: HashMap<(String, usize), Vec<usize>> = HashMap::new();
     let pid_col = df.column("participant_id")?.str()?;
     let trial_cast = df.column("trial_index")?.cast(&DataType::Float64)?;
     let trial_col = trial_cast.f64()?;
 
-    let mut by_pid: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
+    // Borrow participant ids and use row-index slices. Avoid one full-height
+    // Boolean mask per local group; take() is proportional to the group size.
+    let mut by_pid: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
     for i in 0..df.height() {
         let Some(pid) = pid_col.get(i) else { continue };
         let Some(trial) = trial_col.get(i) else { continue };
         if trial.is_finite() {
-            by_pid.entry(pid.to_string()).or_default().push((i, trial));
+            by_pid.entry(pid).or_default().push((i, trial));
         }
     }
-    for (pid, mut rows) in by_pid {
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (_pid, mut rows) in by_pid {
         rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let n = rows.len().max(1);
+        let mut bins: Vec<Vec<usize>> = (0..n_bins).map(|_| Vec::new()).collect();
         for (pos, (idx, _trial)) in rows.into_iter().enumerate() {
             let bin = ((pos * n_bins) / n).min(n_bins - 1);
-            groups.entry((pid.clone(), bin)).or_default().push(idx);
+            bins[bin].push(idx);
         }
+        groups.extend(bins.into_iter().filter(|rows| !rows.is_empty()));
     }
 
     let mut new_rt: Vec<f64> = stationary
@@ -1079,29 +1086,22 @@ pub fn quantile_map_trial_bin(
     let prev_col = df.column("prev_cong")?.cast(&DataType::String)?;
     let prev_col = prev_col.str()?;
 
-    for rows in groups.values() {
-        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for rows in &groups {
+        let mut counts = [0usize; 4];
         for &idx in rows {
             if let (Some(c), Some(p)) = (cong_col.get(idx), prev_col.get(idx)) {
-                *counts.entry((c.to_string(), p.to_string())).or_default() += 1;
+                if let Some(cell) = cell_index(c, p) {
+                    counts[cell] += 1;
+                }
             }
         }
-        let adequate = ["-1", "1"].iter().all(|c| {
-            ["-1", "1"].iter().all(|p| {
-                counts
-                    .get(&(c.to_string(), p.to_string()))
-                    .copied()
-                    .unwrap_or(0)
-                    >= min_cell_n
-            })
-        });
-        if !adequate {
+        if counts.iter().any(|&n| n < min_cell_n) {
             continue;
         }
 
-        let idx_set: HashSet<usize> = rows.iter().copied().collect();
-        let mask: BooleanChunked = (0..df.height()).map(|i| idx_set.contains(&i)).collect();
-        let local_df = df.filter(&mask)?;
+        let idx: Vec<IdxSize> = rows.iter().map(|&i| i as IdxSize).collect();
+        let idx_ca = IdxCa::from_vec("idx".into(), idx);
+        let local_df = df.take(&idx_ca)?;
         let local_mapped = quantile_map_once(local_df, QuantileMapParams {
             scale_col: params.scale_col.clone(),
             kappa: params.kappa,
@@ -1120,6 +1120,17 @@ pub fn quantile_map_trial_bin(
     let mut out_df = df.clone();
     out_df.replace("rt", Series::new("rt".into(), new_rt))?;
     Ok(out_df)
+}
+
+#[inline]
+fn cell_index(cong: &str, prev: &str) -> Option<usize> {
+    match (cong, prev) {
+        ("-1", "-1") | ("-1.0", "-1") | ("-1", "-1.0") | ("-1.0", "-1.0") => Some(0),
+        ("-1", "1") | ("-1.0", "1") | ("-1", "1.0") | ("-1.0", "1.0") => Some(1),
+        ("1", "-1") | ("1.0", "-1") | ("1", "-1.0") | ("1.0", "-1.0") => Some(2),
+        ("1", "1") | ("1.0", "1") | ("1", "1.0") | ("1.0", "1.0") => Some(3),
+        _ => None,
+    }
 }
 
 // Utilities and helpers
