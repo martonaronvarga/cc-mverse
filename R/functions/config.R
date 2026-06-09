@@ -349,7 +349,7 @@ configure_targets <- function(config, paths) {
 
   targets::tar_option_set(
     tidy_eval = TRUE,
-    packages = packages_core,
+    packages = character(),
     format = "rds",
     repository = "local",
     iteration = "list",
@@ -410,7 +410,7 @@ create_crew_controller <- function(config, paths) {
 
       # SLURM resource allocation
       options_cluster = crew.cluster::crew_options_slurm(
-        verbose = TRUE,
+        verbose = FALSE,
         script_directory = paths$logs,
         script_lines = script_lines,
         log_output = "/dev/null",

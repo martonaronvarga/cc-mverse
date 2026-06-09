@@ -6,7 +6,7 @@
 project_root <- Sys.getenv("TAR_PROJECT", unset = normalizePath("."))
 fn_dir <- file.path(project_root, "functions")
 invisible(lapply(list.files(fn_dir, pattern = "\\.R$", full.names = TRUE), source))
-load_all_packages()
+invisible(capture.output(suppressMessages(suppressWarnings(load_all_packages()))))
 
 # ---- Restore state from run.R ----
 state <- load_pipeline_state("_config")

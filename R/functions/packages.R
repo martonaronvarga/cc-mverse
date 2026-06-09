@@ -66,9 +66,10 @@ load_all_packages <- function() {
     install.packages(missing, lib = templib, repos = "https://cran.r-project.org")
   }
 
+  options(tidyverse.quiet = TRUE)
   for (pkg in packages_core) {
     tryCatch(
-      suppressPackageStartupMessages(library(pkg, character.only = TRUE, quietly = TRUE)),
+      suppressWarnings(suppressPackageStartupMessages(library(pkg, character.only = TRUE, quietly = TRUE))),
       error = function(e) {
         log_pipeline(logger::ERROR, "Failed to load package {pkg}: {e$message}")
         stop(e)
@@ -88,10 +89,11 @@ load_all_packages <- function() {
 #' @return Invisible list of loaded packages
 #'
 ensure_worker_packages <- function() {
+  options(tidyverse.quiet = TRUE)
   for (pkg in packages_core) {
-    ok <- suppressPackageStartupMessages(
-      suppressWarnings(require(pkg, character.only = TRUE, quietly = TRUE))
-    )
+    ok <- suppressWarnings(suppressPackageStartupMessages(
+      require(pkg, character.only = TRUE, quietly = TRUE)
+    ))
     if (!ok) {
       stop(glue::glue("Package {pkg} not available on worker"))
     }

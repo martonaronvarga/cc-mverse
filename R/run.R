@@ -8,7 +8,7 @@ invisible(lapply(
   list.files("functions", pattern = "\\.R$", full.names = TRUE),
   source
 ))
-load_all_packages()
+invisible(capture.output(suppressMessages(suppressWarnings(load_all_packages()))))
 
 # ---- Load config (YAML + CLI overrides) ----
 cli <- parse_cli()
