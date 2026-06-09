@@ -40,4 +40,8 @@ if [[ ! -f "$worker_script" ]]; then
   worker_script="R/bin/fit_model_chunk_array.R"
 fi
 
-"$RSCRIPT_BIN" --vanilla "$worker_script" --chunk-id "${SLURM_ARRAY_TASK_ID}"
+if [[ -n "${MODEL_CHUNK_ID_FILE:-}" ]]; then
+  "$RSCRIPT_BIN" --vanilla "$worker_script" --chunk-id-file "${MODEL_CHUNK_ID_FILE}"
+else
+  "$RSCRIPT_BIN" --vanilla "$worker_script" --chunk-id "${SLURM_ARRAY_TASK_ID}"
+fi

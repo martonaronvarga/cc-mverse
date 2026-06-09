@@ -165,6 +165,10 @@ target8 <- targets::tar_target(
   results_all,
   {
     model_chunk_files
+    missing_model_chunks <- model_chunk_files[!file.exists(model_chunk_files)]
+    if (length(missing_model_chunks) > 0L) {
+      stop("Model chunk outputs are incomplete: ", length(missing_model_chunks), " missing. First missing: ", missing_model_chunks[[1]])
+    }
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
     logger::log_info("Aggregating chunked model results...")
     results <- load_results(paths, validate = TRUE)

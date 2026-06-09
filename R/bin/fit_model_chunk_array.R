@@ -7,9 +7,27 @@ get_arg <- function(flag, default = NA_character_) {
 }
 has_flag <- function(flag) flag %in% args
 
-chunk_id <- get_arg("--chunk-id", Sys.getenv("SLURM_ARRAY_TASK_ID", unset = NA_character_))
+chunk_id_file <- get_arg("--chunk-id-file", Sys.getenv("MODEL_CHUNK_ID_FILE", unset = NA_character_))
+array_task_id <- Sys.getenv("SLURM_ARRAY_TASK_ID", unset = NA_character_)
+chunk_id <- get_arg("--chunk-id", NA_character_)
+
+if (!is.na(chunk_id_file) && nzchar(chunk_id_file)) {
+  if (is.na(array_task_id) || !nzchar(array_task_id)) {
+    stop("MODEL_CHUNK_ID_FILE requires SLURM_ARRAY_TASK_ID", call. = FALSE)
+  }
+  ids <- readLines(chunk_id_file, warn = FALSE)
+  ids <- ids[nzchar(ids)]
+  idx <- as.integer(array_task_id)
+  if (is.na(idx) || idx < 1L || idx > length(ids)) {
+    stop("SLURM_ARRAY_TASK_ID ", array_task_id, " is out of range for ", chunk_id_file, call. = FALSE)
+  }
+  chunk_id <- ids[[idx]]
+} else if (is.na(chunk_id) || !nzchar(chunk_id)) {
+  chunk_id <- array_task_id
+}
+
 if (is.na(chunk_id) || !nzchar(chunk_id)) {
-  stop("Provide --chunk-id or run as a SLURM array task with SLURM_ARRAY_TASK_ID", call. = FALSE)
+  stop("Provide --chunk-id, --chunk-id-file, or run with SLURM_ARRAY_TASK_ID", call. = FALSE)
 }
 chunk_id <- as.integer(chunk_id)
 if (is.na(chunk_id) || chunk_id < 1L) stop("chunk_id must be a positive integer", call. = FALSE)
