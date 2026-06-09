@@ -154,18 +154,11 @@ target7a <- targets::tar_target(
   deployment = "main"
 )
 
-target7b_input <- targets::tar_target(
-  pending_branch_chunks,
-  filter_missing_branch_chunks(branch_chunks, paths, overwrite = config$overwrite_results),
-  iteration = "list",
-  deployment = "main"
-)
-
 target7b <- targets::tar_target(
   model_chunk_files,
-  fit_and_save_branch_chunk(pending_branch_chunks, paths, config),
-  pattern = map(pending_branch_chunks),
-  format = "file"
+  run_model_chunks_slurm_array(branch_chunks, paths, config),
+  format = "file",
+  deployment = "main"
 )
 
 target8 <- targets::tar_target(
@@ -254,5 +247,5 @@ target12 <- targets::tar_target(
 
 list(
   target0, target1, target2, target3, target4, target5, target6,
-  target7a, target7b_input, target7b, target8, target9, target10, target11, target12
+  target7a, target7b, target8, target9, target10, target11, target12
 )
