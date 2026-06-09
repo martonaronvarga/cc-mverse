@@ -1,10 +1,10 @@
 // src/lib.rs - Core library
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use polars::prelude::*;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -384,7 +384,6 @@ impl BranchPipeline {
                 // Estimate and remove interaction effect
                 self.remove_interaction_effect(data)
             }
-
         }
     }
 
@@ -840,12 +839,22 @@ fn parse_pm1(value: Option<&str>) -> Option<f64> {
     }
 }
 
-fn local_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>], prev: &[Option<f64>], min_cell_n: usize) -> Option<f64> {
+fn local_interaction_beta(
+    rows: &[usize],
+    rt: &[f64],
+    cong: &[Option<f64>],
+    prev: &[Option<f64>],
+    min_cell_n: usize,
+) -> Option<f64> {
     let mut sums: HashMap<(i8, i8), (f64, usize)> = HashMap::new();
     for &idx in rows {
-        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else { continue };
+        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else {
+            continue;
+        };
         let y = rt[idx];
-        if !y.is_finite() { continue }
+        if !y.is_finite() {
+            continue;
+        }
         let key = (c as i8, p as i8);
         let entry = sums.entry(key).or_insert((0.0, 0));
         entry.0 += y;
@@ -865,10 +874,18 @@ fn local_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>], prev
     Some((mean(1, 1) - mean(1, -1) - mean(-1, 1) + mean(-1, -1)) / 4.0)
 }
 
-fn local_median_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>], prev: &[Option<f64>], min_cell_n: usize) -> Option<f64> {
+fn local_median_interaction_beta(
+    rows: &[usize],
+    rt: &[f64],
+    cong: &[Option<f64>],
+    prev: &[Option<f64>],
+    min_cell_n: usize,
+) -> Option<f64> {
     let mut cells: HashMap<(i8, i8), Vec<f64>> = HashMap::new();
     for &idx in rows {
-        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else { continue };
+        let (Some(c), Some(p)) = (cong[idx], prev[idx]) else {
+            continue;
+        };
         let y = rt[idx];
         if y.is_finite() {
             cells.entry((c as i8, p as i8)).or_default().push(y);
@@ -885,12 +902,20 @@ fn local_median_interaction_beta(rows: &[usize], rt: &[f64], cong: &[Option<f64>
         let mut xs = cells.get(&(c, p)).cloned().unwrap();
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = xs.len();
-        if n % 2 == 0 { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 } else { xs[n / 2] }
+        if n % 2 == 0 {
+            (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+        } else {
+            xs[n / 2]
+        }
     };
     Some((median(1, 1) - median(1, -1) - median(-1, 1) + median(-1, -1)) / 4.0)
 }
 
-pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize) -> Result<DataFrame> {
+pub fn local_mean_residual_strip(
+    df: DataFrame,
+    min_cell_n: usize,
+    n_bins: usize,
+) -> Result<DataFrame> {
     for c in ["rt", "cong", "prev_cong", "participant_id"] {
         if !df.get_column_names().iter().any(|n| *n == c) {
             return Err(anyhow!("missing required column: {}", c));
@@ -917,7 +942,12 @@ pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize
     }
     let participant_beta: HashMap<&str, Option<f64>> = by_pid
         .iter()
-        .map(|(&pid, rows)| (pid, local_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .map(|(&pid, rows)| {
+            (
+                pid,
+                local_interaction_beta(rows, &rt, &cong, &prev, min_cell_n),
+            )
+        })
         .collect();
 
     let mut groups: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
@@ -962,7 +992,11 @@ pub fn local_mean_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize
     Ok(out_df)
 }
 
-pub fn local_median_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usize) -> Result<DataFrame> {
+pub fn local_median_residual_strip(
+    df: DataFrame,
+    min_cell_n: usize,
+    n_bins: usize,
+) -> Result<DataFrame> {
     for c in ["rt", "cong", "prev_cong", "participant_id"] {
         if !df.get_column_names().iter().any(|n| *n == c) {
             return Err(anyhow!("missing required column: {}", c));
@@ -989,7 +1023,12 @@ pub fn local_median_residual_strip(df: DataFrame, min_cell_n: usize, n_bins: usi
     }
     let participant_beta: HashMap<&str, Option<f64>> = by_pid
         .iter()
-        .map(|(&pid, rows)| (pid, local_median_interaction_beta(rows, &rt, &cong, &prev, min_cell_n)))
+        .map(|(&pid, rows)| {
+            (
+                pid,
+                local_median_interaction_beta(rows, &rt, &cong, &prev, min_cell_n),
+            )
+        })
         .collect();
 
     let mut groups: HashMap<(&str, usize), Vec<usize>> = HashMap::new();
@@ -1040,11 +1079,14 @@ pub fn quantile_map_trial_bin(
     min_cell_n: usize,
     n_bins: usize,
 ) -> Result<DataFrame> {
-    let stationary = quantile_map_once(df.clone(), QuantileMapParams {
-        scale_col: params.scale_col.clone(),
-        kappa: params.kappa,
-        ngrid: params.ngrid,
-    })?;
+    let stationary = quantile_map_once(
+        df.clone(),
+        QuantileMapParams {
+            scale_col: params.scale_col.clone(),
+            kappa: params.kappa,
+            ngrid: params.ngrid,
+        },
+    )?;
     if !df.get_column_names().iter().any(|n| *n == "trial_index") || n_bins < 2 {
         return Ok(stationary);
     }
@@ -1058,7 +1100,9 @@ pub fn quantile_map_trial_bin(
     let mut by_pid: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
     for i in 0..df.height() {
         let Some(pid) = pid_col.get(i) else { continue };
-        let Some(trial) = trial_col.get(i) else { continue };
+        let Some(trial) = trial_col.get(i) else {
+            continue;
+        };
         if trial.is_finite() {
             by_pid.entry(pid).or_default().push((i, trial));
         }
@@ -1102,11 +1146,14 @@ pub fn quantile_map_trial_bin(
         let idx: Vec<IdxSize> = rows.iter().map(|&i| i as IdxSize).collect();
         let idx_ca = IdxCa::from_vec("idx".into(), idx);
         let local_df = df.take(&idx_ca)?;
-        let local_mapped = quantile_map_once(local_df, QuantileMapParams {
-            scale_col: params.scale_col.clone(),
-            kappa: params.kappa,
-            ngrid: params.ngrid,
-        })?;
+        let local_mapped = quantile_map_once(
+            local_df,
+            QuantileMapParams {
+                scale_col: params.scale_col.clone(),
+                kappa: params.kappa,
+                ngrid: params.ngrid,
+            },
+        )?;
         let local_rt: Vec<f64> = local_mapped
             .column("rt")?
             .f64()?

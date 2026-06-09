@@ -118,16 +118,18 @@ fn synthetic_time_varying_cse_df() -> DataFrame {
             for _rep in 0..12 {
                 for &c in &[-1_i32, 1_i32] {
                     for &p in &[-1_i32, 1_i32] {
-                        let ar_like = if trial > 0 { 8.0 * ((trial % 7) as f64 / 6.0) } else { 0.0 };
+                        let ar_like = if trial > 0 {
+                            8.0 * ((trial % 7) as f64 / 6.0)
+                        } else {
+                            0.0
+                        };
                         trial_id.push(trial);
                         trial_index.push(trial);
                         participant_id.push(format!("p{pid:02}"));
                         cong.push(c.to_string());
                         prev_cong.push(p.to_string());
                         rt.push(
-                            620.0
-                                + pid_offset
-                                - 0.04 * trial as f64
+                            620.0 + pid_offset - 0.04 * trial as f64
                                 + 12.0 * c as f64
                                 + 7.0 * p as f64
                                 + cse * (c * p) as f64
@@ -651,7 +653,8 @@ fn additive_qmap_trial_bin_reduces_time_varying_autocorrelated_cse() {
 fn local_median_residual_reduces_time_varying_autocorrelated_cse() {
     let df = synthetic_time_varying_cse_df();
     let before = mean_cse(&df).abs();
-    let stripped = local_median_residual_strip(df.clone(), 5, 4).expect("local median residual should run");
+    let stripped =
+        local_median_residual_strip(df.clone(), 5, 4).expect("local median residual should run");
     let after = mean_cse(&stripped).abs();
 
     assert_eq!(stripped.height(), df.height());
@@ -693,7 +696,8 @@ fn local_mean_residual_reduces_cse_and_preserves_marginal_effects() {
     let before_cse = mean_cse(&df).abs();
     let before_cong = mean_cong_effect(&df);
     let before_prev = mean_prev_cong_effect(&df);
-    let stripped = local_mean_residual_strip(df.clone(), 4, 4).expect("local mean residual should run");
+    let stripped =
+        local_mean_residual_strip(df.clone(), 4, 4).expect("local mean residual should run");
     let after_cse = mean_cse(&stripped).abs();
     let after_cong = mean_cong_effect(&stripped);
     let after_prev = mean_prev_cong_effect(&stripped);
@@ -711,7 +715,8 @@ fn local_median_residual_reduces_median_cse_and_preserves_marginal_effects() {
     let before_cse = mean_cse(&df).abs();
     let before_cong = mean_cong_effect(&df);
     let before_prev = mean_prev_cong_effect(&df);
-    let stripped = local_median_residual_strip(df.clone(), 4, 4).expect("local median residual should run");
+    let stripped =
+        local_median_residual_strip(df.clone(), 4, 4).expect("local median residual should run");
     let after_cse = mean_cse(&stripped).abs();
     let after_cong = mean_cong_effect(&stripped);
     let after_prev = mean_prev_cong_effect(&stripped);

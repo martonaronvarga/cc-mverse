@@ -1,19 +1,19 @@
 // src/bin/process.rs - high-throughput CLI for Rust preprocessing.
 //
-// The important unit of work is a base sample: (sample_size, subsample_id).
-// A base sample is processed once, then branch variants are derived from it in
-// the order: sample -> effect/nullification -> outlier filter -> transformation.
-// This avoids recomputing expensive nullification for every final branch and
-// bounds live memory to one base sample plus a bounded number of outlier tasks.
+// The important unit of work is one nullified effect variant streamed across
+// base samples. Each effect variant is prepared on the full empirical data once,
+// then branches are derived as: effect/nullification -> sample -> outlier -> transform.
+// This gives every sample fraction a draw from the same null population while
+// bounding live memory to one effect variant plus bounded outlier tasks.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use multiverse_analysis::{
     BranchConfig, BranchPipeline, EffectCondition, OutlierMethod, ProcessingResult, StripMethod,
     Transformation,
 };
-use polars::prelude::{CsvReadOptions, NullValues};
 use polars::prelude::*;
+use polars::prelude::{CsvReadOptions, NullValues};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +27,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "process",
     about = "Batch process RT data across analysis branches",
-    long_about = "Processes reaction-time data by sharding over base samples. Within each base sample,\
-                  the pipeline is sample -> effect/nullification -> outlier -> transformation."
+    long_about = "Processes reaction-time data by sharding over effect variants and base samples.\
+                  The pipeline is effect/nullification -> sample -> outlier -> transformation."
 )]
 struct Args {
     /// Input CSV file path
@@ -99,7 +99,7 @@ struct Args {
     write_task_manifest: Option<PathBuf>,
 
     /// Rewrite existing processed__*.parquet files instead of skipping them.
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     overwrite: bool,
 
     /// Save processing metadata. Array tasks write metadata__task_<id>.json.
@@ -178,32 +178,33 @@ fn main() -> Result<()> {
         write_task_manifest(path, &base_tasks)?;
     }
 
-    let tasks_to_run: Vec<BaseTask> = match (args.task_id, args.task_count) {
-        (Some(task_id), Some(task_count)) => {
-            if task_count == 0 {
-                return Err(anyhow!("--task-count must be positive"));
+    let tasks_to_run: Vec<BaseTask> =
+        match (args.task_id, args.task_count) {
+            (Some(task_id), Some(task_count)) => {
+                if task_count == 0 {
+                    return Err(anyhow!("--task-count must be positive"));
+                }
+                if task_id >= task_count {
+                    return Err(anyhow!(
+                        "task_id {} must be smaller than task_count {}",
+                        task_id,
+                        task_count
+                    ));
+                }
+                base_tasks
+                    .iter()
+                    .copied()
+                    .filter(|task| task.task_id % task_count == task_id)
+                    .collect()
             }
-            if task_id >= task_count {
-                return Err(anyhow!(
-                    "task_id {} must be smaller than task_count {}",
-                    task_id,
-                    task_count
-                ));
+            (Some(task_id), None) => vec![*base_tasks.get(task_id).ok_or_else(|| {
+                anyhow!("task_id {} out of range 0..{}", task_id, base_tasks.len())
+            })?],
+            (None, Some(_)) => {
+                return Err(anyhow!("--task-count requires --task-id"));
             }
-            base_tasks
-                .iter()
-                .copied()
-                .filter(|task| task.task_id % task_count == task_id)
-                .collect()
-        }
-        (Some(task_id), None) => vec![*base_tasks
-            .get(task_id)
-            .ok_or_else(|| anyhow!("task_id {} out of range 0..{}", task_id, base_tasks.len()))?],
-        (None, Some(_)) => {
-            return Err(anyhow!("--task-count requires --task-id"));
-        }
-        (None, None) => base_tasks.clone(),
-    };
+            (None, None) => base_tasks.clone(),
+        };
 
     let axes = Axes {
         transformations,
@@ -242,29 +243,68 @@ fn main() -> Result<()> {
 
     validate_dataframe(&df)?;
     let df = normalize_all(&df)?;
-    tracing::info!(rows = df.height(), cols = df.width(), "Data loaded and normalized");
+    tracing::info!(
+        rows = df.height(),
+        cols = df.width(),
+        "Data loaded and normalized"
+    );
 
     std::fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
 
     let mut all_results = Vec::new();
-    for task in tasks_to_run {
-        let results = process_base_task(
-            &branch_pool,
-            &df,
-            task,
-            &axes,
-            &args.output_dir,
-            !args.overwrite,
-        )?;
-        all_results.extend(results);
+    for effect in &axes.effect_variants {
+        let effect_start = std::time::Instant::now();
+        let effect_cfg = BranchConfig {
+            sample_size: 1.0,
+            subsample_id: 1,
+            transformation: Transformation::NoLogRt,
+            outlier_method: OutlierMethod::None,
+            effect_condition: effect.condition,
+            strip_method: effect.strip_method,
+            global_seed: axes.seed,
+        };
+
+        let effect_df = BranchPipeline::new(effect_cfg)
+            .apply_effect_condition(df.clone())
+            .with_context(|| {
+                format!(
+                    "Failed to prepare effect {:?}/{:?} on full data",
+                    effect.condition, effect.strip_method
+                )
+            })?;
+
+        tracing::info!(
+            effect_condition = %effect.condition,
+            strip_method = %effect.strip_method,
+            rows = effect_df.height(),
+            ms = effect_start.elapsed().as_millis(),
+            "Prepared full-population effect variant"
+        );
+
+        for task in &tasks_to_run {
+            let results = process_base_task(
+                &branch_pool,
+                &effect_df,
+                df.height(),
+                *task,
+                *effect,
+                &axes,
+                &args.output_dir,
+                !args.overwrite,
+            )?;
+            all_results.extend(results);
+        }
     }
 
     if args.save_metadata {
         let metadata_path = match args.task_id {
-            Some(task_id) => args.output_dir.join(format!("metadata__task_{}.json", task_id)),
+            Some(task_id) => args
+                .output_dir
+                .join(format!("metadata__task_{}.json", task_id)),
             None => args.output_dir.join("metadata.json"),
         };
-        let json = serde_json::to_string_pretty(&all_results).context("Failed to serialize metadata")?;
+        let json =
+            serde_json::to_string_pretty(&all_results).context("Failed to serialize metadata")?;
         std::fs::write(&metadata_path, json).context("Failed to write metadata")?;
         tracing::info!(path = ?metadata_path, entries = all_results.len(), "Saved metadata");
     }
@@ -275,8 +315,10 @@ fn main() -> Result<()> {
 
 fn process_base_task(
     pool: &rayon::ThreadPool,
-    full_df: &DataFrame,
+    effect_df: &DataFrame,
+    full_n_rows: usize,
     task: BaseTask,
+    effect: EffectVariant,
     axes: &Axes,
     output_dir: &Path,
     skip_existing: bool,
@@ -286,7 +328,9 @@ fn process_base_task(
         task_id = task.task_id,
         sample_size = task.sample_size,
         subsample_id = task.subsample_id,
-        "Starting base task"
+        effect_condition = %effect.condition,
+        strip_method = %effect.strip_method,
+        "Starting sampled effect task"
     );
 
     let sample_cfg = BranchConfig {
@@ -294,81 +338,52 @@ fn process_base_task(
         subsample_id: task.subsample_id,
         transformation: Transformation::NoLogRt,
         outlier_method: OutlierMethod::None,
-        effect_condition: EffectCondition::Present,
-        strip_method: StripMethod::Shuffle,
+        effect_condition: effect.condition,
+        strip_method: effect.strip_method,
         global_seed: axes.seed,
     };
     let sampled_df = BranchPipeline::new(sample_cfg)
-        .sample_data(full_df)
+        .sample_data(effect_df)
         .with_context(|| format!("Failed to sample base task {}", task.task_id))?;
 
     tracing::info!(
         task_id = task.task_id,
         rows = sampled_df.height(),
-        full_rows = full_df.height(),
-        "Sampled base task"
+        full_rows = full_n_rows,
+        "Sampled effect task"
     );
 
-    let mut task_results = Vec::new();
-    for effect in &axes.effect_variants {
-        let effect_start = std::time::Instant::now();
-        let effect_cfg = BranchConfig {
-            sample_size: task.sample_size,
-            subsample_id: task.subsample_id,
-            transformation: Transformation::NoLogRt,
-            outlier_method: OutlierMethod::None,
-            effect_condition: effect.condition,
-            strip_method: effect.strip_method,
-            global_seed: axes.seed,
-        };
-
-        let effect_df = BranchPipeline::new(effect_cfg)
-            .apply_effect_condition(sampled_df.clone())
-            .with_context(|| {
-                format!(
-                    "Failed to apply effect {:?}/{:?} for base task {}",
-                    effect.condition, effect.strip_method, task.task_id
+    let per_outlier: Vec<Result<Vec<ProcessingResult>>> = pool.install(|| {
+        axes.outlier_methods
+            .par_iter()
+            .map(|outlier| {
+                process_outlier_variant(
+                    sampled_df.clone(),
+                    full_n_rows,
+                    task,
+                    effect,
+                    *outlier,
+                    &axes.transformations,
+                    axes.seed,
+                    output_dir,
+                    skip_existing,
                 )
-            })?;
+            })
+            .collect()
+    });
 
-        tracing::info!(
-            task_id = task.task_id,
-            effect_condition = %effect.condition,
-            strip_method = %effect.strip_method,
-            rows = effect_df.height(),
-            ms = effect_start.elapsed().as_millis(),
-            "Prepared effect variant"
-        );
-
-        let per_outlier: Vec<Result<Vec<ProcessingResult>>> = pool.install(|| {
-            axes.outlier_methods
-                .par_iter()
-                .map(|outlier| {
-                    process_outlier_variant(
-                        effect_df.clone(),
-                        full_df.height(),
-                        task,
-                        *effect,
-                        *outlier,
-                        &axes.transformations,
-                        axes.seed,
-                        output_dir,
-                        skip_existing,
-                    )
-                })
-                .collect()
-        });
-
-        for result in per_outlier {
-            task_results.extend(result?);
-        }
+    let mut task_results = Vec::new();
+    for result in per_outlier {
+        task_results.extend(result?);
     }
 
     tracing::info!(
         task_id = task.task_id,
+        effect_condition = %effect.condition,
+        strip_method = %effect.strip_method,
         outputs = task_results.len(),
         ms = base_start.elapsed().as_millis(),
-        "Finished base task"
+        "Finished sampled effect task"
     );
 
     Ok(task_results)
@@ -511,8 +526,13 @@ fn write_parquet_atomic(mut df: DataFrame, path: &Path) -> Result<()> {
         return Err(e);
     }
 
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename {} -> {}", tmp_path.display(), path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -631,7 +651,10 @@ fn validate_dataframe(df: &DataFrame) -> Result<()> {
 
     let pid_missing = df.column("participant_id")?.null_count();
     if pid_missing > 0 {
-        return Err(anyhow!("participant_id contains {} missing values", pid_missing));
+        return Err(anyhow!(
+            "participant_id contains {} missing values",
+            pid_missing
+        ));
     }
 
     if missing_rt > 0 || nonpositive_rt > 0 {
@@ -644,7 +667,11 @@ fn validate_dataframe(df: &DataFrame) -> Result<()> {
         );
     }
 
-    tracing::info!(rows = df.height(), cols = df.width(), "Data validation passed");
+    tracing::info!(
+        rows = df.height(),
+        cols = df.width(),
+        "Data validation passed"
+    );
     Ok(())
 }
 

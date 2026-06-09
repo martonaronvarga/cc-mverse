@@ -44,6 +44,7 @@ build_rust_args <- function(config, paths, input_csv) {
     "--seed", seed,
     "--threads", threads,
     "--writer-threads", writer_threads,
+    "--overwrite",
     "--log-level", tolower(config$log_level)
   )
 
