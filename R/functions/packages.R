@@ -3,6 +3,8 @@
 # Single source of truth for all dependencies
 
 # Core packages (loaded once, before pipeline)
+`%>%` <- magrittr::`%>%`
+
 packages_core <- c(
   # Data manipulation & IO
   "tidyverse", # dplyr, tidyr, ggplot2, readr, etc.
