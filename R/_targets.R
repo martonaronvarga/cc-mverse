@@ -165,7 +165,8 @@ target8 <- targets::tar_target(
   results_all,
   {
     model_chunk_files
-    missing_model_chunks <- model_chunk_files[!file.exists(model_chunk_files)]
+    expected_model_chunks <- chunk_result_paths(branch_chunks, paths)
+    missing_model_chunks <- expected_model_chunks[!file.exists(expected_model_chunks)]
     if (length(missing_model_chunks) > 0L) {
       stop("Model chunk outputs are incomplete: ", length(missing_model_chunks), " missing. First missing: ", missing_model_chunks[[1]])
     }

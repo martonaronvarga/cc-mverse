@@ -114,6 +114,9 @@ run_model_chunks_slurm_array <- function(branch_chunks, paths, config, poll_seco
       missing <- batch_expected[!file.exists(batch_expected)]
       if (!length(missing)) break
       if (!slurm_job_running(job_id)) {
+        Sys.sleep(as.integer(config$slurm$array_finish_grace_seconds %||% 120L))
+        missing <- batch_expected[!file.exists(batch_expected)]
+        if (!length(missing)) break
         stop(
           "Model chunk array job ", job_id, " finished but ", length(missing),
           " result file(s) are still missing in batch ", batch_index,
