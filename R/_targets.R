@@ -254,5 +254,5 @@ target12 <- targets::tar_target(
 
 list(
   target0, target1, target2, target3, target4, target5, target6,
-  target7a, target7b, target8, target9, target10, target11, target12
+  target7a, target7b_input, target7b, target8, target9, target10, target11, target12
 )
