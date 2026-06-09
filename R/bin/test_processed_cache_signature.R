@@ -23,11 +23,13 @@ on.exit({ setwd(old_wd); unlink(tmp_root, recursive = TRUE, force = TRUE) }, add
 paths <- init_project_paths(tmp_root)
 dir.create(file.path(tmp_root, "functions"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(tmp_root, "rust", "src"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(tmp_root, "rust", "target", "release"), recursive = TRUE, showWarnings = FALSE)
 writeLines("data:\n  raw_csv: raw.csv\n", file.path(tmp_root, "pipeline.yaml"))
 writeLines("fn <- function() TRUE", file.path(tmp_root, "functions", "config.R"))
 writeLines("fn <- function() TRUE", file.path(tmp_root, "functions", "paths.R"))
 writeLines("fn <- function() TRUE", file.path(tmp_root, "functions", "rust_interop.R"))
 writeLines("fn main() {}", file.path(tmp_root, "rust", "src", "main.rs"))
+writeLines("binary-v1", file.path(tmp_root, "rust", "target", "release", "process"))
 writeLines("[package]\nname = 'process'\nversion = '0.1.0'\nedition = '2021'\n", file.path(tmp_root, "rust", "Cargo.toml"))
 writeLines("participant_id,cong,prev_cong,rt\np1,1,-1,500\n", file.path(tmp_root, "raw.csv"))
 
@@ -65,7 +67,10 @@ check("signature file is written", file.exists(sig_path))
 check("matching signature validates", !inherits(try(validate_processed_cache_signature(config, paths, branch_specs, input_csv, current = sig1), silent = TRUE), "try-error"))
 
 writeLines("fn main() { println!(\"changed\"); }", file.path(tmp_root, "rust", "src", "main.rs"))
+check("changed Rust source does not invalidate processed cache", !inherits(try(validate_processed_cache_signature(config, paths, branch_specs, input_csv), silent = TRUE), "try-error"))
+
+writeLines("binary-v2", file.path(tmp_root, "rust", "target", "release", "process"))
 stale <- inherits(try(validate_processed_cache_signature(config, paths, branch_specs, input_csv), silent = TRUE), "try-error")
-check("changed Rust source invalidates signature", stale)
+check("changed Rust binary invalidates signature", stale)
 
 cat("All processed cache signature checks passed.\n")
