@@ -43,6 +43,19 @@ split_branch_specs <- function(branch_specs, config) {
   unname(out)
 }
 
+filter_missing_branch_chunks <- function(branch_chunks, paths, overwrite = FALSE) {
+  if (isTRUE(overwrite)) return(branch_chunks)
+  missing <- Filter(function(chunk) {
+    chunk_id <- as.integer(unique(chunk$chunk_id))
+    !file.exists(result_path_for_chunk(paths, chunk_id))
+  }, branch_chunks)
+  log_pipeline(
+    logger::INFO,
+    "Model chunks pending: {length(missing)} missing / {length(branch_chunks)} total"
+  )
+  unname(missing)
+}
+
 write_branch_chunk_manifest <- function(branch_chunks, paths) {
   manifest <- purrr::map_dfr(branch_chunks, function(chunk) {
     tibble::tibble(
