@@ -62,7 +62,7 @@ models:
 
   lmm_optimizer:
     name: bobyqa
-    maxfun: 300000
+    maxfun: 20000
     check_conv_grad_tol: 1.0e-3
     check_conv_hess_tol: 1.0e-6
 
