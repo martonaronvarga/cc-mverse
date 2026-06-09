@@ -386,9 +386,17 @@ create_crew_controller <- function(config, paths) {
     worker <- slurm$worker
     log_pipeline(logger::INFO, "Creating SLURM crew controller ({config$n_workers} workers)")
 
-    script_lines <- "#!/bin/bash"
+    script_lines <- c(
+      "export OMP_NUM_THREADS=1",
+      "export MKL_NUM_THREADS=1",
+      "export OPENBLAS_NUM_THREADS=1",
+      "export RAYON_NUM_THREADS=1",
+      "export MALLOC_ARENA_MAX=2"
+    )
     if (!is.null(slurm$bashrc_source) && nzchar(slurm$bashrc_source)) {
-      script_lines <- c(script_lines, paste("source", shQuote(slurm$bashrc_source)))
+      bashrc <- path.expand(slurm$bashrc_source)
+      # crew.cluster may run these lines under /bin/sh, so use POSIX dot instead of bash `source`.
+      script_lines <- c(script_lines, sprintf("[ -f %s ] && . %s > /dev/null", shQuote(bashrc), shQuote(bashrc)))
     }
 
     crew.cluster::crew_controller_slurm(
@@ -405,7 +413,7 @@ create_crew_controller <- function(config, paths) {
         verbose = TRUE,
         script_directory = paths$logs,
         script_lines = script_lines,
-        log_output = file.path(paths$logs, "crew_worker_%A.out"),
+        log_output = "/dev/null",
         log_error = file.path(paths$logs, "crew_worker_%A.err"),
         memory_gigabytes_required = worker$mem_gb,
         cpus_per_task = worker$cpus,

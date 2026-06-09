@@ -89,7 +89,10 @@ load_all_packages <- function() {
 #'
 ensure_worker_packages <- function() {
   for (pkg in packages_core) {
-    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    ok <- suppressPackageStartupMessages(
+      suppressWarnings(require(pkg, character.only = TRUE, quietly = TRUE))
+    )
+    if (!ok) {
       stop(glue::glue("Package {pkg} not available on worker"))
     }
   }
