@@ -42,8 +42,12 @@ submit_model_chunk_array <- function(chunk_ids, paths, config) {
   script <- file.path(paths$root, "slurm_fit_model_chunk_array.sh")
   if (!file.exists(script)) stop("Missing SLURM array script: ", script)
 
-  id_file <- file.path(paths$config_objects, "model_chunk_array_ids.txt")
-  dir.create(dirname(id_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(paths$config_objects, recursive = TRUE, showWarnings = FALSE)
+  id_file <- tempfile(
+    pattern = "model_chunk_array_ids_",
+    tmpdir = paths$config_objects,
+    fileext = ".txt"
+  )
   writeLines(as.character(chunk_ids), id_file)
 
   args <- c(

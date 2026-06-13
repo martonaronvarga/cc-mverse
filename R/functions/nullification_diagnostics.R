@@ -102,7 +102,8 @@ time_bin_quantile_cse <- function(df, n_bins = 5L) {
     x <- df[bins == b & !is.na(bins), , drop = FALSE]
     pooled_quantile_cse(x, probs = 0.5)[[1]]
   }, numeric(1))
-  c(max_abs_timebin_q050_cse = max(abs(vals[is.finite(vals)]), na.rm = TRUE))
+  finite_vals <- vals[is.finite(vals)]
+  c(max_abs_timebin_q050_cse = if (length(finite_vals)) max(abs(finite_vals)) else NA_real_)
 }
 
 build_nullification_diagnostic <- function(
@@ -256,6 +257,77 @@ parse_processed_data_id <- function(path) {
   out
 }
 
+metadata_only_nullification_diagnostics <- function(paths) {
+  rows <- lapply(paths, function(path) {
+    meta <- parse_processed_data_id(path)
+    data.frame(
+      data_id = meta$data_id,
+      effect_condition = meta$effect_condition,
+      strip_method = meta$strip_method,
+      sample_size = meta$sample_size,
+      subsample_id = meta$subsample_id,
+      outlier = meta$outlier,
+      transformation = meta$transformation,
+      n_rows = NA_integer_,
+      n_rows_valid = NA_integer_,
+      n_participants = NA_integer_,
+      n_studies = NA_integer_,
+      studies = NA_character_,
+      cell_min_n = NA_integer_,
+      source_row_monotonic = NA,
+      current_cong_effect = NA_real_,
+      previous_cong_effect = NA_real_,
+      lag1_autocorr_mean = NA_real_,
+      trial_rt_slope_mean = NA_real_,
+      block_mean_sd = NA_real_,
+      transition_imbalance = NA_real_,
+      post_error_slowing = NA_real_,
+      max_abs_timebin_q050_cse = NA_real_,
+      mean_cse = NA_real_,
+      median_cse = NA_real_,
+      max_abs_participant_cse = NA_real_,
+      q010_cse = NA_real_,
+      q025_cse = NA_real_,
+      q050_cse = NA_real_,
+      q075_cse = NA_real_,
+      q090_cse = NA_real_,
+      warnings = "metadata_only_fast_diagnostics",
+      preservation_pass = NA,
+      preservation_warnings = "metadata_only_fast_diagnostics",
+      nullification_verdict = dplyr::case_when(
+        meta$effect_condition == "present" ~ "reference_present_metadata_only",
+        TRUE ~ "metadata_only_fast_diagnostics"
+      ),
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+  })
+  dplyr::bind_rows(rows)
+}
+
+diagnostics_mode <- function() {
+  fast <- tolower(Sys.getenv("FAST_DIAGNOSTICS", unset = ""))
+  if (fast %in% c("1", "true", "yes")) return("metadata")
+  mode <- tolower(Sys.getenv("DIAGNOSTICS_MODE", unset = "cached"))
+  if (mode %in% c("fast", "metadata", "metadata_only")) return("metadata")
+  if (mode %in% c("full", "uncached")) return("full")
+  "cached"
+}
+
+use_fast_nullification_diagnostics <- function(n_paths = NULL) {
+  identical(diagnostics_mode(), "metadata")
+}
+
+diagnostics_overwrite <- function() {
+  tolower(Sys.getenv("DIAGNOSTICS_OVERWRITE", unset = "false")) %in% c("1", "true", "yes")
+}
+
+diagnostics_workers <- function() {
+  workers <- suppressWarnings(as.integer(Sys.getenv("DIAGNOSTIC_WORKERS", unset = "1")))
+  if (is.na(workers) || workers < 1L) workers <- 1L
+  workers
+}
+
 read_processed_diagnostic_file <- function(path) {
   ext <- tolower(tools::file_ext(path))
   if (ext == "csv") {
@@ -274,37 +346,122 @@ reference_key <- function(meta) {
   paste(meta$sample_size, meta$subsample_id, meta$transformation, meta$outlier, sep = "__")
 }
 
-build_nullification_diagnostics_for_files <- function(paths) {
-  metas <- lapply(paths, parse_processed_data_id)
-  reference_paths <- list()
-  for (i in seq_along(paths)) {
-    meta <- metas[[i]]
-    if (identical(meta$effect_condition, "present") && identical(meta$strip_method, "none")) {
-      reference_paths[[reference_key(meta)]] <- paths[[i]]
-    }
-  }
+diagnostic_cache_path <- function(cache_dir, data_id) {
+  safe <- gsub("[^A-Za-z0-9_.-]+", "_", data_id)
+  file.path(cache_dir, paste0(safe, ".rds"))
+}
 
-  rows <- lapply(seq_along(paths), function(i) {
-    path <- paths[[i]]
-    meta <- metas[[i]]
-    df <- read_processed_diagnostic_file(path)
-    reference_df <- NULL
-    if (!identical(meta$effect_condition, "present")) {
-      ref_path <- reference_paths[[reference_key(meta)]]
-      if (!is.null(ref_path)) reference_df <- read_processed_diagnostic_file(ref_path)
+write_rds_atomic <- function(object, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  tmp <- tempfile(pattern = paste0(basename(path), ".tmp_"), tmpdir = dirname(path), fileext = ".rds")
+  saveRDS(object, tmp)
+  if (!file.rename(tmp, path)) {
+    file.copy(tmp, path, overwrite = TRUE)
+    unlink(tmp)
+  }
+  path
+}
+
+compute_nullification_diagnostic_for_path <- function(path) {
+  meta <- parse_processed_data_id(path)
+  df <- read_processed_diagnostic_file(path)
+  build_nullification_diagnostic(
+    df,
+    data_id = meta$data_id,
+    effect_condition = meta$effect_condition,
+    strip_method = meta$strip_method,
+    sample_size = meta$sample_size,
+    outlier = meta$outlier,
+    transformation = meta$transformation,
+    reference_df = NULL
+  )
+}
+
+compute_nullification_diagnostic_cached <- function(path, cache_dir, overwrite = FALSE) {
+  meta <- parse_processed_data_id(path)
+  cache_path <- diagnostic_cache_path(cache_dir, meta$data_id)
+  if (file.exists(cache_path) && !isTRUE(overwrite)) {
+    return(readRDS(cache_path))
+  }
+  diagnostic <- compute_nullification_diagnostic_for_path(path)
+  write_rds_atomic(diagnostic, cache_path)
+  diagnostic
+}
+
+row_reference_key <- function(df) {
+  paste(df$sample_size, df$subsample_id, df$transformation, df$outlier, sep = "__")
+}
+
+attach_nullification_reference_metrics <- function(diagnostics) {
+  if (!nrow(diagnostics)) return(diagnostics)
+  if (!"subsample_id" %in% names(diagnostics)) {
+    diagnostics$subsample_id <- vapply(strsplit(diagnostics$data_id, "__", fixed = TRUE), function(x) {
+      if (length(x) >= 2L) suppressWarnings(as.integer(x[[2]])) else NA_integer_
+    }, integer(1))
+  }
+  references <- diagnostics[
+    diagnostics$effect_condition == "present" & diagnostics$strip_method == "none",
+    , drop = FALSE
+  ]
+  if (!nrow(references)) return(diagnostics)
+  ref_keys <- row_reference_key(references)
+  ref_index <- stats::setNames(seq_len(nrow(references)), ref_keys)
+  delta_cols <- c(
+    "current_cong_effect", "previous_cong_effect", "lag1_autocorr_mean",
+    "trial_rt_slope_mean", "block_mean_sd", "transition_imbalance",
+    "post_error_slowing", "max_abs_timebin_q050_cse", "mean_cse",
+    "q010_cse", "q025_cse", "q050_cse", "q075_cse", "q090_cse"
+  )
+  delta_cols <- intersect(delta_cols, names(diagnostics))
+  for (col in delta_cols) diagnostics[[paste0(col, "_delta_from_present")]] <- NA_real_
+
+  null_rows <- which(diagnostics$effect_condition != "present")
+  for (i in null_rows) {
+    key <- row_reference_key(diagnostics[i, , drop = FALSE])
+    if (!key %in% names(ref_index)) next
+    ref_i <- ref_index[[key]]
+    if (is.null(ref_i) || is.na(ref_i)) next
+    for (col in delta_cols) {
+      diagnostics[[paste0(col, "_delta_from_present")]][[i]] <- diagnostics[[col]][[i]] - references[[col]][[ref_i]]
     }
-    build_nullification_diagnostic(
-      df,
-      data_id = meta$data_id,
-      effect_condition = meta$effect_condition,
-      strip_method = meta$strip_method,
-      sample_size = meta$sample_size,
-      outlier = meta$outlier,
-      transformation = meta$transformation,
-      reference_df = reference_df
-    )
-  })
-  dplyr::bind_rows(rows)
+
+    preservation_warnings <- character()
+    if (is.finite(diagnostics$mean_cse[[i]]) && abs(diagnostics$mean_cse[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "residual_mean_cse_gt_5ms")
+    if (is.finite(diagnostics$q050_cse[[i]]) && abs(diagnostics$q050_cse[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "residual_median_quantile_cse_gt_5ms")
+    if ("current_cong_effect_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$current_cong_effect_delta_from_present[[i]]) && abs(diagnostics$current_cong_effect_delta_from_present[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "current_cong_effect_delta_gt_5ms")
+    if ("previous_cong_effect_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$previous_cong_effect_delta_from_present[[i]]) && abs(diagnostics$previous_cong_effect_delta_from_present[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "previous_cong_effect_delta_gt_5ms")
+    if ("lag1_autocorr_mean_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$lag1_autocorr_mean_delta_from_present[[i]]) && abs(diagnostics$lag1_autocorr_mean_delta_from_present[[i]]) > 0.05) preservation_warnings <- c(preservation_warnings, "lag1_autocorr_delta_gt_0.05")
+    if ("trial_rt_slope_mean_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$trial_rt_slope_mean_delta_from_present[[i]]) && abs(diagnostics$trial_rt_slope_mean_delta_from_present[[i]]) > 0.05) preservation_warnings <- c(preservation_warnings, "trial_slope_delta_gt_0.05ms")
+    if ("block_mean_sd_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$block_mean_sd_delta_from_present[[i]]) && abs(diagnostics$block_mean_sd_delta_from_present[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "block_mean_sd_delta_gt_10ms")
+    if ("transition_imbalance_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$transition_imbalance_delta_from_present[[i]]) && abs(diagnostics$transition_imbalance_delta_from_present[[i]]) > 0.01) preservation_warnings <- c(preservation_warnings, "transition_imbalance_delta_gt_0.01")
+    if (is.finite(diagnostics$max_abs_timebin_q050_cse[[i]]) && abs(diagnostics$max_abs_timebin_q050_cse[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "timebin_median_quantile_cse_gt_10ms")
+    if ("post_error_slowing_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$post_error_slowing_delta_from_present[[i]]) && abs(diagnostics$post_error_slowing_delta_from_present[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "post_error_slowing_delta_gt_10ms")
+
+    diagnostics$preservation_pass[[i]] <- length(preservation_warnings) == 0L
+    diagnostics$preservation_warnings[[i]] <- paste(preservation_warnings, collapse = ";")
+    diagnostics$nullification_verdict[[i]] <- if (isTRUE(diagnostics$preservation_pass[[i]])) "interpretable_nullifier" else "fails_preservation_gates"
+  }
+  diagnostics
+}
+
+build_nullification_diagnostics_for_files <- function(paths) {
+  rows <- lapply(paths, compute_nullification_diagnostic_for_path)
+  attach_nullification_reference_metrics(dplyr::bind_rows(rows))
+}
+
+build_nullification_diagnostics_for_files_cached <- function(paths, cache_dir, overwrite = FALSE) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  worker <- function(path) compute_nullification_diagnostic_cached(path, cache_dir, overwrite = overwrite)
+  workers <- diagnostics_workers()
+  rows <- if (workers > 1L && .Platform$OS.type != "windows") {
+    parallel::mclapply(paths, worker, mc.cores = workers)
+  } else {
+    lapply(seq_along(paths), function(i) {
+      if (i %% 1000L == 0L) log_pipeline(logger::INFO, "Computed/cached nullification diagnostics for {i}/{length(paths)} file(s)")
+      worker(paths[[i]])
+    })
+  }
+  attach_nullification_reference_metrics(dplyr::bind_rows(rows))
 }
 
 write_nullification_diagnostics <- function(diagnostics, output_path = file.path("outputs", "analysis", "nullification_diagnostics.csv")) {
@@ -323,6 +480,26 @@ write_nullification_diagnostics_for_dir <- function(
   if (length(paths) == 0L) {
     stop("No processed diagnostic files found in ", input_dir)
   }
-  diagnostics <- build_nullification_diagnostics_for_files(paths)
+  mode <- diagnostics_mode()
+  if (identical(mode, "metadata")) {
+    log_pipeline(
+      logger::WARN,
+      "Using metadata-only nullification diagnostics for {length(paths)} processed files; set DIAGNOSTICS_MODE=cached or full to read parquet data"
+    )
+    diagnostics <- metadata_only_nullification_diagnostics(paths)
+  } else if (identical(mode, "cached")) {
+    cache_dir <- file.path(dirname(output_path), "diagnostics_cache", "nullification")
+    log_pipeline(
+      logger::INFO,
+      "Using cached per-file nullification diagnostics for {length(paths)} processed files in {cache_dir}; workers={diagnostics_workers()}"
+    )
+    diagnostics <- build_nullification_diagnostics_for_files_cached(
+      paths,
+      cache_dir = cache_dir,
+      overwrite = diagnostics_overwrite()
+    )
+  } else {
+    diagnostics <- build_nullification_diagnostics_for_files(paths)
+  }
   write_nullification_diagnostics(diagnostics, output_path)
 }

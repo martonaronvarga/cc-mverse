@@ -81,6 +81,55 @@ parse_shuffle_processed_meta <- function(path) {
   meta
 }
 
+metadata_only_shuffle_adversarial_diagnostics <- function(paths) {
+  metas <- lapply(paths, parse_shuffle_processed_meta)
+  rows <- lapply(metas, function(meta) {
+    if (!identical(meta$effect_condition, "null_interaction") || !identical(meta$strip_method, "shuffle")) {
+      return(NULL)
+    }
+    data.frame(
+      data_id = meta$data_id,
+      present_data_id = NA_character_,
+      n_rows_present = NA_integer_,
+      n_rows_shuffle = NA_integer_,
+      row_count_match = NA,
+      n_groups = NA_integer_,
+      n_count_mismatch_groups = NA_integer_,
+      n_multiset_mismatch_groups = NA_integer_,
+      multiset_preserved = NA,
+      present_prev_cong_rt_slope = NA_real_,
+      shuffle_prev_cong_rt_slope = NA_real_,
+      abs_shuffle_prev_cong_rt_slope = NA_real_,
+      slope_reduction = NA_real_,
+      shuffle_adversarial_pass = NA,
+      warnings = "metadata_only_fast_diagnostics",
+      stringsAsFactors = FALSE
+    )
+  })
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0L) return(data.frame())
+  dplyr::bind_rows(rows)
+}
+
+compute_shuffle_adversarial_pair <- function(meta, ref) {
+  build_shuffle_adversarial_diagnostic(
+    present_df = read_processed_diagnostic_file(ref$path),
+    shuffle_df = read_processed_diagnostic_file(meta$path),
+    data_id = meta$data_id,
+    present_data_id = ref$data_id
+  )
+}
+
+compute_shuffle_adversarial_pair_cached <- function(meta, ref, cache_dir, overwrite = FALSE) {
+  cache_path <- diagnostic_cache_path(cache_dir, meta$data_id)
+  if (file.exists(cache_path) && !isTRUE(overwrite)) {
+    return(readRDS(cache_path))
+  }
+  diagnostic <- compute_shuffle_adversarial_pair(meta, ref)
+  write_rds_atomic(diagnostic, cache_path)
+  diagnostic
+}
+
 build_shuffle_adversarial_diagnostics_for_files <- function(paths) {
   metas <- lapply(paths, parse_shuffle_processed_meta)
   present <- list()
@@ -100,16 +149,42 @@ build_shuffle_adversarial_diagnostics_for_files <- function(paths) {
     if (is.null(ref)) {
       stop("No matching present branch for shuffle data_id: ", meta$data_id)
     }
-    build_shuffle_adversarial_diagnostic(
-      present_df = read_processed_diagnostic_file(ref$path),
-      shuffle_df = read_processed_diagnostic_file(meta$path),
-      data_id = meta$data_id,
-      present_data_id = ref$data_id
-    )
+    compute_shuffle_adversarial_pair(meta, ref)
   })
   rows <- Filter(Negate(is.null), rows)
   if (length(rows) == 0L) {
     return(data.frame())
+  }
+  dplyr::bind_rows(rows)
+}
+
+build_shuffle_adversarial_diagnostics_for_files_cached <- function(paths, cache_dir, overwrite = FALSE) {
+  metas <- lapply(paths, parse_shuffle_processed_meta)
+  present <- list()
+  for (meta in metas) {
+    if (identical(meta$effect_condition, "present") && identical(meta$strip_method, "none")) {
+      present[[meta$key]] <- meta
+    }
+  }
+  shuffle_metas <- Filter(function(meta) {
+    identical(meta$effect_condition, "null_interaction") && identical(meta$strip_method, "shuffle")
+  }, metas)
+  if (!length(shuffle_metas)) return(data.frame())
+
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  worker <- function(meta) {
+    ref <- present[[meta$key]]
+    if (is.null(ref)) stop("No matching present branch for shuffle data_id: ", meta$data_id)
+    compute_shuffle_adversarial_pair_cached(meta, ref, cache_dir, overwrite = overwrite)
+  }
+  workers <- diagnostics_workers()
+  rows <- if (workers > 1L && .Platform$OS.type != "windows") {
+    parallel::mclapply(shuffle_metas, worker, mc.cores = workers)
+  } else {
+    lapply(seq_along(shuffle_metas), function(i) {
+      if (i %% 1000L == 0L) log_pipeline(logger::INFO, "Computed/cached shuffle diagnostics for {i}/{length(shuffle_metas)} pair(s)")
+      worker(shuffle_metas[[i]])
+    })
   }
   dplyr::bind_rows(rows)
 }
@@ -121,7 +196,27 @@ write_shuffle_adversarial_diagnostics_for_dir <- function(
 ) {
   paths <- list.files(input_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
   if (length(paths) == 0L) stop("No processed files found in ", input_dir)
-  diagnostics <- build_shuffle_adversarial_diagnostics_for_files(paths)
+  mode <- if (exists("diagnostics_mode", mode = "function")) diagnostics_mode() else "cached"
+  if (identical(mode, "metadata")) {
+    log_pipeline(
+      logger::WARN,
+      "Using metadata-only shuffle adversarial diagnostics for {length(paths)} processed files; set DIAGNOSTICS_MODE=cached or full to read parquet data"
+    )
+    diagnostics <- metadata_only_shuffle_adversarial_diagnostics(paths)
+  } else if (identical(mode, "cached")) {
+    cache_dir <- file.path(dirname(output_csv), "diagnostics_cache", "shuffle_adversarial")
+    log_pipeline(
+      logger::INFO,
+      "Using cached per-pair shuffle adversarial diagnostics in {cache_dir}; workers={diagnostics_workers()}"
+    )
+    diagnostics <- build_shuffle_adversarial_diagnostics_for_files_cached(
+      paths,
+      cache_dir = cache_dir,
+      overwrite = diagnostics_overwrite()
+    )
+  } else {
+    diagnostics <- build_shuffle_adversarial_diagnostics_for_files(paths)
+  }
   dir.create(dirname(output_csv), recursive = TRUE, showWarnings = FALSE)
   readr::write_csv(diagnostics, output_csv)
   invisible(output_csv)

@@ -67,6 +67,7 @@
             processx
             qs2
             yaml
+            rsvg
           ];
         };
 

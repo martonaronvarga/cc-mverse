@@ -39,8 +39,9 @@ while (i <= length(args)) {
 
 if (!dir.exists(opts$input)) stop("Input directory not found: ", opts$input, call. = FALSE)
 if (!is.finite(opts$dpi) || opts$dpi <= 0) stop("--dpi must be positive", call. = FALSE)
-if (!requireNamespace("rsvg", quietly = TRUE)) {
-  stop("Package 'rsvg' is required. Install it or use the shell converter fallback.", call. = FALSE)
+has_rsvg <- requireNamespace("rsvg", quietly = TRUE)
+if (!has_rsvg) {
+  message("Package 'rsvg' is not available; trying PDF fallbacks for matching .pdf files.")
 }
 
 parse_attrs <- function(svg) {
@@ -96,8 +97,37 @@ if (!length(svgs)) {
   quit(status = 0L)
 }
 
+convert_pdf_fallback <- function(svg, png, dpi) {
+  pdf <- sub("[.]svg$", ".pdf", svg, ignore.case = TRUE)
+  if (!file.exists(pdf)) return(FALSE)
+
+  if (nzchar(Sys.which("pdftoppm"))) {
+    out_base <- tools::file_path_sans_ext(png)
+    out <- system2(
+      "pdftoppm",
+      c("-png", "-singlefile", "-r", as.character(dpi), pdf, out_base),
+      stdout = TRUE,
+      stderr = TRUE
+    )
+    status <- attr(out, "status")
+    if (is.null(status)) status <- 0L
+    if (identical(as.integer(status), 0L) && file.exists(png)) return(TRUE)
+  }
+
+  if (requireNamespace("pdftools", quietly = TRUE)) {
+    ok <- tryCatch({
+      pdftools::pdf_convert(pdf, format = "png", pages = 1L, filenames = png, dpi = dpi, verbose = FALSE)
+      file.exists(png)
+    }, error = function(e) FALSE)
+    if (ok) return(TRUE)
+  }
+
+  FALSE
+}
+
 converted <- 0L
 skipped <- 0L
+failed <- data.frame(svg = character(), reason = character(), stringsAsFactors = FALSE)
 for (svg in svgs) {
   rel <- substring(normalizePath(svg, winslash = "/", mustWork = TRUE), nchar(input_root) + 2L)
   if (is.na(opts$output)) {
@@ -113,10 +143,33 @@ for (svg in svgs) {
   }
 
   dims <- svg_dimensions(svg, opts$dpi)
-  rsvg::rsvg_png(svg, file = png, width = dims$width, height = dims$height)
+  ok <- FALSE
+  if (has_rsvg) {
+    ok <- tryCatch({
+      rsvg::rsvg_png(svg, file = png, width = dims$width, height = dims$height)
+      TRUE
+    }, error = function(e) {
+      message("rsvg failed for ", svg, ": ", conditionMessage(e))
+      FALSE
+    })
+  }
+
+  if (!ok) {
+    ok <- convert_pdf_fallback(svg, png, opts$dpi)
+    if (ok) {
+      cat("Wrote ", png, " from PDF fallback\n", sep = "")
+    } else {
+      failed <- rbind(failed, data.frame(svg = svg, reason = "rsvg failed and no PDF fallback succeeded", stringsAsFactors = FALSE))
+      next
+    }
+  } else {
+    size <- paste0(if (is.null(dims$width)) "auto" else dims$width, "x", if (is.null(dims$height)) "auto" else dims$height)
+    cat("Wrote ", png, " (", size, ")\n", sep = "")
+  }
   converted <- converted + 1L
-  size <- paste0(if (is.null(dims$width)) "auto" else dims$width, "x", if (is.null(dims$height)) "auto" else dims$height)
-  cat("Wrote ", png, " (", size, ")\n", sep = "")
 }
 
-cat("Converted ", converted, " SVG file(s); skipped ", skipped, " up-to-date PNG file(s).\n", sep = "")
+cat("Converted ", converted, " SVG file(s); skipped ", skipped, " up-to-date PNG file(s); failed ", nrow(failed), " file(s).\n", sep = "")
+if (nrow(failed) > 0L) {
+  print(failed, row.names = FALSE)
+}
