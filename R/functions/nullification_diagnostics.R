@@ -328,6 +328,59 @@ diagnostics_workers <- function() {
   workers
 }
 
+diagnostics_progress_every <- function(total, workers = diagnostics_workers()) {
+  every <- suppressWarnings(as.integer(Sys.getenv("DIAGNOSTIC_PROGRESS_EVERY", unset = NA_character_)))
+  if (is.na(every) || every < 1L) every <- max(100L, workers * 25L)
+  min(every, max(1L, total))
+}
+
+format_diagnostic_duration <- function(seconds) {
+  seconds <- max(0, as.numeric(seconds))
+  if (!is.finite(seconds)) return("unknown")
+  if (seconds < 60) return(sprintf("%.0fs", seconds))
+  if (seconds < 3600) return(sprintf("%.1fmin", seconds / 60))
+  sprintf("%.1fh", seconds / 3600)
+}
+
+diagnostics_map_with_progress <- function(items, worker, label, workers = diagnostics_workers()) {
+  total <- length(items)
+  if (!total) return(list())
+  every <- diagnostics_progress_every(total, workers)
+  groups <- split(seq_len(total), ceiling(seq_len(total) / every))
+  started <- Sys.time()
+  out <- vector("list", total)
+  completed <- 0L
+
+  for (idx in groups) {
+    batch <- items[idx]
+    batch_out <- if (workers > 1L && .Platform$OS.type != "windows") {
+      parallel::mclapply(batch, worker, mc.cores = workers)
+    } else {
+      lapply(batch, worker)
+    }
+    out[idx] <- batch_out
+    completed <- completed + length(idx)
+    elapsed <- as.numeric(difftime(Sys.time(), started, units = "secs"))
+    rate <- if (elapsed > 0) completed / elapsed else NA_real_
+    remaining <- total - completed
+    eta <- if (is.finite(rate) && rate > 0) remaining / rate else NA_real_
+    log_pipeline(
+      logger::INFO,
+      sprintf(
+        "%s: %d/%d (%.1f%%) complete; elapsed=%s; rate=%.2f/s; eta=%s",
+        label,
+        completed,
+        total,
+        100 * completed / total,
+        format_diagnostic_duration(elapsed),
+        rate,
+        format_diagnostic_duration(eta)
+      )
+    )
+  }
+  out
+}
+
 read_processed_diagnostic_file <- function(path) {
   ext <- tolower(tools::file_ext(path))
   if (ext == "csv") {
@@ -453,14 +506,12 @@ build_nullification_diagnostics_for_files_cached <- function(paths, cache_dir, o
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
   worker <- function(path) compute_nullification_diagnostic_cached(path, cache_dir, overwrite = overwrite)
   workers <- diagnostics_workers()
-  rows <- if (workers > 1L && .Platform$OS.type != "windows") {
-    parallel::mclapply(paths, worker, mc.cores = workers)
-  } else {
-    lapply(seq_along(paths), function(i) {
-      if (i %% 1000L == 0L) log_pipeline(logger::INFO, "Computed/cached nullification diagnostics for {i}/{length(paths)} file(s)")
-      worker(paths[[i]])
-    })
-  }
+  rows <- diagnostics_map_with_progress(
+    paths,
+    worker,
+    label = "Nullification diagnostics",
+    workers = workers
+  )
   attach_nullification_reference_metrics(dplyr::bind_rows(rows))
 }
 

@@ -178,14 +178,12 @@ build_shuffle_adversarial_diagnostics_for_files_cached <- function(paths, cache_
     compute_shuffle_adversarial_pair_cached(meta, ref, cache_dir, overwrite = overwrite)
   }
   workers <- diagnostics_workers()
-  rows <- if (workers > 1L && .Platform$OS.type != "windows") {
-    parallel::mclapply(shuffle_metas, worker, mc.cores = workers)
-  } else {
-    lapply(seq_along(shuffle_metas), function(i) {
-      if (i %% 1000L == 0L) log_pipeline(logger::INFO, "Computed/cached shuffle diagnostics for {i}/{length(shuffle_metas)} pair(s)")
-      worker(shuffle_metas[[i]])
-    })
-  }
+  rows <- diagnostics_map_with_progress(
+    shuffle_metas,
+    worker,
+    label = "Shuffle adversarial diagnostics",
+    workers = workers
+  )
   dplyr::bind_rows(rows)
 }
 
