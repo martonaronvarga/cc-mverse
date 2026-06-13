@@ -130,6 +130,55 @@ compute_shuffle_adversarial_pair_cached <- function(meta, ref, cache_dir, overwr
   diagnostic
 }
 
+compute_shuffle_adversarial_cache_path <- function(meta, ref, cache_dir, overwrite = FALSE) {
+  cache_path <- diagnostic_cache_path(cache_dir, meta$data_id)
+  if (file.exists(cache_path) && !isTRUE(overwrite)) return(cache_path)
+  diagnostic <- compute_shuffle_adversarial_pair(meta, ref)
+  write_rds_atomic(diagnostic, cache_path)
+}
+
+build_shuffle_present_lookup <- function(paths) {
+  metas <- lapply(paths, parse_shuffle_processed_meta)
+  present <- list()
+  for (meta in metas) {
+    if (identical(meta$effect_condition, "present") && identical(meta$strip_method, "none")) {
+      present[[meta$key]] <- meta
+    }
+  }
+  list(metas = metas, present = present)
+}
+
+compute_shuffle_adversarial_cache_paths <- function(paths, all_paths, cache_dir, overwrite = FALSE) {
+  lookup <- build_shuffle_present_lookup(all_paths)
+  metas <- lapply(paths, parse_shuffle_processed_meta)
+  shuffle_metas <- Filter(function(meta) {
+    identical(meta$effect_condition, "null_interaction") && identical(meta$strip_method, "shuffle")
+  }, metas)
+  if (!length(shuffle_metas)) return(character())
+
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  worker <- function(meta) {
+    ref <- lookup$present[[meta$key]]
+    if (is.null(ref)) stop("No matching present branch for shuffle data_id: ", meta$data_id)
+    compute_shuffle_adversarial_cache_path(meta, ref, cache_dir, overwrite = overwrite)
+  }
+  diagnostics_map_with_progress(
+    shuffle_metas,
+    worker,
+    label = "Shuffle adversarial diagnostics cache",
+    workers = diagnostics_workers()
+  ) |>
+    unlist(use.names = FALSE)
+}
+
+aggregate_shuffle_adversarial_diagnostic_cache <- function(cache_paths, output_csv) {
+  cache_paths <- sort(unique(unlist(cache_paths, use.names = FALSE)))
+  diagnostics <- if (length(cache_paths)) dplyr::bind_rows(lapply(cache_paths, readRDS)) else data.frame()
+  dir.create(dirname(output_csv), recursive = TRUE, showWarnings = FALSE)
+  readr::write_csv(diagnostics, output_csv)
+  invisible(output_csv)
+}
+
 build_shuffle_adversarial_diagnostics_for_files <- function(paths) {
   metas <- lapply(paths, parse_shuffle_processed_meta)
   present <- list()

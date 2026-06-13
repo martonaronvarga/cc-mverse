@@ -441,6 +441,52 @@ compute_nullification_diagnostic_cached <- function(path, cache_dir, overwrite =
   diagnostic
 }
 
+compute_nullification_diagnostic_cache_path <- function(path, cache_dir, overwrite = FALSE) {
+  meta <- parse_processed_data_id(path)
+  cache_path <- diagnostic_cache_path(cache_dir, meta$data_id)
+  if (file.exists(cache_path) && !isTRUE(overwrite)) return(cache_path)
+  diagnostic <- compute_nullification_diagnostic_for_path(path)
+  write_rds_atomic(diagnostic, cache_path)
+}
+
+diagnostic_chunk_size <- function(default = 500L) {
+  size <- suppressWarnings(as.integer(Sys.getenv("DIAGNOSTIC_CHUNK_SIZE", unset = as.character(default))))
+  if (is.na(size) || size < 1L) size <- default
+  size
+}
+
+list_processed_diagnostic_paths <- function(input_dir, pattern = "^processed__.*\\.(parquet|csv)$") {
+  paths <- list.files(input_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
+  if (!length(paths)) stop("No processed diagnostic files found in ", input_dir)
+  sort(paths)
+}
+
+split_diagnostic_paths <- function(paths, chunk_size = diagnostic_chunk_size()) {
+  paths <- sort(paths)
+  if (!length(paths)) return(list())
+  split(paths, ceiling(seq_along(paths) / max(1L, as.integer(chunk_size))))
+}
+
+compute_nullification_diagnostic_cache_paths <- function(paths, cache_dir, overwrite = FALSE) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  worker <- function(path) compute_nullification_diagnostic_cache_path(path, cache_dir, overwrite = overwrite)
+  diagnostics_map_with_progress(
+    paths,
+    worker,
+    label = "Nullification diagnostics cache",
+    workers = diagnostics_workers()
+  ) |>
+    unlist(use.names = FALSE)
+}
+
+aggregate_nullification_diagnostic_cache <- function(cache_paths, output_path) {
+  cache_paths <- sort(unique(unlist(cache_paths, use.names = FALSE)))
+  if (!length(cache_paths)) stop("No nullification diagnostic cache files to aggregate")
+  rows <- lapply(cache_paths, readRDS)
+  diagnostics <- attach_nullification_reference_metrics(dplyr::bind_rows(rows))
+  write_nullification_diagnostics(diagnostics, output_path)
+}
+
 row_reference_key <- function(df) {
   paste(df$sample_size, df$subsample_id, df$transformation, df$outlier, sep = "__")
 }

@@ -104,15 +104,42 @@ target3 <- targets::tar_target(
   deployment = "main"
 )
 
-target4 <- targets::tar_target(
-  nullification_diagnostics_file,
+target4a <- targets::tar_target(
+  processed_diagnostic_paths,
   {
     processed_data_dir
-    output <- file.path(paths$outputs_analysis, "nullification_diagnostics.csv")
-    write_nullification_diagnostics_for_dir(paths$data_processed, output)
-    output
+    list_processed_diagnostic_paths(paths$data_processed)
   },
+  deployment = "main"
+)
+
+target4b <- targets::tar_target(
+  diagnostic_path_chunks,
+  split_diagnostic_paths(processed_diagnostic_paths),
+  iteration = "list",
+  deployment = "main"
+)
+
+target4c <- targets::tar_target(
+  nullification_diagnostic_cache_files,
+  compute_nullification_diagnostic_cache_paths(
+    diagnostic_path_chunks,
+    cache_dir = file.path(paths$outputs_analysis, "diagnostics_cache", "nullification"),
+    overwrite = diagnostics_overwrite()
+  ),
+  pattern = map(diagnostic_path_chunks),
+  iteration = "list",
   format = "file"
+)
+
+target4d <- targets::tar_target(
+  nullification_diagnostics_file,
+  aggregate_nullification_diagnostic_cache(
+    nullification_diagnostic_cache_files,
+    output_path = file.path(paths$outputs_analysis, "nullification_diagnostics.csv")
+  ),
+  format = "file",
+  deployment = "main"
 )
 
 target5 <- targets::tar_target(
@@ -128,15 +155,39 @@ target5 <- targets::tar_target(
   format = "file"
 )
 
-target6 <- targets::tar_target(
-  shuffle_adversarial_diagnostics_file,
+target6a <- targets::tar_target(
+  shuffle_diagnostic_path_chunks,
   {
-    processed_data_dir
-    output <- file.path(paths$outputs_analysis, "shuffle_adversarial_diagnostics.csv")
-    write_shuffle_adversarial_diagnostics_for_dir(paths$data_processed, output)
-    output
+    shuffle_paths <- processed_diagnostic_paths[
+      grepl("__null_interaction__shuffle[.](parquet|csv)$", basename(processed_diagnostic_paths), ignore.case = TRUE)
+    ]
+    split_diagnostic_paths(shuffle_paths)
   },
+  iteration = "list",
+  deployment = "main"
+)
+
+target6b <- targets::tar_target(
+  shuffle_adversarial_diagnostic_cache_files,
+  compute_shuffle_adversarial_cache_paths(
+    shuffle_diagnostic_path_chunks,
+    all_paths = processed_diagnostic_paths,
+    cache_dir = file.path(paths$outputs_analysis, "diagnostics_cache", "shuffle_adversarial"),
+    overwrite = diagnostics_overwrite()
+  ),
+  pattern = map(shuffle_diagnostic_path_chunks),
+  iteration = "list",
   format = "file"
+)
+
+target6c <- targets::tar_target(
+  shuffle_adversarial_diagnostics_file,
+  aggregate_shuffle_adversarial_diagnostic_cache(
+    shuffle_adversarial_diagnostic_cache_files,
+    output_csv = file.path(paths$outputs_analysis, "shuffle_adversarial_diagnostics.csv")
+  ),
+  format = "file",
+  deployment = "main"
 )
 
 # Model fitting: chunk branch table into coarse dynamic branches. This replaces
@@ -251,6 +302,9 @@ target12 <- targets::tar_target(
 )
 
 list(
-  target0, target1, target2, target3, target4, target5, target6,
+  target0, target1, target2, target3,
+  target4a, target4b, target4c, target4d,
+  target5,
+  target6a, target6b, target6c,
   target7a, target7b, target8, target9, target10, target11, target12
 )
