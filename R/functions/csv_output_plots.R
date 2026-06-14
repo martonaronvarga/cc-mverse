@@ -206,8 +206,8 @@ plot_health_table <- function(df, title) {
   if (length(cols) == 0) return(NULL)
   d <- df %>%
     csvp_labels() %>%
-    tidyr::pivot_longer(dplyr::all_of(cols), names_to = "metric", values_to = "value") %>%
-    dplyr::mutate(metric = csvp_wrap(gsub("^pct_", "", .data$metric), 12))
+    tidyr::pivot_longer(dplyr::all_of(cols), names_to = "numeric_metric", values_to = "value") %>%
+    dplyr::mutate(metric = csvp_wrap(gsub("^pct_", "", .data$numeric_metric), 12))
   ggplot2::ggplot(d, ggplot2::aes(x = model_label, y = value / 100, fill = metric)) +
     ggplot2::geom_col(position = "dodge", width = 0.72) +
     ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
@@ -215,6 +215,103 @@ plot_health_table <- function(df, title) {
     ggplot2::labs(title = title, x = NULL, y = "Branch proportion", fill = "Metric") +
     csvp_theme() +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, vjust = 1))
+}
+
+csvp_data_id_parts <- function(df) {
+  if (all(c("sample_size", "outlier", "transformation") %in% names(df))) return(df)
+  if (!"data_id" %in% names(df)) return(df)
+  parts <- strsplit(as.character(df$data_id), "__", fixed = TRUE)
+  if (!"sample_size" %in% names(df)) {
+    df$sample_size <- suppressWarnings(as.numeric(vapply(parts, function(x) if (length(x) >= 1L) x[[1]] else NA_character_, character(1))))
+  }
+  if (!"transformation" %in% names(df)) {
+    df$transformation <- vapply(parts, function(x) if (length(x) >= 3L) x[[3]] else NA_character_, character(1))
+  }
+  if (!"outlier" %in% names(df)) {
+    df$outlier <- vapply(parts, function(x) if (length(x) >= 4L) x[[4]] else NA_character_, character(1))
+  }
+  df
+}
+
+plot_nullification_diagnostics_csv <- function(df, title) {
+  required <- c("strip_method", "transformation", "sample_size", "nullification_verdict")
+  if (!all(required %in% names(df))) return(NULL)
+  d <- df %>%
+    dplyr::filter(.data$effect_condition == "null_interaction") %>%
+    dplyr::group_by(.data$strip_method, .data$transformation, .data$sample_size, .data$nullification_verdict) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(.data$strip_method, .data$transformation, .data$sample_size) %>%
+    dplyr::mutate(rate = .data$n / sum(.data$n)) %>%
+    dplyr::ungroup() %>%
+    csvp_labels() %>%
+    dplyr::mutate(sample_label = scales::percent(.data$sample_size, accuracy = 1))
+  if (nrow(d) == 0) return(NULL)
+  ggplot2::ggplot(d, ggplot2::aes(x = sample_label, y = strip_method, fill = rate)) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.3) +
+    ggplot2::facet_grid(rows = ggplot2::vars(nullification_verdict), cols = ggplot2::vars(transformation_label)) +
+    ggplot2::scale_fill_viridis_c(labels = scales::percent, name = "Branch share") +
+    ggplot2::labs(title = title, subtitle = "Share of nullification branches by verdict, method, sample fraction, and transform.", x = "Sample fraction", y = "Nullification method") +
+    csvp_theme(base_size = 9) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, vjust = 1))
+}
+
+plot_shuffle_adversarial_csv <- function(df, title) {
+  df <- csvp_data_id_parts(df)
+  required <- c("outlier", "transformation", "row_count_match", "multiset_preserved", "abs_shuffle_prev_cong_rt_slope")
+  if (!all(required %in% names(df))) return(NULL)
+  d <- df %>%
+    dplyr::group_by(.data$outlier, .data$transformation) %>%
+    dplyr::summarise(
+      row_count_match_rate = mean(.data$row_count_match %in% TRUE, na.rm = TRUE),
+      multiset_preserved_rate = mean(.data$multiset_preserved %in% TRUE, na.rm = TRUE),
+      median_abs_slope = stats::median(.data$abs_shuffle_prev_cong_rt_slope, na.rm = TRUE),
+      n = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_longer(
+      c("row_count_match_rate", "multiset_preserved_rate", "median_abs_slope"),
+      names_to = "numeric_metric",
+      values_to = "value"
+    ) %>%
+    csvp_labels() %>%
+    dplyr::mutate(metric = csvp_wrap(gsub("_", " ", .data$numeric_metric), 16))
+  if (nrow(d) == 0) return(NULL)
+  ggplot2::ggplot(d, ggplot2::aes(x = outlier_label, y = value, fill = transformation_label)) +
+    ggplot2::geom_col(position = "dodge", width = 0.72) +
+    ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free_y") +
+    ggplot2::labs(title = title, subtitle = "Aggregated shuffle adversarial preservation checks by outlier rule and transform.", x = "Outlier rule", y = "Value", fill = "Transform") +
+    csvp_theme(base_size = 9) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, vjust = 1))
+}
+
+plot_cse_definition_metrics_long <- function(df, title) {
+  required <- c("metric", "abs_cse_value", "strip_method", "transformation")
+  if (!all(required %in% names(df))) return(NULL)
+  d <- df %>%
+    dplyr::filter(is.finite(.data$abs_cse_value)) %>%
+    dplyr::group_by(.data$strip_method, .data$transformation, .data$metric) %>%
+    dplyr::summarise(
+      median_abs_cse = stats::median(.data$abs_cse_value, na.rm = TRUE),
+      p95_abs_cse = stats::quantile(.data$abs_cse_value, probs = 0.95, na.rm = TRUE),
+      n = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    csvp_labels() %>%
+    dplyr::mutate(metric_label = csvp_wrap(.data$metric, 18))
+  if (nrow(d) == 0) return(NULL)
+  ggplot2::ggplot(d, ggplot2::aes(x = strip_method, y = metric_label, fill = median_abs_cse)) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.35) +
+    ggplot2::geom_text(ggplot2::aes(label = scales::number(p95_abs_cse, accuracy = 0.01)), size = 2.7, color = "grey15") +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free_x") +
+    ggplot2::scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "Median |CSE|") +
+    ggplot2::labs(
+      title = title,
+      subtitle = "Tile fill is median absolute CSE; text is 95th percentile absolute CSE across branches.",
+      x = "Nullification method",
+      y = "CSE definition"
+    ) +
+    csvp_theme(base_size = 9) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30, hjust = 1, vjust = 1))
 }
 
 plot_numeric_profile <- function(df, title) {
@@ -225,9 +322,9 @@ plot_numeric_profile <- function(df, title) {
   if (is.na(id_col)) id_col <- names(df)[[1]]
   d <- df %>%
     dplyr::mutate(row_label = csvp_wrap(.data[[id_col]], 28)) %>%
-    tidyr::pivot_longer(dplyr::all_of(numeric_cols), names_to = "metric", values_to = "value") %>%
+    tidyr::pivot_longer(dplyr::all_of(numeric_cols), names_to = "numeric_metric", values_to = "value") %>%
     dplyr::filter(is.finite(.data$value)) %>%
-    dplyr::mutate(metric = csvp_wrap(.data$metric, 18))
+    dplyr::mutate(metric = csvp_wrap(.data$numeric_metric, 18))
   if (nrow(d) == 0) return(NULL)
   ggplot2::ggplot(d, ggplot2::aes(x = row_label, y = value)) +
     ggplot2::geom_col(fill = "#546E7A", width = 0.72) +
@@ -253,6 +350,12 @@ plot_csv_output <- function(csv_path) {
     plot_branch_result_map(df, title)
   } else if (grepl("dependency_report_r_packages", base)) {
     plot_dependency_status(df, title)
+  } else if (identical(base, "nullification_diagnostics")) {
+    plot_nullification_diagnostics_csv(df, title)
+  } else if (identical(base, "shuffle_adversarial_diagnostics")) {
+    plot_shuffle_adversarial_csv(df, title)
+  } else if (identical(base, "cse_definition_metrics_long")) {
+    plot_cse_definition_metrics_long(df, title)
   } else if (any(c("FPR", "power", "pct_significant", "unconditional_rate", "conditional_rate") %in% names(df))) {
     plot_rate_table(df, title)
   } else {
