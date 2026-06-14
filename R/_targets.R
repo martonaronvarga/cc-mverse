@@ -236,55 +236,55 @@ target8 <- targets::tar_target(
     logger::log_info("Aggregating chunked model results...")
     results <- load_results(paths, validate = TRUE)
 
-	branch_lookup <- branch_specs |>
-	  dplyr::select(branch_id, data_id) |>
-	  dplyr::distinct()
+    branch_lookup <- branch_specs |>
+      dplyr::select(branch_id, data_id) |>
+      dplyr::distinct()
 
-	if (!"branch_id" %in% names(results)) {
-	  stop("Aggregated results are missing branch_id; cannot attach data_id")
-	}
+    if (!"branch_id" %in% names(results)) {
+      stop("Aggregated results are missing branch_id; cannot attach data_id")
+    }
 
-	if (!"data_id" %in% names(results)) {
-	  missing_lookup <- dplyr::anti_join(
-	    results |> dplyr::distinct(branch_id),
-	    branch_lookup,
-	    by = "branch_id"
-	  )
+    if (!"data_id" %in% names(results)) {
+      missing_lookup <- dplyr::anti_join(
+        results |> dplyr::distinct(branch_id),
+        branch_lookup,
+        by = "branch_id"
+      )
 
-	  if (nrow(missing_lookup) > 0L) {
-	    stop(
-	      "Cannot attach data_id: ",
-	      nrow(missing_lookup),
-	      " result branch_id values are absent from branch_specs. First missing: ",
-	      missing_lookup$branch_id[[1]]
-	    )
-	  }
+      if (nrow(missing_lookup) > 0L) {
+        stop(
+          "Cannot attach data_id: ",
+          nrow(missing_lookup),
+          " result branch_id values are absent from branch_specs. First missing: ",
+          missing_lookup$branch_id[[1]]
+        )
+      }
 
-	  duplicate_lookup <- branch_lookup |>
-	    dplyr::count(branch_id) |>
-	    dplyr::filter(n > 1L)
+      duplicate_lookup <- branch_lookup |>
+        dplyr::count(branch_id) |>
+        dplyr::filter(n > 1L)
 
-	  if (nrow(duplicate_lookup) > 0L) {
-	    stop(
-	      "Cannot attach data_id: branch_specs has duplicate branch_id mappings. First duplicate: ",
-	      duplicate_lookup$branch_id[[1]]
-	    )
-	  }
+      if (nrow(duplicate_lookup) > 0L) {
+        stop(
+          "Cannot attach data_id: branch_specs has duplicate branch_id mappings. First duplicate: ",
+          duplicate_lookup$branch_id[[1]]
+        )
+      }
 
-	  results <- results |>
-	    dplyr::left_join(branch_lookup, by = "branch_id", relationship = "many-to-one") |>
-	    dplyr::relocate(data_id, .after = branch_id)
-	}
+      results <- results |>
+        dplyr::left_join(branch_lookup, by = "branch_id", relationship = "many-to-one") |>
+        dplyr::relocate(data_id, .after = branch_id)
+    }
 
-	if (anyNA(results$data_id)) {
-	  stop("data_id attachment produced NA values")
-	}
+    if (anyNA(results$data_id)) {
+      stop("data_id attachment produced NA values")
+    }
 
-	logger::log_info(
-	  "Aggregated {nrow(results)} results with {dplyr::n_distinct(results$data_id)} data_id values"
-	)
+    logger::log_info(
+      "Aggregated {nrow(results)} results with {dplyr::n_distinct(results$data_id)} data_id values"
+    )
 
-	results
+    results
   },
   deployment = "main"
 )
@@ -295,8 +295,15 @@ target9 <- targets::tar_target(
     nullification_diagnostics_file
     model_chunk_files
     results_all
+
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
-    analyze_and_save(results_all, paths, diagnostics_csv = nullification_diagnostics_file, alpha = config$alpha)
+
+    analyze_and_save(
+      results_all,
+      paths,
+      diagnostics_csv = nullification_diagnostics_file,
+      alpha = config$alpha
+    )
   },
   deployment = "main"
 )
@@ -307,20 +314,34 @@ target10 <- targets::tar_target(
     nullification_diagnostics_file
     results_all
     analysis
+
     diagnostics <- readr::read_csv(nullification_diagnostics_file, show_col_types = FALSE)
-    tables <- build_nullification_operating_characteristics(results_all, diagnostics, alpha = config$alpha)
-    output_dir <- file.path(paths$outputs_analysis, "nullification_operating_characteristics")
+
+    tables <- build_nullification_operating_characteristics(
+      results_all,
+      diagnostics,
+      alpha = config$alpha
+    )
+
+    output_dir <- file.path(
+      analysis_latest_dir(paths),
+      "nullification_operating_characteristics"
+    )
+
     dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
     paths_out <- c(
       file.path(output_dir, "nullification_fpr_coarse.csv"),
       file.path(output_dir, "nullification_fpr_by_sample.csv"),
       file.path(output_dir, "nullification_fpr_by_outlier.csv"),
       file.path(output_dir, "nullification_failure_aware_rates.csv")
     )
+
     readr::write_csv(tables$fpr_coarse, paths_out[[1]])
     readr::write_csv(tables$fpr_by_sample, paths_out[[2]])
     readr::write_csv(tables$fpr_by_outlier, paths_out[[3]])
     readr::write_csv(tables$failure_aware, paths_out[[4]])
+
     paths_out
   },
   format = "file",
@@ -333,11 +354,25 @@ target11 <- targets::tar_target(
     analysis
     results_all
     nullification_operating_characteristics_files
+
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
-    source("functions/analysis_plots.R")
-    fig_dir <- file.path(paths$outputs_analysis, "figures")
-    generate_multiverse_dashboard(analysis, output_dir = fig_dir, save_individual = TRUE)
-    list.files(fig_dir, full.names = TRUE)
+
+    fig_dir <- file.path(analysis_latest_dir(paths), "figures")
+    dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+    generate_multiverse_dashboard(
+      analysis,
+      output_dir = fig_dir,
+      save_individual = TRUE
+    )
+
+    files <- list.files(fig_dir, full.names = TRUE, recursive = TRUE)
+
+    if (length(files) == 0L) {
+      stop("Plot generation produced zero files in: ", fig_dir)
+    }
+
+    files
   },
   format = "file",
   deployment = "main"
@@ -352,14 +387,22 @@ target12 <- targets::tar_target(
     shuffle_adversarial_diagnostics_file
     nullification_operating_characteristics_files
     plots
+
     if (!tolower(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "false")) %in% c("1", "true", "yes")) {
       logger::log_info("Skipping exhaustive CSV plot gallery; set PLOT_ALL_CSV_OUTPUTS=true to enable")
       character()
     } else {
-      output_dir <- file.path(paths$outputs_analysis, "figures", "csv_outputs")
-      manifest <- write_csv_output_plots(paths$outputs_analysis, output_dir)
+      analysis_dir <- analysis_latest_dir(paths)
+      output_dir <- file.path(analysis_dir, "figures", "csv_outputs")
+
+      manifest <- write_csv_output_plots(
+        analysis_dir,
+        output_dir
+      )
+
       manifest_path <- file.path(output_dir, "csv_output_plot_manifest.csv")
       readr::write_csv(manifest, manifest_path)
+
       c(manifest$plot[manifest$plotted], manifest_path)
     }
   },
@@ -372,6 +415,6 @@ list(
   target4a, target4b, target4c, target4d, target4e,
   target5,
   target6a, target6b, target6c,
-  target7a, target7b, 
+  target7a, target7b,
   target8, target9, target10, target11, target12
 )

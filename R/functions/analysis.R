@@ -364,8 +364,16 @@ compute_failure_aware_nullification_rates <- function(prepared_df, alpha = 0.05)
     )
 
   group_vars <- c(
-    "rate_source", "rate_label", "interpretable_fpr_source", "null_type",
-    "model_type", "transformation", "sample_size", "outlier"
+    "rate_source",
+    "rate_label",
+    "interpretable_fpr_source",
+    "null_type",
+    "effect_condition",
+    "strip_method",
+    "model_type",
+    "transformation",
+    "sample_size",
+    "outlier"
   )
 
   null_df %>%
@@ -982,6 +990,97 @@ analyze_multiverse_results <- function(results_df, diagnostics_df = NULL, alpha 
   analyses
 }
 
+get_analysis_run_id <- function() {
+  Sys.getenv(
+    "PIPELINE_RUN_ID",
+    unset = format(Sys.time(), "%Y%m%d_%H%M%S")
+  )
+}
+
+analysis_run_dir <- function(paths, run_id = get_analysis_run_id()) {
+  file.path(paths$outputs_analysis, "runs", run_id)
+}
+
+analysis_latest_dir <- function(paths) {
+  latest <- file.path(paths$outputs_analysis, "latest")
+  link <- Sys.readlink(latest)
+
+  if (nzchar(link)) {
+    if (grepl("^/", link)) {
+      return(normalizePath(link, mustWork = FALSE))
+    }
+    return(normalizePath(file.path(dirname(latest), link), mustWork = FALSE))
+  }
+
+  latest
+}
+
+update_analysis_latest_link <- function(paths, run_dir) {
+  root <- paths$outputs_analysis
+  latest <- file.path(root, "latest")
+  rel_target <- file.path("runs", basename(run_dir))
+  tmp <- file.path(root, paste0(".latest.tmp.", Sys.getpid()))
+
+  dir.create(root, recursive = TRUE, showWarnings = FALSE)
+
+  if (file.exists(tmp) || nzchar(Sys.readlink(tmp))) {
+    unlink(tmp, recursive = TRUE)
+  }
+
+  if (!file.symlink(rel_target, tmp)) {
+    stop("Failed to create temporary latest symlink: ", tmp, " -> ", rel_target)
+  }
+
+  latest_is_symlink <- nzchar(Sys.readlink(latest))
+
+  if (file.exists(latest) && !latest_is_symlink) {
+    backup <- file.path(
+      root,
+      paste0("latest.backup.", format(Sys.time(), "%Y%m%d_%H%M%S"))
+    )
+
+    if (!file.rename(latest, backup)) {
+      unlink(tmp)
+      stop("Refusing to overwrite non-symlink latest path: ", latest)
+    }
+
+    log_pipeline(logger::WARN, "Moved non-symlink latest path to {backup}")
+  }
+
+  if (file.exists(latest) || latest_is_symlink) {
+    unlink(latest, recursive = TRUE)
+  }
+
+  if (!file.rename(tmp, latest)) {
+    unlink(tmp)
+    stop("Failed to promote latest symlink: ", latest)
+  }
+
+  invisible(latest)
+}
+
+write_analysis_manifest <- function(output_files, analyses, run_dir, run_id) {
+  manifest <- purrr::imap_dfr(output_files, function(path, name) {
+    df <- analyses[[name]]
+
+    tibble::tibble(
+      run_id = run_id,
+      table = name,
+      file = basename(path),
+      path = path,
+      rows = nrow(df),
+      columns = ncol(df),
+      column_names = paste(names(df), collapse = ","),
+      size_bytes = file.info(path)$size,
+      md5 = unname(tools::md5sum(path))
+    )
+  })
+
+  manifest_path <- file.path(run_dir, "analysis_manifest.csv")
+  readr::write_csv(manifest, manifest_path)
+  manifest_path
+}
+
 #' Analyze results and save to disk
 #'
 #' @param results_df Aggregated results tibble
@@ -991,11 +1090,12 @@ analyze_multiverse_results <- function(results_df, diagnostics_df = NULL, alpha 
 #' @return List of written file paths
 #'
 analyze_and_save <- function(results_df, paths, diagnostics_csv = NULL, alpha = 0.05) {
-  log_pipeline(logger::INFO, "Saving multiverse analysis results...")
+  run_id <- get_analysis_run_id()
+  run_dir <- analysis_run_dir(paths, run_id = run_id)
 
-  if (!dir.exists(paths$outputs_analysis)) {
-    dir.create(paths$outputs_analysis, recursive = TRUE, showWarnings = FALSE)
-  }
+  log_pipeline(logger::INFO, "Saving multiverse analysis results to {run_dir}")
+
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
   diagnostics_df <- NULL
   if (!is.null(diagnostics_csv)) {
@@ -1011,16 +1111,28 @@ analyze_and_save <- function(results_df, paths, diagnostics_csv = NULL, alpha = 
       next
     }
 
-    filename <- glue::glue("{name}_{format(Sys.time(), '%Y%m%d_%H%M%S')}.csv")
-    filepath <- file.path(paths$outputs_analysis, filename)
+    filename <- paste0(name, ".csv")
+    filepath <- file.path(run_dir, filename)
     readr::write_csv(df, filepath)
     log_pipeline(logger::INFO, "Wrote analysis: {filepath}")
     output_files[[name]] <- filepath
   }
 
+  manifest_path <- write_analysis_manifest(
+    output_files = output_files,
+    analyses = analyses,
+    run_dir = run_dir,
+    run_id = run_id
+  )
+
+  log_pipeline(logger::INFO, "Wrote analysis manifest: {manifest_path}")
+
+  update_analysis_latest_link(paths, run_dir)
+
   log_pipeline(
     logger::INFO,
-    "Analysis complete, {length(output_files)} files saved"
+    "Analysis complete, {length(output_files)} files saved under run_id={run_id}"
   )
+
   invisible(analyses)
 }
