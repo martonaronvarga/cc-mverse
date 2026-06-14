@@ -266,9 +266,9 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
     )
 
   coarse <- usable_null %>%
-    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation) %>%
+    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, effect_condition, strip_method, null_type, model_type, transformation) %>%
     dplyr::summarise(
-      n = dplyr::n(), false_positives = sum(sig),
+      n = dplyr::n(), false_positives = sum(sig, na.rm = TRUE),
       FPR = false_positives / n,
       mean_p = mean(main_p_value, na.rm = TRUE),
       median_p = median(main_p_value, na.rm = TRUE),
@@ -276,20 +276,43 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
       .groups = "drop"
     )
 
-  medium <- usable_null %>%
-    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation, sample_size) %>%
+  by_sample_size <- usable_null %>%
+    dplyr::group_by(
+      rate_source,
+      rate_label,
+      interpretable_fpr_source,
+      null_type,
+      effect_condition,
+      strip_method,
+      model_type,
+      transformation,
+      sample_size
+    ) %>%
     dplyr::summarise(
-      n = dplyr::n(), false_positives = sum(sig),
+      n = dplyr::n(),
+      false_positives = sum(sig, na.rm = TRUE),
       FPR = false_positives / n,
       mean_p = mean(main_p_value, na.rm = TRUE),
       mean_estimate = mean(main_estimate, na.rm = TRUE),
       .groups = "drop"
     )
 
-  fine <- usable_null %>%
-    dplyr::group_by(rate_source, rate_label, interpretable_fpr_source, null_type, model_type, transformation, sample_size, outlier) %>%
+  by_outlier <- usable_null %>%
+    dplyr::group_by(
+      rate_source,
+      rate_label,
+      interpretable_fpr_source,
+      null_type,
+      effect_condition,
+      strip_method,
+      model_type,
+      transformation,
+      sample_size,
+      outlier
+    ) %>%
     dplyr::summarise(
-      n = dplyr::n(), false_positives = sum(sig),
+      n = dplyr::n(),
+      false_positives = sum(sig, na.rm = TRUE),
       FPR = false_positives / n,
       mean_estimate = mean(main_estimate, na.rm = TRUE),
       .groups = "drop"
@@ -297,13 +320,29 @@ compute_fpr_tables <- function(prepared_df, alpha = 0.05) {
 
   per_branch <- usable_null %>%
     dplyr::transmute(
-      rate_source, rate_label, interpretable_fpr_source,
-      null_type, model_type, transformation, sample_size, subsample_id, outlier,
-      significant = sig, p_value = main_p_value,
-      estimate = main_estimate, std_error = main_std_error
+      rate_source,
+      rate_label,
+      interpretable_fpr_source,
+      null_type,
+      effect_condition,
+      strip_method,
+      model_type,
+      transformation,
+      sample_size,
+      subsample_id,
+      outlier,
+      significant = sig,
+      p_value = main_p_value,
+      estimate = main_estimate,
+      std_error = main_std_error
     )
 
-  list(coarse = coarse, by_sample_size = medium, by_outlier = fine, per_branch = per_branch)
+  list(
+    coarse = coarse,
+    by_sample_size = by_sample_size,
+    by_outlier = by_outlier,
+    per_branch = per_branch
+  )
 }
 
 compute_failure_aware_nullification_rates <- function(prepared_df, alpha = 0.05) {

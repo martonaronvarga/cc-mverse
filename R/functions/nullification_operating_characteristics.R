@@ -21,7 +21,6 @@ join_nullification_diagnostics <- function(results_df, diagnostics_df) {
 }
 
 build_nullification_operating_characteristics <- function(results_df, diagnostics_df, alpha = 0.05) {
-  source("R/functions/analysis.R")
   joined <- join_nullification_diagnostics(results_df, diagnostics_df)
   prepared <- prepare_analysis_df(joined)
   fpr_tables <- compute_fpr_tables(prepared, alpha = alpha)
@@ -30,7 +29,7 @@ build_nullification_operating_characteristics <- function(results_df, diagnostic
   list(
     prepared = prepared,
     fpr_coarse = fpr_tables$coarse,
-    fpr_by_sample = fpr_tables$by_sample,
+    fpr_by_sample = fpr_tables$by_sample_size,
     fpr_by_outlier = fpr_tables$by_outlier,
     fpr_per_branch = fpr_tables$per_branch,
     failure_aware = failure_aware

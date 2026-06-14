@@ -45,7 +45,13 @@ plot_save_fallback <- function(filepath, plot, width = 10, height = 7, dpi = 180
 
   saved <- character()
   for (ext in names(devices)) {
-    ok <- tryCatch({ devices[[ext]](paste0(filepath, ".", ext)); TRUE }, error = function(e) FALSE)
+    ok <- tryCatch(
+      {
+        devices[[ext]](paste0(filepath, ".", ext))
+        TRUE
+      },
+      error = function(e) FALSE
+    )
     if (ok) {
       saved <- c(saved, paste0(filepath, ".", ext))
       plot_log(logger::INFO, "Saved plot: {filepath}.{ext}")
@@ -53,7 +59,9 @@ plot_save_fallback <- function(filepath, plot, width = 10, height = 7, dpi = 180
       return(invisible(saved))
     }
   }
-  if (length(saved) > 0) return(invisible(saved))
+  if (length(saved) > 0) {
+    return(invisible(saved))
+  }
   plot_log(logger::WARN, "Could not save plot in any headless-safe format: {filepath}")
   invisible(filepath)
 }
@@ -81,7 +89,7 @@ get_effect_palette <- function() {
 get_null_type_palette <- function() {
   c(
     "null_interaction:shuffle" = "#1976D2",
-    "null_interaction:additive_qmap"  = "#F57C00",
+    "null_interaction:additive_qmap" = "#F57C00",
     "null_interaction:additive_qmap_trial_bin" = "#00897B",
     "null_interaction:local_mean_residual" = "#8D6E63",
     "null_interaction:local_median_residual" = "#546E7A"
@@ -105,9 +113,23 @@ wrap_discrete_labels <- function(width = 22) {
 }
 
 plot_log <- function(level, message) {
-  if (exists("log_pipeline", mode = "function")) {
-    log_pipeline(level, message)
+  formatted_msg <- tryCatch(
+    as.character(glue::glue(message, .envir = parent.frame())),
+    error = function(glue_err) {
+      paste0(
+        message,
+        " [glue error: ",
+        glue_err$message,
+        "]"
+      )
+    }
+  )
+  if (requireNamespace("logger", quietly = TRUE)) {
+    logger::log_level(level, logger::skip_formatter(formatted_msg))
+  } else {
+    message(formatted_msg)
   }
+
   invisible(NULL)
 }
 
@@ -159,7 +181,9 @@ pretty_outlier <- function(x) {
 }
 
 prepare_plot_labels <- function(df) {
-  if (is.null(df) || !is.data.frame(df)) return(df)
+  if (is.null(df) || !is.data.frame(df)) {
+    return(df)
+  }
   df %>%
     dplyr::mutate(
       dplyr::across(
@@ -1246,17 +1270,17 @@ generate_multiverse_dashboard <- function(
   }
 
   plots <- list(
-    fpr_by_null_type   = safe_plot(plot_fpr_by_null_type(fpr_coarse), "fpr_by_null_type"),
+    fpr_by_null_type = safe_plot(plot_fpr_by_null_type(fpr_coarse), "fpr_by_null_type"),
     fpr_by_sample_size = safe_plot(plot_fpr_by_sample_size(fpr_by_ss), "fpr_by_sample_size"),
-    fpr_by_outlier     = safe_plot(plot_fpr_outlier_heatmap(fpr_by_outlier), "fpr_by_outlier"),
-    fpr_exceedance     = safe_plot(plot_fpr_exceedance_summary(fpr_by_outlier), "fpr_exceedance"),
+    fpr_by_outlier = safe_plot(plot_fpr_outlier_heatmap(fpr_by_outlier), "fpr_by_outlier"),
+    fpr_exceedance = safe_plot(plot_fpr_exceedance_summary(fpr_by_outlier), "fpr_exceedance"),
     fpr_transform_delta = safe_plot(plot_fpr_transform_delta(fpr_by_ss), "fpr_transform_delta"),
     fpr_extreme_combos = safe_plot(plot_fpr_extreme_combinations(fpr_by_outlier), "fpr_extreme_combos"),
-    strip_robust       = safe_plot(plot_stripping_robustness(fpr_by_ss), "strip_robust"),
-    nullifier_matrix   = safe_plot(plot_nullifier_verdict_matrix(prepared_df), "nullifier_matrix"),
-    failure_lollipop   = safe_plot(plot_failure_composition_lollipop(analysis_list), "failure_lollipop"),
-    branch_health      = safe_plot(plot_branch_health(branch_health), "branch_health"),
-    tpr_saturated      = safe_plot(plot_tpr_saturation_summary(analysis_list$power_by_sample_size), "tpr_saturated")
+    strip_robust = safe_plot(plot_stripping_robustness(fpr_by_ss), "strip_robust"),
+    nullifier_matrix = safe_plot(plot_nullifier_verdict_matrix(prepared_df), "nullifier_matrix"),
+    failure_lollipop = safe_plot(plot_failure_composition_lollipop(analysis_list), "failure_lollipop"),
+    branch_health = safe_plot(plot_branch_health(branch_health), "branch_health"),
+    tpr_saturated = safe_plot(plot_tpr_saturation_summary(analysis_list$power_by_sample_size), "tpr_saturated")
   )
 
   # Save individual plots
