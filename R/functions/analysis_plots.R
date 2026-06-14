@@ -371,6 +371,12 @@ plot_fpr_by_sample_size <- function(
   df <- fpr_by_ss %>%
     dplyr::filter(.data$null_type %in% null_types) %>%
     prepare_plot_labels()
+  subtitle <- if ("null_interaction:shuffle" %in% df$null_type) {
+    "Primary no-location-CSE null plus shuffle sensitivity; dashed line = 5%"
+  } else {
+    "Primary no-location-CSE null; dashed line = 5%"
+  }
+
   ggplot(df, aes(
     x = sample_size, y = FPR, color = model_type, group = model_type
   )) +
@@ -383,7 +389,7 @@ plot_fpr_by_sample_size <- function(
     facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free_y") +
     labs(
       title = "FPR Across Sample Sizes",
-      subtitle = "Primary no-location-CSE null plus shuffle sensitivity; dashed line = 5%",
+      subtitle = subtitle,
       x = "Sample fraction",
       y = "FPR"
     ) +
