@@ -494,16 +494,57 @@ compute_nullification_diagnostic_cache_paths <- function(paths, cache_dir, overw
     unlist(use.names = FALSE)
 }
 
+bind_diagnostic_rows <- function(rows) {
+  rows <- Filter(Negate(is.null), rows)
+  if (!length(rows)) return(data.frame())
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    return(as.data.frame(data.table::rbindlist(rows, fill = TRUE, use.names = TRUE)))
+  }
+  dplyr::bind_rows(rows)
+}
+
+nullification_diagnostic_chunk_path <- function(chunk_dir, cache_paths) {
+  cache_paths <- sort(unique(unlist(cache_paths, use.names = FALSE)))
+  if (!length(cache_paths)) stop("No nullification diagnostic cache files in chunk")
+  first <- tools::file_path_sans_ext(basename(cache_paths[[1]]))
+  last <- tools::file_path_sans_ext(basename(cache_paths[[length(cache_paths)]]))
+  safe <- gsub("[^A-Za-z0-9_.-]+", "_", paste(length(cache_paths), first, last, sep = "__"))
+  file.path(chunk_dir, paste0(substr(safe, 1L, 220L), ".rds"))
+}
+
+write_nullification_diagnostic_cache_chunk <- function(cache_paths, chunk_dir) {
+  cache_paths <- sort(unique(unlist(cache_paths, use.names = FALSE)))
+  if (!length(cache_paths)) stop("No nullification diagnostic cache files in chunk")
+  output_path <- nullification_diagnostic_chunk_path(chunk_dir, cache_paths)
+  diagnostics <- bind_diagnostic_rows(lapply(cache_paths, readRDS))
+  write_rds_atomic(diagnostics, output_path)
+}
+
 aggregate_nullification_diagnostic_cache <- function(cache_paths, output_path) {
   cache_paths <- sort(unique(unlist(cache_paths, use.names = FALSE)))
   if (!length(cache_paths)) stop("No nullification diagnostic cache files to aggregate")
   rows <- lapply(cache_paths, readRDS)
-  diagnostics <- attach_nullification_reference_metrics(dplyr::bind_rows(rows))
+  diagnostics <- attach_nullification_reference_metrics(bind_diagnostic_rows(rows))
+  write_nullification_diagnostics(diagnostics, output_path)
+}
+
+aggregate_nullification_diagnostic_chunks <- function(chunk_paths, output_path) {
+  chunk_paths <- sort(unique(unlist(chunk_paths, use.names = FALSE)))
+  if (!length(chunk_paths)) stop("No nullification diagnostic chunk files to aggregate")
+  rows <- lapply(chunk_paths, readRDS)
+  diagnostics <- attach_nullification_reference_metrics(bind_diagnostic_rows(rows))
   write_nullification_diagnostics(diagnostics, output_path)
 }
 
 row_reference_key <- function(df) {
   paste(df$sample_size, df$subsample_id, df$transformation, df$outlier, sep = "__")
+}
+
+append_preservation_warning <- function(current, flag, label) {
+  idx <- which(flag %in% TRUE)
+  if (!length(idx)) return(current)
+  current[idx] <- ifelse(nzchar(current[idx]), paste(current[idx], label, sep = ";"), label)
+  current
 }
 
 attach_nullification_reference_metrics <- function(diagnostics) {
@@ -518,8 +559,7 @@ attach_nullification_reference_metrics <- function(diagnostics) {
     , drop = FALSE
   ]
   if (!nrow(references)) return(diagnostics)
-  ref_keys <- row_reference_key(references)
-  ref_index <- stats::setNames(seq_len(nrow(references)), ref_keys)
+
   delta_cols <- c(
     "current_cong_effect", "previous_cong_effect", "lag1_autocorr_mean",
     "trial_rt_slope_mean", "block_mean_sd", "transition_imbalance",
@@ -529,32 +569,34 @@ attach_nullification_reference_metrics <- function(diagnostics) {
   delta_cols <- intersect(delta_cols, names(diagnostics))
   for (col in delta_cols) diagnostics[[paste0(col, "_delta_from_present")]] <- NA_real_
 
-  null_rows <- which(diagnostics$effect_condition != "present")
-  for (i in null_rows) {
-    key <- row_reference_key(diagnostics[i, , drop = FALSE])
-    if (!key %in% names(ref_index)) next
-    ref_i <- ref_index[[key]]
-    if (is.null(ref_i) || is.na(ref_i)) next
-    for (col in delta_cols) {
-      diagnostics[[paste0(col, "_delta_from_present")]][[i]] <- diagnostics[[col]][[i]] - references[[col]][[ref_i]]
-    }
-
-    preservation_warnings <- character()
-    if (is.finite(diagnostics$mean_cse[[i]]) && abs(diagnostics$mean_cse[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "residual_mean_cse_gt_5ms")
-    if (is.finite(diagnostics$q050_cse[[i]]) && abs(diagnostics$q050_cse[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "residual_median_quantile_cse_gt_5ms")
-    if ("current_cong_effect_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$current_cong_effect_delta_from_present[[i]]) && abs(diagnostics$current_cong_effect_delta_from_present[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "current_cong_effect_delta_gt_5ms")
-    if ("previous_cong_effect_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$previous_cong_effect_delta_from_present[[i]]) && abs(diagnostics$previous_cong_effect_delta_from_present[[i]]) > 5) preservation_warnings <- c(preservation_warnings, "previous_cong_effect_delta_gt_5ms")
-    if ("lag1_autocorr_mean_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$lag1_autocorr_mean_delta_from_present[[i]]) && abs(diagnostics$lag1_autocorr_mean_delta_from_present[[i]]) > 0.05) preservation_warnings <- c(preservation_warnings, "lag1_autocorr_delta_gt_0.05")
-    if ("trial_rt_slope_mean_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$trial_rt_slope_mean_delta_from_present[[i]]) && abs(diagnostics$trial_rt_slope_mean_delta_from_present[[i]]) > 0.05) preservation_warnings <- c(preservation_warnings, "trial_slope_delta_gt_0.05ms")
-    if ("block_mean_sd_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$block_mean_sd_delta_from_present[[i]]) && abs(diagnostics$block_mean_sd_delta_from_present[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "block_mean_sd_delta_gt_10ms")
-    if ("transition_imbalance_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$transition_imbalance_delta_from_present[[i]]) && abs(diagnostics$transition_imbalance_delta_from_present[[i]]) > 0.01) preservation_warnings <- c(preservation_warnings, "transition_imbalance_delta_gt_0.01")
-    if (is.finite(diagnostics$max_abs_timebin_q050_cse[[i]]) && abs(diagnostics$max_abs_timebin_q050_cse[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "timebin_median_quantile_cse_gt_10ms")
-    if ("post_error_slowing_delta_from_present" %in% names(diagnostics) && is.finite(diagnostics$post_error_slowing_delta_from_present[[i]]) && abs(diagnostics$post_error_slowing_delta_from_present[[i]]) > 10) preservation_warnings <- c(preservation_warnings, "post_error_slowing_delta_gt_10ms")
-
-    diagnostics$preservation_pass[[i]] <- length(preservation_warnings) == 0L
-    diagnostics$preservation_warnings[[i]] <- paste(preservation_warnings, collapse = ";")
-    diagnostics$nullification_verdict[[i]] <- if (isTRUE(diagnostics$preservation_pass[[i]])) "interpretable_nullifier" else "fails_preservation_gates"
+  ref_match <- match(row_reference_key(diagnostics), row_reference_key(references))
+  matched_null <- diagnostics$effect_condition != "present" & !is.na(ref_match)
+  if (!any(matched_null)) return(diagnostics)
+  for (col in delta_cols) {
+    delta <- rep(NA_real_, nrow(diagnostics))
+    delta[matched_null] <- diagnostics[[col]][matched_null] - references[[col]][ref_match[matched_null]]
+    diagnostics[[paste0(col, "_delta_from_present")]] <- delta
   }
+
+  warnings <- rep("", nrow(diagnostics))
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$mean_cse) & abs(diagnostics$mean_cse) > 5, "residual_mean_cse_gt_5ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$q050_cse) & abs(diagnostics$q050_cse) > 5, "residual_median_quantile_cse_gt_5ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$current_cong_effect_delta_from_present) & abs(diagnostics$current_cong_effect_delta_from_present) > 5, "current_cong_effect_delta_gt_5ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$previous_cong_effect_delta_from_present) & abs(diagnostics$previous_cong_effect_delta_from_present) > 5, "previous_cong_effect_delta_gt_5ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$lag1_autocorr_mean_delta_from_present) & abs(diagnostics$lag1_autocorr_mean_delta_from_present) > 0.05, "lag1_autocorr_delta_gt_0.05")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$trial_rt_slope_mean_delta_from_present) & abs(diagnostics$trial_rt_slope_mean_delta_from_present) > 0.05, "trial_slope_delta_gt_0.05ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$block_mean_sd_delta_from_present) & abs(diagnostics$block_mean_sd_delta_from_present) > 10, "block_mean_sd_delta_gt_10ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$transition_imbalance_delta_from_present) & abs(diagnostics$transition_imbalance_delta_from_present) > 0.01, "transition_imbalance_delta_gt_0.01")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$max_abs_timebin_q050_cse) & abs(diagnostics$max_abs_timebin_q050_cse) > 10, "timebin_median_quantile_cse_gt_10ms")
+  warnings <- append_preservation_warning(warnings, is.finite(diagnostics$post_error_slowing_delta_from_present) & abs(diagnostics$post_error_slowing_delta_from_present) > 10, "post_error_slowing_delta_gt_10ms")
+
+  diagnostics$preservation_pass[matched_null] <- !nzchar(warnings[matched_null])
+  diagnostics$preservation_warnings[matched_null] <- warnings[matched_null]
+  diagnostics$nullification_verdict[matched_null] <- ifelse(
+    diagnostics$preservation_pass[matched_null],
+    "interpretable_nullifier",
+    "fails_preservation_gates"
+  )
   diagnostics
 }
 

@@ -133,9 +133,20 @@ target4c <- targets::tar_target(
 )
 
 target4d <- targets::tar_target(
-  nullification_diagnostics_file,
-  aggregate_nullification_diagnostic_cache(
+  nullification_diagnostic_chunk_files,
+  write_nullification_diagnostic_cache_chunk(
     nullification_diagnostic_cache_files,
+    chunk_dir = file.path(paths$outputs_analysis, "diagnostics_cache", "nullification_chunks")
+  ),
+  pattern = map(nullification_diagnostic_cache_files),
+  iteration = "list",
+  format = "file"
+)
+
+target4e <- targets::tar_target(
+  nullification_diagnostics_file,
+  aggregate_nullification_diagnostic_chunks(
+    nullification_diagnostic_chunk_files,
     output_path = file.path(paths$outputs_analysis, "nullification_diagnostics.csv")
   ),
   format = "file",
@@ -303,7 +314,7 @@ target12 <- targets::tar_target(
 
 list(
   target0, target1, target2, target3,
-  target4a, target4b, target4c, target4d,
+  target4a, target4b, target4c, target4d, target4e,
   target5,
   target6a, target6b, target6c,
   target7a, target7b, target8, target9, target10, target11, target12
