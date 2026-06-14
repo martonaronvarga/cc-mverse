@@ -297,13 +297,40 @@ target9 <- targets::tar_target(
     results_all
 
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
+    verbose_log <- log_post_model_event(
+      paths,
+      "analysis",
+      "start",
+      list(
+        results_rows = nrow(results_all),
+        results_columns = ncol(results_all),
+        diagnostics_csv = nullification_diagnostics_file,
+        model_chunk_files = length(model_chunk_files),
+        analysis_run_dir = analysis_run_dir(paths),
+        latest_dir_before = analysis_latest_dir(paths)
+      )
+    )
 
-    analyze_and_save(
+    analysis_result <- analyze_and_save(
       results_all,
       paths,
       diagnostics_csv = nullification_diagnostics_file,
       alpha = config$alpha
     )
+
+    log_post_model_event(
+      paths,
+      "analysis",
+      "complete",
+      list(
+        tables = names(analysis_result),
+        data_frame_tables = names(analysis_result)[vapply(analysis_result, is.data.frame, logical(1))],
+        latest_dir_after = analysis_latest_dir(paths),
+        verbose_log = verbose_log
+      )
+    )
+
+    analysis_result
   },
   deployment = "main"
 )
@@ -314,6 +341,18 @@ target10 <- targets::tar_target(
     nullification_diagnostics_file
     results_all
     analysis
+
+    setup_logging(log_level = config$log_level, log_dir = paths$logs)
+    log_post_model_event(
+      paths,
+      "nullification_operating_characteristics",
+      "start",
+      list(
+        diagnostics_csv = nullification_diagnostics_file,
+        results_rows = nrow(results_all),
+        analysis_latest_dir = analysis_latest_dir(paths)
+      )
+    )
 
     diagnostics <- readr::read_csv(nullification_diagnostics_file, show_col_types = FALSE)
 
@@ -342,6 +381,17 @@ target10 <- targets::tar_target(
     readr::write_csv(tables$fpr_by_outlier, paths_out[[3]])
     readr::write_csv(tables$failure_aware, paths_out[[4]])
 
+    log_post_model_event(
+      paths,
+      "nullification_operating_characteristics",
+      "complete",
+      list(
+        output_dir = output_dir,
+        output_files = paths_out,
+        table_rows = vapply(tables, nrow, integer(1))
+      )
+    )
+
     paths_out
   },
   format = "file",
@@ -360,13 +410,41 @@ target11 <- targets::tar_target(
     fig_dir <- file.path(analysis_latest_dir(paths), "figures")
     dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 
-    generate_multiverse_dashboard(
+    before_files <- list.files(fig_dir, full.names = TRUE, recursive = TRUE)
+    log_post_model_event(
+      paths,
+      "plots",
+      "start",
+      list(
+        fig_dir = fig_dir,
+        existing_files = length(before_files),
+        analysis_tables = names(analysis),
+        results_rows = nrow(results_all),
+        operating_characteristics_files = nullification_operating_characteristics_files
+      )
+    )
+
+    dashboard_plots <- generate_multiverse_dashboard(
       analysis,
       output_dir = fig_dir,
       save_individual = TRUE
     )
 
     files <- list.files(fig_dir, full.names = TRUE, recursive = TRUE)
+    new_files <- setdiff(files, before_files)
+
+    log_post_model_event(
+      paths,
+      "plots",
+      "complete",
+      list(
+        fig_dir = fig_dir,
+        returned_plot_names = names(dashboard_plots),
+        total_files = length(files),
+        new_files = length(new_files),
+        files = files
+      )
+    )
 
     if (length(files) == 0L) {
       stop("Plot generation produced zero files in: ", fig_dir)
@@ -388,12 +466,31 @@ target12 <- targets::tar_target(
     nullification_operating_characteristics_files
     plots
 
-    if (!tolower(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "false")) %in% c("1", "true", "yes")) {
-      logger::log_info("Skipping exhaustive CSV plot gallery; set PLOT_ALL_CSV_OUTPUTS=true to enable")
+    setup_logging(log_level = config$log_level, log_dir = paths$logs)
+    gallery_enabled <- tolower(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "false")) %in% c("1", "true", "yes")
+    log_post_model_event(
+      paths,
+      "csv_output_plot_files",
+      "start",
+      list(
+        enabled = gallery_enabled,
+        PLOT_ALL_CSV_OUTPUTS = Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "<unset>"),
+        analysis_latest_dir = analysis_latest_dir(paths)
+      )
+    )
+
+    if (!gallery_enabled) {
+      log_post_model_event(
+        paths,
+        "csv_output_plot_files",
+        "skipped",
+        list(reason = "Set PLOT_ALL_CSV_OUTPUTS=true to enable")
+      )
       character()
     } else {
       analysis_dir <- analysis_latest_dir(paths)
       output_dir <- file.path(analysis_dir, "figures", "csv_outputs")
+      before_files <- list.files(output_dir, full.names = TRUE, recursive = TRUE)
 
       manifest <- write_csv_output_plots(
         analysis_dir,
@@ -402,8 +499,25 @@ target12 <- targets::tar_target(
 
       manifest_path <- file.path(output_dir, "csv_output_plot_manifest.csv")
       readr::write_csv(manifest, manifest_path)
+      output_files <- c(manifest$plot[manifest$plotted], manifest_path)
 
-      c(manifest$plot[manifest$plotted], manifest_path)
+      log_post_model_event(
+        paths,
+        "csv_output_plot_files",
+        "complete",
+        list(
+          analysis_dir = analysis_dir,
+          output_dir = output_dir,
+          csvs_seen = nrow(manifest),
+          plotted = sum(manifest$plotted),
+          failed = sum(!manifest$plotted),
+          manifest_path = manifest_path,
+          new_files = length(setdiff(list.files(output_dir, full.names = TRUE, recursive = TRUE), before_files)),
+          failed_csvs = manifest$csv[!manifest$plotted]
+        )
+      )
+
+      output_files
     }
   },
   format = "file",

@@ -816,8 +816,14 @@ detect_specification_inconsistencies <- function(prepared_df, alpha = 0.05) {
         effect_sd / abs(effect_mean),
         NA_real_
       ),
-      p_min = min(main_p_value[numerically_usable], na.rm = TRUE),
-      p_max = max(main_p_value[numerically_usable], na.rm = TRUE),
+      p_min = {
+        p <- main_p_value[numerically_usable & !is.na(main_p_value)]
+        if (length(p) > 0L) min(p) else NA_real_
+      },
+      p_max = {
+        p <- main_p_value[numerically_usable & !is.na(main_p_value)]
+        if (length(p) > 0L) max(p) else NA_real_
+      },
       p_range = p_max - p_min,
       .groups = "drop"
     ) %>%

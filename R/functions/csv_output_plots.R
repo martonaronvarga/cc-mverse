@@ -401,16 +401,29 @@ write_csv_output_plots <- function(input_dir = file.path("R", "outputs", "analys
   if (length(csvs) == 0L) stop("No CSV files found in ", input_dir)
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-  rows <- lapply(csvs, function(path) {
+  if (requireNamespace("logger", quietly = TRUE)) {
+    logger::log_info("CSV plot gallery: plotting {length(csvs)} CSV file(s) from {input_dir} into {output_dir}")
+  }
+
+  rows <- lapply(seq_along(csvs), function(i) {
+    path <- csvs[[i]]
     rel <- gsub(paste0("^", normalizePath(input_dir, winslash = "/", mustWork = FALSE), "/?"), "", normalizePath(path, winslash = "/", mustWork = FALSE))
     safe <- gsub("[^A-Za-z0-9_.-]+", "_", tools::file_path_sans_ext(rel))
     out <- file.path(output_dir, paste0(safe, ".png"))
+    if (requireNamespace("logger", quietly = TRUE)) {
+      logger::log_info("CSV plot gallery [{i}/{length(csvs)}]: {rel}")
+    }
     ok <- tryCatch({
       p <- plot_csv_output(path)
       csvp_save(p, out)
       TRUE
     }, error = function(e) {
-      message("CSV plot failed for ", path, ": ", conditionMessage(e))
+      msg <- paste("CSV plot failed for", path, ":", conditionMessage(e))
+      if (requireNamespace("logger", quietly = TRUE)) {
+        logger::log_warn(msg)
+      } else {
+        message(msg)
+      }
       FALSE
     })
     data.frame(csv = path, plot = if (ok) out else NA_character_, plotted = ok, stringsAsFactors = FALSE)
@@ -418,5 +431,8 @@ write_csv_output_plots <- function(input_dir = file.path("R", "outputs", "analys
   manifest <- dplyr::bind_rows(rows)
   index_path <- write_csv_plot_index(manifest, output_dir)
   manifest$index <- index_path
+  if (requireNamespace("logger", quietly = TRUE)) {
+    logger::log_info("CSV plot gallery complete: {sum(manifest$plotted)}/{nrow(manifest)} plotted; index={index_path}")
+  }
   manifest
 }

@@ -15,8 +15,9 @@ print_usage <- function() {
     "  --no-dashboard      Skip the dashboard plot target.\n",
     "  --no-csv-gallery    Skip exhaustive CSV plot gallery.\n",
     "  --no-archive        Do not tar outputs/analysis/figures after targets complete.\n",
+    "  --balanced          Use targets' balanced reporter instead of timestamp/verbose target logs.\n",
     "  --dry-run           Print selected targets and environment defaults only.\n",
-    "  --help            Show this help.\n",
+    "  --help              Show this help.\n",
     sep = ""
   )
 }
@@ -33,6 +34,9 @@ if (!file.exists("_targets.R")) {
   stop("Run this from the R project directory, or from the repository root containing R/_targets.R")
 }
 
+if (!nzchar(Sys.getenv("PIPELINE_RUN_ID", unset = ""))) {
+  Sys.setenv(PIPELINE_RUN_ID = format(Sys.time(), "%Y%m%d_%H%M%S"))
+}
 if (!nzchar(Sys.getenv("SKIP_RUST", unset = ""))) Sys.setenv(SKIP_RUST = "true")
 if (!nzchar(Sys.getenv("DIAGNOSTICS_MODE", unset = ""))) Sys.setenv(DIAGNOSTICS_MODE = "cached")
 if (!has_flag("--no-csv-gallery") && !nzchar(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = ""))) {
@@ -40,6 +44,8 @@ if (!has_flag("--no-csv-gallery") && !nzchar(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", 
 }
 if (has_flag("--no-csv-gallery")) Sys.setenv(PLOT_ALL_CSV_OUTPUTS = "false")
 skip_diagnostics <- has_flag("--skip-diagnostics")
+reporter <- if (has_flag("--balanced")) "balanced" else "timestamp"
+verbose_log <- file.path("logs", paste0("post_model_", Sys.getenv("PIPELINE_RUN_ID"), ".log"))
 
 post_model_targets <- if (skip_diagnostics) {
   c(
@@ -65,29 +71,36 @@ cat("Environment defaults:\n")
 cat("  SKIP_RUST=", Sys.getenv("SKIP_RUST"), "\n", sep = "")
 cat("  DIAGNOSTICS_MODE=", Sys.getenv("DIAGNOSTICS_MODE"), "\n", sep = "")
 cat("  PLOT_ALL_CSV_OUTPUTS=", Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "<unset>"), "\n", sep = "")
+cat("  PIPELINE_RUN_ID=", Sys.getenv("PIPELINE_RUN_ID"), "\n", sep = "")
 cat("  skip diagnostics=", skip_diagnostics, "\n", sep = "")
 cat("  targets shortcut=", skip_diagnostics, "\n", sep = "")
+cat("  targets reporter=", reporter, "\n", sep = "")
+cat("  verbose post-model log=", verbose_log, "\n", sep = "")
 
 if (has_flag("--dry-run")) quit(status = 0L)
 
 if (!requireNamespace("targets", quietly = TRUE)) stop("Package 'targets' is required")
 if (!requireNamespace("tidyselect", quietly = TRUE)) stop("Package 'tidyselect' is required")
 
+target_selection <- substitute(tidyselect::all_of(targets), list(targets = post_model_targets))
+
 targets::tar_make(
-  names = tidyselect::all_of(post_model_targets),
-  shortcut = skip_diagnostics
+  names = target_selection,
+  shortcut = skip_diagnostics,
+  reporter = reporter
 )
 
+figures_dir <- file.path("outputs", "analysis", "latest", "figures")
 archive_path <- NA_character_
-if (!has_flag("--no-archive") && dir.exists(file.path("outputs", "analysis", "figures"))) {
+if (!has_flag("--no-archive") && dir.exists(figures_dir)) {
   archive_path <- file.path(
     "outputs",
     "analysis",
-    sprintf("figures_%s.tar.gz", format(Sys.time(), "%Y%m%d_%H%M%S"))
+    sprintf("figures_%s.tar.gz", Sys.getenv("PIPELINE_RUN_ID"))
   )
   status <- system2(
     "tar",
-    c("-czf", archive_path, "-C", file.path("outputs", "analysis"), "figures")
+    c("-czf", archive_path, "-C", dirname(figures_dir), basename(figures_dir))
   )
   if (!identical(as.integer(status), 0L)) stop("tar failed while archiving figures")
   cat("Figure archive: ", archive_path, "\n", sep = "")

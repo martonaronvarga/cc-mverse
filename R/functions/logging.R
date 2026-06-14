@@ -147,3 +147,68 @@ log_pipeline <- function(level, msg) {
   )
   logger::log_level(level, logger::skip_formatter(formatted_msg))
 }
+
+format_verbose_log_value <- function(value, max_items = 40L) {
+  if (is.null(value)) {
+    return("NULL")
+  }
+  if (is.data.frame(value)) {
+    return(sprintf("<data.frame: %d rows x %d columns>", nrow(value), ncol(value)))
+  }
+  if (is.list(value) && !is.atomic(value)) {
+    value <- vapply(value, format_verbose_log_value, character(1), max_items = 8L)
+  }
+
+  value <- as.character(value)
+  if (length(value) == 0L) {
+    return("<empty>")
+  }
+  if (length(value) > max_items) {
+    value <- c(value[seq_len(max_items)], sprintf("... (%d more)", length(value) - max_items))
+  }
+  paste(value, collapse = ", ")
+}
+
+post_model_verbose_log_file <- function(paths) {
+  log_dir <- paths$logs
+  if (is.null(log_dir) || !nzchar(log_dir)) {
+    log_dir <- file.path(".", "logs")
+  }
+  if (!dir.exists(log_dir)) {
+    dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  file.path(log_dir, paste0("post_model_", get_run_id(), ".log"))
+}
+
+log_post_model_event <- function(paths, stage, event, details = list(), level = logger::INFO) {
+  log_file <- post_model_verbose_log_file(paths)
+  level_name <- attr(level, "level")
+  if (is.null(level_name)) {
+    level_name <- as.character(level)
+  }
+
+  header <- paste0(
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
+    " | ", level_name,
+    " | [PID:", Sys.getpid(), "] ",
+    stage,
+    " | ",
+    event
+  )
+  detail_lines <- character()
+  if (length(details) > 0L) {
+    detail_names <- names(details)
+    if (is.null(detail_names)) {
+      detail_names <- paste0("detail_", seq_along(details))
+    }
+    detail_lines <- vapply(
+      seq_along(details),
+      function(i) paste0("  - ", detail_names[[i]], ": ", format_verbose_log_value(details[[i]])),
+      character(1)
+    )
+  }
+
+  cat(paste(c(header, detail_lines), collapse = "\n"), "\n", file = log_file, append = TRUE, sep = "")
+  log_pipeline(level, "Post-model {stage}: {event}; verbose log: {log_file}")
+  invisible(log_file)
+}

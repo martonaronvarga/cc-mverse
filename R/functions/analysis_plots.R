@@ -575,9 +575,14 @@ plot_stripping_robustness <- function(fpr_by_ss) {
       )
     )
 
-  # Pivot to get shuffle vs additive_qmap side by side
+  # Aggregate after dropping metadata columns so pivot_wider has one row per cell.
   wide <- df %>%
-    dplyr::select(model_type, sample_size, transformation, strip_method, FPR) %>%
+    dplyr::group_by(model_type, sample_size, transformation, strip_method) %>%
+    dplyr::summarise(
+      FPR = stats::weighted.mean(FPR, w = pmax(n, 0), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(FPR = dplyr::if_else(is.nan(FPR), NA_real_, FPR)) %>%
     tidyr::pivot_wider(names_from = strip_method, values_from = FPR)
 
   # If both methods present, scatter them
@@ -668,7 +673,13 @@ plot_fpr_transform_delta <- function(
     null_types = c(primary_null_type(), "null_interaction:shuffle")) {
   df <- fpr_by_ss %>%
     dplyr::filter(.data$null_type %in% null_types) %>%
-    dplyr::select(null_type, model_type, sample_size, transformation, n, false_positives, FPR) %>%
+    dplyr::group_by(null_type, model_type, sample_size, transformation) %>%
+    dplyr::summarise(
+      n = sum(n, na.rm = TRUE),
+      false_positives = sum(false_positives, na.rm = TRUE),
+      FPR = dplyr::if_else(n > 0, false_positives / n, NA_real_),
+      .groups = "drop"
+    ) %>%
     tidyr::pivot_wider(names_from = transformation, values_from = c(n, false_positives, FPR)) %>%
     dplyr::filter(!is.na(FPR_log_rt), !is.na(FPR_no_log_rt)) %>%
     dplyr::mutate(
@@ -1269,19 +1280,24 @@ generate_multiverse_dashboard <- function(
     )
   }
 
-  plots <- list(
-    fpr_by_null_type = safe_plot(plot_fpr_by_null_type(fpr_coarse), "fpr_by_null_type"),
-    fpr_by_sample_size = safe_plot(plot_fpr_by_sample_size(fpr_by_ss), "fpr_by_sample_size"),
-    fpr_by_outlier = safe_plot(plot_fpr_outlier_heatmap(fpr_by_outlier), "fpr_by_outlier"),
-    fpr_exceedance = safe_plot(plot_fpr_exceedance_summary(fpr_by_outlier), "fpr_exceedance"),
-    fpr_transform_delta = safe_plot(plot_fpr_transform_delta(fpr_by_ss), "fpr_transform_delta"),
-    fpr_extreme_combos = safe_plot(plot_fpr_extreme_combinations(fpr_by_outlier), "fpr_extreme_combos"),
-    strip_robust = safe_plot(plot_stripping_robustness(fpr_by_ss), "strip_robust"),
-    nullifier_matrix = safe_plot(plot_nullifier_verdict_matrix(prepared_df), "nullifier_matrix"),
-    failure_lollipop = safe_plot(plot_failure_composition_lollipop(analysis_list), "failure_lollipop"),
-    branch_health = safe_plot(plot_branch_health(branch_health), "branch_health"),
-    tpr_saturated = safe_plot(plot_tpr_saturation_summary(analysis_list$power_by_sample_size), "tpr_saturated")
+  plot_specs <- list(
+    fpr_by_null_type = function() plot_fpr_by_null_type(fpr_coarse),
+    fpr_by_sample_size = function() plot_fpr_by_sample_size(fpr_by_ss),
+    fpr_by_outlier = function() plot_fpr_outlier_heatmap(fpr_by_outlier),
+    fpr_exceedance = function() plot_fpr_exceedance_summary(fpr_by_outlier),
+    fpr_transform_delta = function() plot_fpr_transform_delta(fpr_by_ss),
+    fpr_extreme_combos = function() plot_fpr_extreme_combinations(fpr_by_outlier),
+    strip_robust = function() plot_stripping_robustness(fpr_by_ss),
+    nullifier_matrix = function() plot_nullifier_verdict_matrix(prepared_df),
+    failure_lollipop = function() plot_failure_composition_lollipop(analysis_list),
+    branch_health = function() plot_branch_health(branch_health),
+    tpr_saturated = function() plot_tpr_saturation_summary(analysis_list$power_by_sample_size)
   )
+  plots <- lapply(names(plot_specs), function(name) {
+    plot_log(logger::INFO, "Building plot: {name}")
+    safe_plot(plot_specs[[name]](), name)
+  })
+  names(plots) <- names(plot_specs)
 
   # Save individual plots
   if (save_individual) {
