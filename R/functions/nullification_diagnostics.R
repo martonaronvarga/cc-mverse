@@ -381,14 +381,23 @@ diagnostics_map_with_progress <- function(items, worker, label, workers = diagno
   out
 }
 
-read_processed_diagnostic_file <- function(path) {
+read_processed_diagnostic_file <- function(path, columns = NULL) {
   ext <- tolower(tools::file_ext(path))
   if (ext == "csv") {
-    return(read.csv(path, stringsAsFactors = FALSE))
+    df <- read.csv(path, stringsAsFactors = FALSE)
+    if (!is.null(columns)) df <- df[intersect(columns, names(df))]
+    return(df)
   }
   if (ext == "parquet") {
     if (!requireNamespace("arrow", quietly = TRUE)) {
       stop("Package 'arrow' is required to read parquet diagnostics input: ", path)
+    }
+    if (!is.null(columns)) {
+      selected <- try(
+        arrow::read_parquet(path, col_select = tidyselect::any_of(columns)),
+        silent = TRUE
+      )
+      if (!inherits(selected, "try-error")) return(as.data.frame(selected))
     }
     return(as.data.frame(arrow::read_parquet(path)))
   }
@@ -451,6 +460,12 @@ compute_nullification_diagnostic_cache_path <- function(path, cache_dir, overwri
 
 diagnostic_chunk_size <- function(default = 500L) {
   size <- suppressWarnings(as.integer(Sys.getenv("DIAGNOSTIC_CHUNK_SIZE", unset = as.character(default))))
+  if (is.na(size) || size < 1L) size <- default
+  size
+}
+
+shuffle_diagnostic_chunk_size <- function(default = 25L) {
+  size <- suppressWarnings(as.integer(Sys.getenv("SHUFFLE_DIAGNOSTIC_CHUNK_SIZE", unset = as.character(default))))
   if (is.na(size) || size < 1L) size <- default
   size
 }

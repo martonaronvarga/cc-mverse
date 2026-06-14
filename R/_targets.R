@@ -161,7 +161,7 @@ target6a <- targets::tar_target(
     shuffle_paths <- processed_diagnostic_paths[
       grepl("__null_interaction__shuffle[.](parquet|csv)$", basename(processed_diagnostic_paths), ignore.case = TRUE)
     ]
-    split_diagnostic_paths(shuffle_paths)
+    split_diagnostic_paths(shuffle_paths, chunk_size = shuffle_diagnostic_chunk_size())
   },
   iteration = "list",
   deployment = "main"

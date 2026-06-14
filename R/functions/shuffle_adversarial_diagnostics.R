@@ -13,16 +13,19 @@ rt_multiset_fingerprint <- function(x, digits = 10L) {
 conditional_prev_cong_rt_slope <- function(df) {
   required <- c("participant_id", "cong", "prev_cong", "rt")
   if (!all(required %in% names(df))) return(NA_real_)
-  d <- df |>
-    dplyr::mutate(
-      rt = suppressWarnings(as.numeric(.data$rt)),
-      prev_cong_num = suppressWarnings(as.numeric(as.character(.data$prev_cong)))
-    ) |>
-    dplyr::filter(is.finite(.data$rt), .data$prev_cong_num %in% c(-1, 1))
-  if (nrow(d) < 4L || length(unique(d$prev_cong_num)) < 2L) return(NA_real_)
-  fit <- try(stats::lm(rt ~ prev_cong_num + factor(participant_id):factor(cong), data = d), silent = TRUE)
-  if (inherits(fit, "try-error")) return(NA_real_)
-  coef(fit)[["prev_cong_num"]] %||% NA_real_
+  rt <- suppressWarnings(as.numeric(df$rt))
+  prev_cong_num <- suppressWarnings(as.numeric(as.character(df$prev_cong)))
+  ok <- is.finite(rt) & prev_cong_num %in% c(-1, 1)
+  if (sum(ok) < 4L || length(unique(prev_cong_num[ok])) < 2L) return(NA_real_)
+
+  group <- paste(df$participant_id[ok], df$cong[ok], sep = "\r")
+  rt <- rt[ok]
+  prev_cong_num <- prev_cong_num[ok]
+  rt_centered <- rt - ave(rt, group, FUN = mean)
+  prev_centered <- prev_cong_num - ave(prev_cong_num, group, FUN = mean)
+  denominator <- sum(prev_centered^2, na.rm = TRUE)
+  if (!is.finite(denominator) || denominator <= 0) return(NA_real_)
+  sum(prev_centered * rt_centered, na.rm = TRUE) / denominator
 }
 
 compare_shuffle_multisets <- function(present_df, shuffle_df) {
@@ -30,26 +33,36 @@ compare_shuffle_multisets <- function(present_df, shuffle_df) {
   missing <- setdiff(required, intersect(names(present_df), names(shuffle_df)))
   if (length(missing) > 0L) stop("Missing required shuffle multiset columns: ", paste(missing, collapse = ", "))
 
-  p <- present_df |>
-    dplyr::mutate(group_key = shuffle_group_key(present_df)) |>
-    dplyr::group_by(.data$group_key) |>
-    dplyr::summarise(n_present = dplyr::n(), fp_present = rt_multiset_fingerprint(.data$rt), .groups = "drop")
-  s <- shuffle_df |>
-    dplyr::mutate(group_key = shuffle_group_key(shuffle_df)) |>
-    dplyr::group_by(.data$group_key) |>
-    dplyr::summarise(n_shuffle = dplyr::n(), fp_shuffle = rt_multiset_fingerprint(.data$rt), .groups = "drop")
+  present_values <- split(round(as.numeric(present_df$rt), 10L), shuffle_group_key(present_df))
+  shuffle_values <- split(round(as.numeric(shuffle_df$rt), 10L), shuffle_group_key(shuffle_df))
+  keys <- union(names(present_values), names(shuffle_values))
+  if (!length(keys)) {
+    return(data.frame(
+      n_groups = 0L,
+      n_count_mismatch_groups = 0L,
+      n_multiset_mismatch_groups = 0L,
+      multiset_preserved = TRUE,
+      stringsAsFactors = FALSE
+    ))
+  }
 
-  joined <- dplyr::full_join(p, s, by = "group_key") |>
-    dplyr::mutate(
-      count_match = .data$n_present == .data$n_shuffle,
-      multiset_match = .data$count_match & .data$fp_present == .data$fp_shuffle
+  count_match <- logical(length(keys))
+  multiset_match <- logical(length(keys))
+  for (i in seq_along(keys)) {
+    present_rt <- present_values[[keys[[i]]]]
+    shuffle_rt <- shuffle_values[[keys[[i]]]]
+    count_match[[i]] <- length(present_rt) == length(shuffle_rt)
+    multiset_match[[i]] <- count_match[[i]] && identical(
+      unname(sort(present_rt, na.last = TRUE)),
+      unname(sort(shuffle_rt, na.last = TRUE))
     )
+  }
 
   data.frame(
-    n_groups = nrow(joined),
-    n_count_mismatch_groups = sum(!isTRUE(joined$count_match), na.rm = TRUE),
-    n_multiset_mismatch_groups = sum(!isTRUE(joined$multiset_match), na.rm = TRUE),
-    multiset_preserved = all(joined$multiset_match, na.rm = FALSE),
+    n_groups = length(keys),
+    n_count_mismatch_groups = sum(!count_match),
+    n_multiset_mismatch_groups = sum(!multiset_match),
+    multiset_preserved = all(multiset_match),
     stringsAsFactors = FALSE
   )
 }
@@ -112,9 +125,10 @@ metadata_only_shuffle_adversarial_diagnostics <- function(paths) {
 }
 
 compute_shuffle_adversarial_pair <- function(meta, ref) {
+  diagnostic_columns <- c("participant_id", "cong", "prev_cong", "rt")
   build_shuffle_adversarial_diagnostic(
-    present_df = read_processed_diagnostic_file(ref$path),
-    shuffle_df = read_processed_diagnostic_file(meta$path),
+    present_df = read_processed_diagnostic_file(ref$path, columns = diagnostic_columns),
+    shuffle_df = read_processed_diagnostic_file(meta$path, columns = diagnostic_columns),
     data_id = meta$data_id,
     present_data_id = ref$data_id
   )
