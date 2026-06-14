@@ -75,7 +75,8 @@ if (!requireNamespace("tidyselect", quietly = TRUE)) stop("Package 'tidyselect' 
 
 targets::tar_make(
   names = tidyselect::all_of(post_model_targets),
-  shortcut = skip_diagnostics
+  shortcut = skip_diagnostics,
+  script = "./run_post_model_targets.R"
 )
 
 archive_path <- NA_character_
