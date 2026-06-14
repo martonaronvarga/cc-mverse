@@ -235,8 +235,56 @@ target8 <- targets::tar_target(
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
     logger::log_info("Aggregating chunked model results...")
     results <- load_results(paths, validate = TRUE)
-    logger::log_info("Aggregated {nrow(results)} results")
-    results
+
+	branch_lookup <- branch_specs |>
+	  dplyr::select(branch_id, data_id) |>
+	  dplyr::distinct()
+
+	if (!"branch_id" %in% names(results)) {
+	  stop("Aggregated results are missing branch_id; cannot attach data_id")
+	}
+
+	if (!"data_id" %in% names(results)) {
+	  missing_lookup <- dplyr::anti_join(
+	    results |> dplyr::distinct(branch_id),
+	    branch_lookup,
+	    by = "branch_id"
+	  )
+
+	  if (nrow(missing_lookup) > 0L) {
+	    stop(
+	      "Cannot attach data_id: ",
+	      nrow(missing_lookup),
+	      " result branch_id values are absent from branch_specs. First missing: ",
+	      missing_lookup$branch_id[[1]]
+	    )
+	  }
+
+	  duplicate_lookup <- branch_lookup |>
+	    dplyr::count(branch_id) |>
+	    dplyr::filter(n > 1L)
+
+	  if (nrow(duplicate_lookup) > 0L) {
+	    stop(
+	      "Cannot attach data_id: branch_specs has duplicate branch_id mappings. First duplicate: ",
+	      duplicate_lookup$branch_id[[1]]
+	    )
+	  }
+
+	  results <- results |>
+	    dplyr::left_join(branch_lookup, by = "branch_id", relationship = "many-to-one") |>
+	    dplyr::relocate(data_id, .after = branch_id)
+	}
+
+	if (anyNA(results$data_id)) {
+	  stop("data_id attachment produced NA values")
+	}
+
+	logger::log_info(
+	  "Aggregated {nrow(results)} results with {dplyr::n_distinct(results$data_id)} data_id values"
+	)
+
+	results
   },
   deployment = "main"
 )
@@ -245,6 +293,8 @@ target9 <- targets::tar_target(
   analysis,
   {
     nullification_diagnostics_file
+    model_chunk_files
+    results_all
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
     analyze_and_save(results_all, paths, diagnostics_csv = nullification_diagnostics_file, alpha = config$alpha)
   },
@@ -256,6 +306,7 @@ target10 <- targets::tar_target(
   {
     nullification_diagnostics_file
     results_all
+    analysis
     diagnostics <- readr::read_csv(nullification_diagnostics_file, show_col_types = FALSE)
     tables <- build_nullification_operating_characteristics(results_all, diagnostics, alpha = config$alpha)
     output_dir <- file.path(paths$outputs_analysis, "nullification_operating_characteristics")
@@ -279,6 +330,9 @@ target10 <- targets::tar_target(
 target11 <- targets::tar_target(
   plots,
   {
+    analysis
+    results_all
+    nullification_operating_characteristics_files
     setup_logging(log_level = config$log_level, log_dir = paths$logs)
     source("functions/analysis_plots.R")
     fig_dir <- file.path(paths$outputs_analysis, "figures")
@@ -297,6 +351,7 @@ target12 <- targets::tar_target(
     cse_definition_comparison_files
     shuffle_adversarial_diagnostics_file
     nullification_operating_characteristics_files
+    plots
     if (!tolower(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "false")) %in% c("1", "true", "yes")) {
       logger::log_info("Skipping exhaustive CSV plot gallery; set PLOT_ALL_CSV_OUTPUTS=true to enable")
       character()
@@ -317,5 +372,6 @@ list(
   target4a, target4b, target4c, target4d, target4e,
   target5,
   target6a, target6b, target6c,
-  target7a, target7b, target8, target9, target10, target11, target12
+  target7a, target7b, 
+  target8, target9, target10, target11, target12
 )
