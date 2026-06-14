@@ -40,11 +40,12 @@ fpr_by_outlier <- read_csv("fpr_by_outlier.csv")
 branch_health <- read_csv("branch_health.csv")
 summary_table <- read_csv("summary_table.csv")
 
-filter_main <- function(df) {
+filter_main <- function(df, require_interpretable = TRUE) {
   df |>
-    dplyr::filter(
-      .data$model_type %in% main_models,
-      .data$null_type %in% primary_nullifiers
+    filter_primary_fpr_rows(
+      null_types = primary_nullifiers,
+      models = main_models,
+      require_interpretable = require_interpretable
     )
 }
 
@@ -74,7 +75,7 @@ save_plot(
   plot_fpr_by_null_type(main_fpr_coarse) +
     ggplot2::labs(
       title = "Primary FPR by Model and Nullification Choice",
-      subtitle = "Full LMM and shuffle removed; dashed line = nominal 5%"
+      subtitle = "Diagnostics-passing rows only; full LMM and shuffle removed; dashed line = nominal 5%"
     ),
   width = 12,
   height = 10
@@ -85,7 +86,7 @@ save_plot(
   plot_fpr_by_sample_size(location_fpr_sample, null_types = location_nullifier) +
     ggplot2::labs(
       title = "FPR When the Correct Null Is a Location-CSE Removal",
-      subtitle = "Local mean residual nullifier only; full LMM and shuffle removed"
+      subtitle = "Diagnostics-passing local mean residual rows only; full LMM and shuffle removed"
     ),
   width = 12,
   height = 7
@@ -107,7 +108,7 @@ save_plot(
   plot_fpr_by_null_type(shape_fpr_coarse) +
     ggplot2::labs(
       title = "FPR Under Shape-Sensitive Nullification Choices",
-      subtitle = "Qmap, trial-bin qmap, and median residual; full LMM and shuffle removed"
+      subtitle = "Diagnostics-passing qmap, trial-bin qmap, and median residual rows; full LMM and shuffle removed"
     ),
   width = 12,
   height = 9
@@ -137,7 +138,11 @@ save_plot(
 
 save_plot(
   "sensitivity_shuffle_only_no_full_lmm",
-  plot_fpr_by_sample_size(shuffle_fpr_sample, null_types = "null_interaction:shuffle") +
+  plot_fpr_by_sample_size(
+    shuffle_fpr_sample,
+    null_types = "null_interaction:shuffle",
+    require_interpretable = FALSE
+  ) +
     ggplot2::labs(
       title = "Shuffle Sensitivity Only",
       subtitle = "Shuffle fails preservation diagnostics; full LMM removed"

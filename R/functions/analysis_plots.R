@@ -135,6 +135,41 @@ plot_log <- function(level, message) {
 
 primary_null_type <- function() "null_interaction:local_mean_residual"
 
+primary_reporting_models <- function() {
+  c("rmANOVA", "LMM (random intercept)", "LMM (random congruency slope)")
+}
+
+primary_reporting_null_types <- function() {
+  c(
+    "null_interaction:local_mean_residual",
+    "null_interaction:local_median_residual",
+    "null_interaction:additive_qmap",
+    "null_interaction:additive_qmap_trial_bin"
+  )
+}
+
+filter_primary_fpr_rows <- function(
+    df,
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
+  if (is.null(df) || !is.data.frame(df)) {
+    return(df)
+  }
+
+  out <- df
+  if ("model_type" %in% names(out)) {
+    out <- dplyr::filter(out, .data$model_type %in% models)
+  }
+  if ("null_type" %in% names(out)) {
+    out <- dplyr::filter(out, .data$null_type %in% null_types)
+  }
+  if (isTRUE(require_interpretable) && "interpretable_fpr_source" %in% names(out)) {
+    out <- dplyr::filter(out, .data$interpretable_fpr_source %in% TRUE)
+  }
+  out
+}
+
 pretty_model <- function(x) {
   dplyr::case_when(
     x == "rmANOVA" ~ "ANOVA",
@@ -336,8 +371,19 @@ plot_roc_by_outlier <- function(roc_metrics) {
 #' FPR comparison across null types and models
 #' Consumes: fpr_coarse
 #' Columns: null_type, model_type, transformation, n, false_positives, FPR
-plot_fpr_by_null_type <- function(fpr_coarse, palette = get_null_type_palette()) {
-  df <- prepare_plot_labels(fpr_coarse)
+plot_fpr_by_null_type <- function(
+    fpr_coarse,
+    palette = get_null_type_palette(),
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
+  df <- fpr_coarse %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
+    prepare_plot_labels()
   ggplot(df, aes(x = FPR, y = model_type_label, color = null_type_label)) +
     geom_vline(xintercept = 0.05, linetype = "dashed", color = "#C62828", alpha = 0.7) +
     geom_point(size = 2.8, alpha = 0.9) +
@@ -367,14 +413,22 @@ plot_fpr_by_null_type <- function(fpr_coarse, palette = get_null_type_palette())
 plot_fpr_by_sample_size <- function(
     fpr_by_ss,
     palette = get_model_palette(),
-    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
   df <- fpr_by_ss %>%
-    dplyr::filter(.data$null_type %in% null_types) %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     prepare_plot_labels()
-  subtitle <- if ("null_interaction:shuffle" %in% df$null_type) {
-    "Primary no-location-CSE null plus shuffle sensitivity; dashed line = 5%"
+  subtitle <- if (isTRUE(require_interpretable)) {
+    "Diagnostics-passing nullified rows only; dashed line = 5%"
+  } else if ("null_interaction:shuffle" %in% df$null_type) {
+    "Diagnostic/sensitivity rows; shuffle shown separately; dashed line = 5%"
   } else {
-    "Primary no-location-CSE null; dashed line = 5%"
+    "Diagnostic/sensitivity rows; dashed line = 5%"
   }
 
   ggplot(df, aes(
@@ -567,9 +621,18 @@ plot_pvalue_distributions <- function(prepared_df, palette = get_effect_palette(
 
 #' Compare FPR between stripping methods for null_interaction branches
 #' Consumes: fpr_by_sample_size (has null_type, model_type, transformation, sample_size)
-plot_stripping_robustness <- function(fpr_by_ss) {
-  # Extract strip method from null_type for null_interaction only
+plot_stripping_robustness <- function(
+    fpr_by_ss,
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
+  # Extract strip method from null_type for null_interaction only after primary FPR filtering.
   df <- fpr_by_ss %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     dplyr::filter(grepl("^null_interaction:", null_type)) %>%
     dplyr::mutate(
       strip_method = sub("^null_interaction:", "", null_type),
@@ -639,9 +702,15 @@ plot_stripping_robustness <- function(fpr_by_ss) {
 
 plot_fpr_outlier_heatmap <- function(
     fpr_by_outlier,
-    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
   df <- fpr_by_outlier %>%
-    dplyr::filter(.data$null_type %in% null_types) %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     prepare_plot_labels()
   df <- df %>%
     dplyr::group_by(null_type_label, model_type_label, transformation_label, outlier_label) %>%
@@ -676,9 +745,15 @@ plot_fpr_outlier_heatmap <- function(
 
 plot_fpr_transform_delta <- function(
     fpr_by_ss,
-    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
   df <- fpr_by_ss %>%
-    dplyr::filter(.data$null_type %in% null_types) %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     dplyr::group_by(null_type, model_type, sample_size, transformation) %>%
     dplyr::summarise(
       n = sum(n, na.rm = TRUE),
@@ -716,9 +791,15 @@ plot_fpr_transform_delta <- function(
 plot_fpr_extreme_combinations <- function(
     fpr_by_outlier,
     top_n = 18,
-    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
   df <- fpr_by_outlier %>%
-    dplyr::filter(.data$null_type %in% null_types) %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     prepare_plot_labels() %>%
     dplyr::filter(is.finite(FPR), n > 0) %>%
     dplyr::mutate(
@@ -747,9 +828,15 @@ plot_fpr_extreme_combinations <- function(
 
 plot_fpr_exceedance_summary <- function(
     fpr_by_outlier,
-    null_types = c(primary_null_type(), "null_interaction:shuffle")) {
+    null_types = primary_reporting_null_types(),
+    models = primary_reporting_models(),
+    require_interpretable = TRUE) {
   base <- fpr_by_outlier %>%
-    dplyr::filter(.data$null_type %in% null_types) %>%
+    filter_primary_fpr_rows(
+      null_types = null_types,
+      models = models,
+      require_interpretable = require_interpretable
+    ) %>%
     prepare_plot_labels()
   factor_tables <- list(
     Nullifier = base %>% dplyr::transmute(factor = null_type_label, n, false_positives),
