@@ -11,10 +11,11 @@ print_usage <- function() {
     "Existing model chunks are reused; modeling is only submitted if expected chunk outputs are missing.\n",
     "\n",
     "Options:\n",
-    "  --no-dashboard    Skip the dashboard plot target.\n",
-    "  --no-csv-gallery  Skip exhaustive CSV plot gallery.\n",
-    "  --no-archive      Do not tar outputs/analysis/figures after targets complete.\n",
-    "  --dry-run         Print selected targets and environment defaults only.\n",
+    "  --skip-diagnostics  Assume diagnostic targets are already up to date; run downstream targets only.\n",
+    "  --no-dashboard      Skip the dashboard plot target.\n",
+    "  --no-csv-gallery    Skip exhaustive CSV plot gallery.\n",
+    "  --no-archive        Do not tar outputs/analysis/figures after targets complete.\n",
+    "  --dry-run           Print selected targets and environment defaults only.\n",
     "  --help            Show this help.\n",
     sep = ""
   )
@@ -38,14 +39,23 @@ if (!has_flag("--no-csv-gallery") && !nzchar(Sys.getenv("PLOT_ALL_CSV_OUTPUTS", 
   Sys.setenv(PLOT_ALL_CSV_OUTPUTS = "true")
 }
 if (has_flag("--no-csv-gallery")) Sys.setenv(PLOT_ALL_CSV_OUTPUTS = "false")
+skip_diagnostics <- has_flag("--skip-diagnostics")
 
-post_model_targets <- c(
-  "nullification_diagnostics_file",
-  "cse_definition_comparison_files",
-  "shuffle_adversarial_diagnostics_file",
-  "analysis",
-  "nullification_operating_characteristics_files"
-)
+post_model_targets <- if (skip_diagnostics) {
+  c(
+    "cse_definition_comparison_files",
+    "analysis",
+    "nullification_operating_characteristics_files"
+  )
+} else {
+  c(
+    "nullification_diagnostics_file",
+    "cse_definition_comparison_files",
+    "shuffle_adversarial_diagnostics_file",
+    "analysis",
+    "nullification_operating_characteristics_files"
+  )
+}
 if (!has_flag("--no-dashboard")) post_model_targets <- c(post_model_targets, "plots")
 if (!has_flag("--no-csv-gallery")) post_model_targets <- c(post_model_targets, "csv_output_plot_files")
 
@@ -55,13 +65,18 @@ cat("Environment defaults:\n")
 cat("  SKIP_RUST=", Sys.getenv("SKIP_RUST"), "\n", sep = "")
 cat("  DIAGNOSTICS_MODE=", Sys.getenv("DIAGNOSTICS_MODE"), "\n", sep = "")
 cat("  PLOT_ALL_CSV_OUTPUTS=", Sys.getenv("PLOT_ALL_CSV_OUTPUTS", unset = "<unset>"), "\n", sep = "")
+cat("  skip diagnostics=", skip_diagnostics, "\n", sep = "")
+cat("  targets shortcut=", skip_diagnostics, "\n", sep = "")
 
 if (has_flag("--dry-run")) quit(status = 0L)
 
 if (!requireNamespace("targets", quietly = TRUE)) stop("Package 'targets' is required")
 if (!requireNamespace("tidyselect", quietly = TRUE)) stop("Package 'tidyselect' is required")
 
-targets::tar_make(names = tidyselect::all_of(post_model_targets))
+targets::tar_make(
+  names = tidyselect::all_of(post_model_targets),
+  shortcut = skip_diagnostics
+)
 
 archive_path <- NA_character_
 if (!has_flag("--no-archive") && dir.exists(file.path("outputs", "analysis", "figures"))) {
