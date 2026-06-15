@@ -794,7 +794,7 @@ plot_fpr_outlier_heatmap <- function(
         barheight = grid::unit(0.6, "lines")
       )
     ) +
-    facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free", space = "free") +
+    facet_grid(rows = vars(null_type_label), cols = vars(transformation_label), scales = "free_y", space = "free") +
     labs(
       title = "FPR by Outlier Rule, Model, and Nullifier",
       subtitle = paste0("Cells pool across sample sizes after dropping sparse cells; green is below nominal alpha, red is inflated", stable_rate_note(min_n)),
@@ -841,7 +841,7 @@ plot_fpr_transform_delta <- function(
     scale_color_manual(values = get_model_palette(), name = "Model", drop = FALSE) +
     scale_x_continuous(labels = scales::percent, breaks = sort(unique(df$sample_size))) +
     scale_y_continuous(labels = scales::percent) +
-    facet_wrap(vars(null_type_label), scales = "free") +
+    facet_wrap(vars(null_type_label), scales = "free_y") +
     labs(
       title = "Transformation Sensitivity of FPR",
       subtitle = "Positive values mean Raw RT has higher FPR than log(RT)",

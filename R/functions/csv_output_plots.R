@@ -213,9 +213,9 @@ plot_rate_table <- function(df, title) {
         TRUE ~ "rate"
       ),
       rate_denominator = dplyr::case_when(
-        "interpretable_fpr_source" %in% names(.) & .data$interpretable_fpr_source ~ "interpretable",
-        "interpretable_fpr_source" %in% names(.) & !.data$interpretable_fpr_source ~ "diagnostic/sensitivity",
-        TRUE ~ dplyr::coalesce(.data$rate_label, "rate")
+        !"interpretable_fpr_source" %in% names(.) ~ dplyr::coalesce(.data$rate_label, "rate"),
+        .data$interpretable_fpr_source ~ "interpretable",
+        TRUE ~ "diagnostic/sensitivity"
       ),
       rate_panel = interaction(.data$rate_family, .data$rate_denominator, drop = TRUE, sep = " | ")
     )
