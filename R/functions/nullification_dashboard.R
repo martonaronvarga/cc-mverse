@@ -13,7 +13,8 @@ nd_theme <- function(base_size = 11) {
   ggplot2::theme_minimal(base_size = base_size) +
     ggplot2::theme(
       legend.position = "bottom",
-      legend.box = "vertical",
+      legend.box = "horizontal",
+      legend.direction = "horizontal",
       panel.grid.minor = ggplot2::element_blank(),
       panel.spacing = grid::unit(1.1, "lines"),
       strip.text = ggplot2::element_text(face = "bold", lineheight = 0.95, margin = ggplot2::margin(4, 4, 4, 4)),
@@ -86,7 +87,7 @@ plot_nullification_reliability <- function(diagnostics_df) {
     ggplot2::geom_hline(yintercept = 0, linewidth = 0.3, color = "grey45") +
     ggplot2::geom_hline(yintercept = c(-5, 5), linewidth = 0.25, linetype = "dashed", color = "grey60") +
     ggplot2::geom_col(width = 0.68) +
-    ggplot2::facet_grid(rows = ggplot2::vars(metric), cols = ggplot2::vars(transformation_label), scales = "free_y") +
+    ggplot2::facet_grid(rows = ggplot2::vars(metric), cols = ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::coord_flip(clip = "off") +
     ggplot2::scale_fill_manual(values = c(pass = "#2E7D32", fail = "#C62828", unknown = "#78909C"), name = "Preservation") +
     ggplot2::labs(
@@ -106,7 +107,7 @@ plot_nullification_reliability <- function(diagnostics_df) {
       ggplot2::ggplot(ggplot2::aes(x = strip_method_label, y = delta)) +
       ggplot2::geom_hline(yintercept = 0, linewidth = 0.3, color = "grey45") +
       ggplot2::geom_point(size = 2, color = "#455A64") +
-      ggplot2::facet_grid(rows = ggplot2::vars(metric), cols = ggplot2::vars(transformation_label), scales = "free_y") +
+      ggplot2::facet_grid(rows = ggplot2::vars(metric), cols = ggplot2::vars(transformation_label), scales = "free") +
       ggplot2::coord_flip(clip = "off") +
       ggplot2::labs(
         title = "Preservation Deltas From Present Branch",
@@ -116,7 +117,9 @@ plot_nullification_reliability <- function(diagnostics_df) {
       ) +
       nd_theme(base_size = 10)
   } else {
-    ggplot2::ggplot() + ggplot2::labs(title = "No preservation delta columns available") + ggplot2::theme_void()
+    ggplot2::ggplot() +
+      ggplot2::labs(title = "No preservation delta columns available") +
+      ggplot2::theme_void()
   }
 
   quantile_cols <- intersect(c("q010_cse", "q025_cse", "q050_cse", "q075_cse", "q090_cse"), names(d))
@@ -129,7 +132,7 @@ plot_nullification_reliability <- function(diagnostics_df) {
       ggplot2::geom_hline(yintercept = 0, linewidth = 0.3, color = "grey45") +
       ggplot2::geom_line(linewidth = 0.8, alpha = 0.85) +
       ggplot2::geom_point(size = 2) +
-      ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+      ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
       ggplot2::labs(
         title = "Distributional CSE Profile",
         subtitle = "Quantile curves reveal residual distributional CSE that mean-only summaries can miss",
@@ -139,7 +142,9 @@ plot_nullification_reliability <- function(diagnostics_df) {
       ) +
       nd_theme()
   } else {
-    ggplot2::ggplot() + ggplot2::labs(title = "No quantile CSE columns available") + ggplot2::theme_void()
+    ggplot2::ggplot() +
+      ggplot2::labs(title = "No quantile CSE columns available") +
+      ggplot2::theme_void()
   }
 
   verdict_matrix <- d %>%
@@ -148,7 +153,7 @@ plot_nullification_reliability <- function(diagnostics_df) {
     dplyr::slice_max(.data$n, n = 1, with_ties = FALSE) %>%
     ggplot2::ggplot(ggplot2::aes(x = sample_label, y = outlier_label, fill = nullification_verdict)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.45) +
-    ggplot2::facet_grid(rows = ggplot2::vars(strip_method_label), cols = ggplot2::vars(transformation_label), scales = "free_y", space = "free_y") +
+    ggplot2::facet_grid(rows = ggplot2::vars(strip_method_label), cols = ggplot2::vars(transformation_label), scales = "free", space = "free") +
     ggplot2::scale_fill_manual(
       values = c(interpretable_nullifier = "#2E7D32", fails_preservation_gates = "#C62828", unpaired = "#6D4C41", diagnostics_missing = "#78909C"),
       name = "Verdict",

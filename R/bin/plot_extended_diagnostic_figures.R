@@ -31,7 +31,9 @@ path_first <- function(...) {
 }
 
 read_selected <- function(path, cols = NULL) {
-  if (is.null(cols)) return(readr::read_csv(path, show_col_types = FALSE))
+  if (is.null(cols)) {
+    return(readr::read_csv(path, show_col_types = FALSE))
+  }
   readr::read_csv(path, col_select = tidyselect::any_of(cols), show_col_types = FALSE)
 }
 
@@ -58,7 +60,7 @@ plot_cse_definition_flags <- function(cse) {
 
   ggplot2::ggplot(d, ggplot2::aes(x = strip_method_label, y = rate, fill = flag_label)) +
     ggplot2::geom_col(width = 0.72) +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent) +
     ggplot2::scale_fill_brewer(palette = "Set2", name = "CSE definition flag") +
     ggplot2::labs(
@@ -68,7 +70,7 @@ plot_cse_definition_flags <- function(cse) {
       y = "Share of grouped branches"
     ) +
     theme_multiverse(base_size = 10) +
-    legend_bottom_rows(2) +
+    legend_bottom_rows(1) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, vjust = 1))
 }
 
@@ -96,7 +98,7 @@ plot_cse_location_vs_shape <- function(cse) {
     ggplot2::scale_x_continuous(trans = "sqrt") +
     ggplot2::scale_y_continuous(trans = "sqrt") +
     ggplot2::scale_size_continuous(range = c(1.2, 5), name = "Branches") +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::labs(
       title = "Location CSE Versus Distributional/Shape CSE",
       subtitle = "Dashed lines mark the 5 ms location-style threshold; points above horizontal line retain shape CSE",
@@ -106,7 +108,7 @@ plot_cse_location_vs_shape <- function(cse) {
       shape = "Preservation pass"
     ) +
     theme_multiverse(base_size = 10) +
-    legend_bottom_rows(2)
+    legend_bottom_rows(1)
 }
 
 plot_cse_metrics_long_summary <- function(metrics) {
@@ -136,7 +138,7 @@ plot_cse_metrics_long_summary <- function(metrics) {
   ggplot2::ggplot(d, ggplot2::aes(x = strip_method_label, y = metric_label, fill = p95_abs_cse)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.35) +
     ggplot2::geom_text(ggplot2::aes(label = scales::number(median_abs_cse, accuracy = 0.01)), size = 2.4) +
-    ggplot2::facet_grid(ggplot2::vars(family_label), ggplot2::vars(transformation_label), scales = "free_y", space = "free_y") +
+    ggplot2::facet_grid(ggplot2::vars(family_label), ggplot2::vars(transformation_label), scales = "free", space = "free") +
     ggplot2::scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "95th pct |CSE|") +
     ggplot2::labs(
       title = "Residual CSE Metric Profile",
@@ -165,7 +167,7 @@ plot_nullification_verdicts <- function(diag) {
 
   ggplot2::ggplot(d, ggplot2::aes(x = sample_label, y = strip_method_label, fill = rate)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.3) +
-    ggplot2::facet_grid(ggplot2::vars(verdict_label), ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(ggplot2::vars(verdict_label), ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_fill_viridis_c(labels = scales::percent, name = "Share") +
     ggplot2::labs(
       title = "Nullification Verdicts Across the Design",
@@ -201,7 +203,7 @@ plot_preservation_warning_breakdown <- function(diag) {
 
   ggplot2::ggplot(d, ggplot2::aes(x = strip_method_label, y = rate, fill = warning_label)) +
     ggplot2::geom_col(width = 0.72) +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent) +
     ggplot2::labs(
       title = "Which Preservation Gates Fail?",
@@ -211,7 +213,7 @@ plot_preservation_warning_breakdown <- function(diag) {
       fill = "Gate/warning"
     ) +
     theme_multiverse(base_size = 9) +
-    legend_bottom_rows(2) +
+    legend_bottom_rows(1) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, vjust = 1))
 }
 
@@ -246,7 +248,7 @@ plot_residual_cse_deltas <- function(diag) {
   ggplot2::ggplot(d, ggplot2::aes(x = strip_method_label, y = metric_label, fill = p95_abs_delta)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.35) +
     ggplot2::geom_text(ggplot2::aes(label = scales::number(median_abs_delta, accuracy = 0.01)), size = 2.5) +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "95th pct |delta|") +
     ggplot2::labs(
       title = "Residual Diagnostics Relative to Present Branches",
@@ -325,7 +327,7 @@ plot_shuffle_slope_scatter <- function(shuf) {
       color = "Outlier rule"
     ) +
     theme_multiverse(base_size = 9) +
-    legend_bottom_rows(2)
+    legend_bottom_rows(1)
 }
 
 plot_failure_aware_composition <- function(fail) {
@@ -358,7 +360,7 @@ plot_failure_aware_composition <- function(fail) {
 
   ggplot2::ggplot(d, ggplot2::aes(x = model_label, y = rate, fill = status_label)) +
     ggplot2::geom_col(width = 0.72) +
-    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent) +
     ggplot2::labs(
       title = "Failure-Aware Nullification Operating Characteristics",
@@ -368,7 +370,7 @@ plot_failure_aware_composition <- function(fail) {
       fill = "Outcome"
     ) +
     theme_multiverse(base_size = 9) +
-    legend_bottom_rows(2) +
+    legend_bottom_rows(1) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, vjust = 1))
 }
 
@@ -399,7 +401,7 @@ plot_conditional_vs_unconditional <- function(fail) {
     ggplot2::scale_x_continuous(labels = scales::percent) +
     ggplot2::scale_y_continuous(labels = scales::percent) +
     ggplot2::scale_size_continuous(labels = scales::percent, name = "Invalid branch share") +
-    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::labs(
       title = "Conditional Versus Unconditional Nullification Rates",
       subtitle = "Shows whether high/low FPR is driven by significance among usable fits or by fit failures changing the denominator",
@@ -408,7 +410,7 @@ plot_conditional_vs_unconditional <- function(fail) {
       color = "Model"
     ) +
     theme_multiverse(base_size = 9) +
-    legend_bottom_rows(2)
+    legend_bottom_rows(1)
 }
 
 plot_interpretable_vs_all_fpr <- function(fpr) {
@@ -427,7 +429,7 @@ plot_interpretable_vs_all_fpr <- function(fpr) {
   ggplot2::ggplot(d, ggplot2::aes(x = model_label, y = FPR, fill = source)) +
     ggplot2::geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828") +
     ggplot2::geom_col(position = "dodge", width = 0.72) +
-    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(ggplot2::vars(strip_method_label), ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent) +
     ggplot2::labs(
       title = "Do Preservation Gates Change the FPR Story?",
@@ -437,7 +439,7 @@ plot_interpretable_vs_all_fpr <- function(fpr) {
       fill = "Rate denominator"
     ) +
     theme_multiverse(base_size = 9) +
-    legend_bottom_rows(2) +
+    legend_bottom_rows(1) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, vjust = 1))
 }
 

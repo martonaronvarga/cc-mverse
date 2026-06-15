@@ -14,7 +14,8 @@ csvp_theme <- function(base_size = 10) {
   ggplot2::theme_minimal(base_size = base_size) +
     ggplot2::theme(
       legend.position = "bottom",
-      legend.box = "vertical",
+      legend.box = "horizontal",
+      legend.direction = "horizontal",
       panel.grid.minor = ggplot2::element_blank(),
       panel.spacing = grid::unit(1.0, "lines"),
       strip.text = ggplot2::element_text(face = "bold", lineheight = 0.95),
@@ -66,7 +67,9 @@ csvp_labels <- function(df) {
 
 plot_saturated_tpr_context <- function(df, title = "TPR Saturated: Read FPR And Precision Instead") {
   required <- c("model_type", "transformation", "sample_size", "null_type", "FPR", "TPR")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     csvp_labels() %>%
     dplyr::mutate(
@@ -79,7 +82,7 @@ plot_saturated_tpr_context <- function(df, title = "TPR Saturated: Read FPR And 
     ggplot2::geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828") +
     ggplot2::geom_line(linewidth = 0.75, alpha = 0.85) +
     ggplot2::geom_point(ggplot2::aes(size = utility_gap), alpha = 0.9) +
-    ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, NA), expand = ggplot2::expansion(mult = c(0.02, 0.12))) +
     ggplot2::scale_size_continuous(name = "FPR + TPR gap", range = c(2, 6)) +
     ggplot2::labs(
@@ -93,14 +96,18 @@ plot_saturated_tpr_context <- function(df, title = "TPR Saturated: Read FPR And 
 }
 
 plot_roc_table <- function(df, title) {
-  if (!all(c("FPR", "TPR", "model_type", "transformation", "sample_size", "null_type") %in% names(df))) return(NULL)
-  if (all(abs(df$TPR - 1) < 1e-12, na.rm = TRUE)) return(plot_saturated_tpr_context(df, paste(title, "- saturated TPR view")))
+  if (!all(c("FPR", "TPR", "model_type", "transformation", "sample_size", "null_type") %in% names(df))) {
+    return(NULL)
+  }
+  if (all(abs(df$TPR - 1) < 1e-12, na.rm = TRUE)) {
+    return(plot_saturated_tpr_context(df, paste(title, "- saturated TPR view")))
+  }
   d <- df %>% csvp_labels()
   ggplot2::ggplot(d, ggplot2::aes(x = FPR, y = TPR, color = model_label, size = sample_size)) +
     ggplot2::geom_vline(xintercept = 0.05, linetype = "dashed", color = "#C62828") +
     ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey60") +
     ggplot2::geom_point(alpha = 0.85) +
-    ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_x_continuous(labels = scales::percent, limits = c(0, NA)) +
     ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
     ggplot2::scale_size_continuous(labels = scales::percent, name = "Sample") +
@@ -110,7 +117,9 @@ plot_roc_table <- function(df, title) {
 
 plot_branch_result_map <- function(df, title) {
   required <- c("sample_size", "outlier", "significant", "estimate")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     csvp_labels() %>%
     dplyr::mutate(
@@ -137,9 +146,9 @@ plot_branch_result_map <- function(df, title) {
     csvp_theme(base_size = 9) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, vjust = 1))
   if (all(c("null_label", "transformation_label") %in% names(d)) && !all(is.na(d$null_label))) {
-    p + ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label), scales = "free_y")
+    p + ggplot2::facet_grid(rows = ggplot2::vars(null_label), cols = ggplot2::vars(transformation_label), scales = "free")
   } else if ("transformation_label" %in% names(d)) {
-    p + ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free_y")
+    p + ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free")
   } else {
     p
   }
@@ -147,17 +156,21 @@ plot_branch_result_map <- function(df, title) {
 
 plot_spec_curve_table <- function(df, title) {
   required <- c("estimate", "significant", "numerically_usable")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     csvp_labels() %>%
     dplyr::filter(.data$numerically_usable) %>%
     dplyr::arrange(.data$estimate) %>%
     dplyr::mutate(rank = dplyr::row_number())
-  if (nrow(d) == 0) return(NULL)
+  if (nrow(d) == 0) {
+    return(NULL)
+  }
   ggplot2::ggplot(d, ggplot2::aes(x = rank, y = estimate, color = significant)) +
     ggplot2::geom_hline(yintercept = 0, linewidth = 0.3, color = "grey35") +
     ggplot2::geom_point(size = 1.2, alpha = 0.75) +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free_y") +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_color_manual(values = c("TRUE" = "#C62828", "FALSE" = "#78909C"), name = "Significant") +
     ggplot2::labs(
       title = paste(title, "Ranked Specification Curve"),
@@ -169,7 +182,9 @@ plot_spec_curve_table <- function(df, title) {
 }
 
 plot_dependency_status <- function(df, title) {
-  if (!all(c("installed", "package") %in% names(df))) return(NULL)
+  if (!all(c("installed", "package") %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>% dplyr::mutate(package = csvp_wrap(.data$package, 18), installed = as.logical(.data$installed))
   ggplot2::ggplot(d, ggplot2::aes(x = package, y = 1, fill = installed)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.5) +
@@ -182,35 +197,114 @@ plot_dependency_status <- function(df, title) {
 
 plot_rate_table <- function(df, title) {
   rate_col <- intersect(c("FPR", "power", "pct_significant", "unconditional_rate", "conditional_rate"), names(df))[1]
-  if (is.na(rate_col)) return(NULL)
+  if (is.na(rate_col)) {
+    return(NULL)
+  }
   d <- df %>% csvp_labels()
+  if (!"null_type" %in% names(d)) d$null_type <- NA_character_
+  if (!"effect_condition" %in% names(d)) d$effect_condition <- NA_character_
+  if (!"rate_label" %in% names(d)) d$rate_label <- NA_character_
+  d <- d %>%
+    dplyr::mutate(
+      rate_family = dplyr::case_when(
+        rate_col %in% c("unconditional_rate", "conditional_rate") & !is.na(.data$null_type) ~ csvp_wrap(.data$null_type, 24),
+        rate_col %in% c("FPR", "power") ~ csvp_wrap(dplyr::coalesce(.data$null_type, "present"), 24),
+        !is.na(.data$effect_condition) ~ csvp_wrap(.data$effect_condition, 18),
+        TRUE ~ "rate"
+      ),
+      rate_denominator = dplyr::case_when(
+        "interpretable_fpr_source" %in% names(.) & .data$interpretable_fpr_source ~ "interpretable",
+        "interpretable_fpr_source" %in% names(.) & !.data$interpretable_fpr_source ~ "diagnostic/sensitivity",
+        TRUE ~ dplyr::coalesce(.data$rate_label, "rate")
+      ),
+      rate_panel = interaction(.data$rate_family, .data$rate_denominator, drop = TRUE, sep = " | ")
+    )
   x_col <- dplyr::case_when(
     "sample_size" %in% names(d) ~ "sample_size",
     "outlier" %in% names(d) ~ "outlier_label",
     "model_type" %in% names(d) ~ "model_label",
     TRUE ~ names(d)[[1]]
   )
-  p <- ggplot2::ggplot(d, ggplot2::aes(x = .data[[x_col]], y = .data[[rate_col]], color = model_label, group = model_label)) +
+  p <- ggplot2::ggplot(d, ggplot2::aes(x = .data[[x_col]], y = .data[[rate_col]], color = model_label, group = interaction(model_label, rate_panel, drop = TRUE))) +
     ggplot2::geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828", alpha = 0.55) +
     ggplot2::geom_point(size = 2.4, alpha = 0.85) +
     ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, NA), expand = ggplot2::expansion(mult = c(0.02, 0.12))) +
     ggplot2::labs(title = title, x = NULL, y = rate_col, color = "Model") +
     csvp_theme()
-  if (x_col == "sample_size") p <- p + ggplot2::geom_line(linewidth = 0.75) + ggplot2::scale_x_continuous(labels = scales::percent)
-  if ("transformation_label" %in% names(d)) p <- p + ggplot2::facet_wrap(ggplot2::vars(transformation_label))
+  if (x_col == "sample_size") {
+    group_cols <- intersect(
+      c(
+        "sample_size",
+        "model_label",
+        "transformation_label",
+        "rate_family",
+        "rate_denominator",
+        "rate_panel"
+      ),
+      names(d)
+    )
+    for (col in c("false_positives", "n", "detected", "n_planned", "significant_primary", "conditional_n_usable")) {
+      if (!col %in% names(d)) d[[col]] <- NA_real_
+    }
+    d$.csvp_weight <- if (any(is.finite(d$n))) d$n else if (any(is.finite(d$n_planned))) d$n_planned else 1
+    d$.csvp_weight <- dplyr::coalesce(d$.csvp_weight, 1)
+    d <- d %>%
+      dplyr::group_by(dplyr::across(dplyr::all_of(group_cols))) %>%
+      dplyr::summarise(
+        plot_rate = dplyr::case_when(
+          rate_col == "FPR" & any(is.finite(.data$false_positives)) & any(is.finite(.data$n)) ~ sum(.data$false_positives, na.rm = TRUE) / sum(.data$n, na.rm = TRUE),
+          rate_col == "power" & any(is.finite(.data$detected)) & any(is.finite(.data$n)) ~ sum(.data$detected, na.rm = TRUE) / sum(.data$n, na.rm = TRUE),
+          rate_col == "unconditional_rate" & any(is.finite(.data$significant_primary)) & any(is.finite(.data$n_planned)) ~ sum(.data$significant_primary, na.rm = TRUE) / sum(.data$n_planned, na.rm = TRUE),
+          rate_col == "conditional_rate" & any(is.finite(.data$significant_primary)) & any(is.finite(.data$conditional_n_usable)) ~ sum(.data$significant_primary, na.rm = TRUE) / sum(.data$conditional_n_usable, na.rm = TRUE),
+          TRUE ~ stats::weighted.mean(.data[[rate_col]], w = .data$.csvp_weight, na.rm = TRUE)
+        ),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(plot_rate = dplyr::if_else(is.nan(.data$plot_rate), NA_real_, .data$plot_rate))
+    d <- dplyr::arrange(d, .data$rate_panel, .data$model_label, .data$sample_size)
+    d$rate_line_group <- interaction(d$model_label, d$rate_panel, drop = TRUE)
+    p <- ggplot2::ggplot(d, ggplot2::aes(x = .data[[x_col]], y = plot_rate, color = model_label, group = rate_line_group)) +
+      ggplot2::geom_hline(yintercept = 0.05, linetype = "dashed", color = "#C62828", alpha = 0.55) +
+      ggplot2::geom_line(linewidth = 0.75, alpha = 0.75) +
+      ggplot2::geom_point(size = 2.4, alpha = 0.85) +
+      ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, NA), expand = ggplot2::expansion(mult = c(0.02, 0.12))) +
+      ggplot2::scale_x_continuous(labels = scales::percent) +
+      ggplot2::labs(title = title, x = NULL, y = rate_col, color = "Model") +
+      csvp_theme()
+  }
+  if (
+    "transformation_label" %in% names(d) &&
+      "rate_panel" %in% names(d) &&
+      dplyr::n_distinct(d$rate_panel, na.rm = TRUE) > 1
+  ) {
+    p <- p +
+      ggplot2::facet_grid(
+        rows = ggplot2::vars(rate_panel),
+        cols = ggplot2::vars(transformation_label),
+        scales = "free"
+      )
+  } else if ("transformation_label" %in% names(d)) {
+    p <- p +
+      ggplot2::facet_wrap(
+        ggplot2::vars(transformation_label),
+        scales = "free"
+      )
+  }
   p + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30, hjust = 1, vjust = 1))
 }
 
 plot_health_table <- function(df, title) {
   cols <- intersect(c("pct_usable", "pct_error", "pct_singular", "pct_converged"), names(df))
-  if (length(cols) == 0) return(NULL)
+  if (length(cols) == 0) {
+    return(NULL)
+  }
   d <- df %>%
     csvp_labels() %>%
     tidyr::pivot_longer(dplyr::all_of(cols), names_to = "numeric_metric", values_to = "value") %>%
     dplyr::mutate(metric = csvp_wrap(gsub("^pct_", "", .data$numeric_metric), 12))
   ggplot2::ggplot(d, ggplot2::aes(x = model_label, y = value / 100, fill = metric)) +
     ggplot2::geom_col(position = "dodge", width = 0.72) +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label)) +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
     ggplot2::labs(title = title, x = NULL, y = "Branch proportion", fill = "Metric") +
     csvp_theme() +
@@ -218,8 +312,12 @@ plot_health_table <- function(df, title) {
 }
 
 csvp_data_id_parts <- function(df) {
-  if (all(c("sample_size", "outlier", "transformation") %in% names(df))) return(df)
-  if (!"data_id" %in% names(df)) return(df)
+  if (all(c("sample_size", "outlier", "transformation") %in% names(df))) {
+    return(df)
+  }
+  if (!"data_id" %in% names(df)) {
+    return(df)
+  }
   parts <- strsplit(as.character(df$data_id), "__", fixed = TRUE)
   if (!"sample_size" %in% names(df)) {
     df$sample_size <- suppressWarnings(as.numeric(vapply(parts, function(x) if (length(x) >= 1L) x[[1]] else NA_character_, character(1))))
@@ -235,7 +333,9 @@ csvp_data_id_parts <- function(df) {
 
 plot_nullification_diagnostics_csv <- function(df, title) {
   required <- c("strip_method", "transformation", "sample_size", "nullification_verdict")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     dplyr::filter(.data$effect_condition == "null_interaction") %>%
     dplyr::group_by(.data$strip_method, .data$transformation, .data$sample_size, .data$nullification_verdict) %>%
@@ -245,10 +345,12 @@ plot_nullification_diagnostics_csv <- function(df, title) {
     dplyr::ungroup() %>%
     csvp_labels() %>%
     dplyr::mutate(sample_label = scales::percent(.data$sample_size, accuracy = 1))
-  if (nrow(d) == 0) return(NULL)
+  if (nrow(d) == 0) {
+    return(NULL)
+  }
   ggplot2::ggplot(d, ggplot2::aes(x = sample_label, y = strip_method, fill = rate)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.3) +
-    ggplot2::facet_grid(rows = ggplot2::vars(nullification_verdict), cols = ggplot2::vars(transformation_label)) +
+    ggplot2::facet_grid(rows = ggplot2::vars(nullification_verdict), cols = ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_fill_viridis_c(labels = scales::percent, name = "Branch share") +
     ggplot2::labs(title = title, subtitle = "Share of nullification branches by verdict, method, sample fraction, and transform.", x = "Sample fraction", y = "Nullification method") +
     csvp_theme(base_size = 9) +
@@ -258,7 +360,9 @@ plot_nullification_diagnostics_csv <- function(df, title) {
 plot_shuffle_adversarial_csv <- function(df, title) {
   df <- csvp_data_id_parts(df)
   required <- c("outlier", "transformation", "row_count_match", "multiset_preserved", "abs_shuffle_prev_cong_rt_slope")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     dplyr::group_by(.data$outlier, .data$transformation) %>%
     dplyr::summarise(
@@ -275,10 +379,12 @@ plot_shuffle_adversarial_csv <- function(df, title) {
     ) %>%
     csvp_labels() %>%
     dplyr::mutate(metric = csvp_wrap(gsub("_", " ", .data$numeric_metric), 16))
-  if (nrow(d) == 0) return(NULL)
+  if (nrow(d) == 0) {
+    return(NULL)
+  }
   ggplot2::ggplot(d, ggplot2::aes(x = outlier_label, y = value, fill = transformation_label)) +
     ggplot2::geom_col(position = "dodge", width = 0.72) +
-    ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free_y") +
+    ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free") +
     ggplot2::labs(title = title, subtitle = "Aggregated shuffle adversarial preservation checks by outlier rule and transform.", x = "Outlier rule", y = "Value", fill = "Transform") +
     csvp_theme(base_size = 9) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, vjust = 1))
@@ -286,7 +392,9 @@ plot_shuffle_adversarial_csv <- function(df, title) {
 
 plot_cse_definition_metrics_long <- function(df, title) {
   required <- c("metric", "abs_cse_value", "strip_method", "transformation")
-  if (!all(required %in% names(df))) return(NULL)
+  if (!all(required %in% names(df))) {
+    return(NULL)
+  }
   d <- df %>%
     dplyr::filter(is.finite(.data$abs_cse_value)) %>%
     dplyr::group_by(.data$strip_method, .data$transformation, .data$metric) %>%
@@ -298,11 +406,13 @@ plot_cse_definition_metrics_long <- function(df, title) {
     ) %>%
     csvp_labels() %>%
     dplyr::mutate(metric_label = csvp_wrap(.data$metric, 18))
-  if (nrow(d) == 0) return(NULL)
+  if (nrow(d) == 0) {
+    return(NULL)
+  }
   ggplot2::ggplot(d, ggplot2::aes(x = strip_method, y = metric_label, fill = median_abs_cse)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.35) +
     ggplot2::geom_text(ggplot2::aes(label = scales::number(p95_abs_cse, accuracy = 0.01)), size = 2.7, color = "grey15") +
-    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free_x") +
+    ggplot2::facet_wrap(ggplot2::vars(transformation_label), scales = "free") +
     ggplot2::scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "Median |CSE|") +
     ggplot2::labs(
       title = title,
@@ -317,7 +427,9 @@ plot_cse_definition_metrics_long <- function(df, title) {
 plot_numeric_profile <- function(df, title) {
   numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
   numeric_cols <- setdiff(numeric_cols, c("idx", "branch_idx", "subsample_id"))
-  if (length(numeric_cols) == 0) return(NULL)
+  if (length(numeric_cols) == 0) {
+    return(NULL)
+  }
   id_col <- intersect(c("study", "model_type", "model", "condition", "effect_condition", "package", "tool", "key", "column", "confound", "strategy_id"), names(df))[1]
   if (is.na(id_col)) id_col <- names(df)[[1]]
   d <- df %>%
@@ -325,10 +437,12 @@ plot_numeric_profile <- function(df, title) {
     tidyr::pivot_longer(dplyr::all_of(numeric_cols), names_to = "numeric_metric", values_to = "value") %>%
     dplyr::filter(is.finite(.data$value)) %>%
     dplyr::mutate(metric = csvp_wrap(.data$numeric_metric, 18))
-  if (nrow(d) == 0) return(NULL)
+  if (nrow(d) == 0) {
+    return(NULL)
+  }
   ggplot2::ggplot(d, ggplot2::aes(x = row_label, y = value)) +
     ggplot2::geom_col(fill = "#546E7A", width = 0.72) +
-    ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free_y") +
+    ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free") +
     ggplot2::labs(title = title, x = NULL, y = "Value") +
     csvp_theme(base_size = 9) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, vjust = 1))
@@ -413,19 +527,22 @@ write_csv_output_plots <- function(input_dir = file.path("R", "outputs", "analys
     if (requireNamespace("logger", quietly = TRUE)) {
       logger::log_info("CSV plot gallery [{i}/{length(csvs)}]: {rel}")
     }
-    ok <- tryCatch({
-      p <- plot_csv_output(path)
-      csvp_save(p, out)
-      TRUE
-    }, error = function(e) {
-      msg <- paste("CSV plot failed for", path, ":", conditionMessage(e))
-      if (requireNamespace("logger", quietly = TRUE)) {
-        logger::log_warn(msg)
-      } else {
-        message(msg)
+    ok <- tryCatch(
+      {
+        p <- plot_csv_output(path)
+        csvp_save(p, out)
+        TRUE
+      },
+      error = function(e) {
+        msg <- paste("CSV plot failed for", path, ":", conditionMessage(e))
+        if (requireNamespace("logger", quietly = TRUE)) {
+          logger::log_warn(msg)
+        } else {
+          message(msg)
+        }
+        FALSE
       }
-      FALSE
-    })
+    )
     data.frame(csv = path, plot = if (ok) out else NA_character_, plotted = ok, stringsAsFactors = FALSE)
   })
   manifest <- dplyr::bind_rows(rows)
